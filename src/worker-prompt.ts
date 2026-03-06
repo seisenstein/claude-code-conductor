@@ -8,6 +8,7 @@
  */
 
 import type { ProjectConventions, TaskType, WorkerRuntime } from "./utils/types.js";
+import { getPersona, formatPersonaPrompt } from "./worker-personas.js";
 
 export interface WorkerPromptContext {
   sessionId: string;
@@ -237,15 +238,11 @@ ${context.threatModelSummary}`);
   }
 
   // ------------------------------------------------------------------
-  // 9. Task-Type-Specific Guidelines (conditional)
+  // 9. Worker Persona (conditional — replaces generic task-type guidelines)
   // ------------------------------------------------------------------
   if (context.taskType) {
-    const guideline = getTaskTypeGuidelines(context.taskType);
-    if (guideline) {
-      lines.push(`## Task-Type Guidelines
-
-${guideline}`);
-    }
+    const persona = getPersona(context.taskType);
+    lines.push(formatPersonaPrompt(persona));
   }
 
   // ------------------------------------------------------------------
@@ -270,85 +267,3 @@ Before implementing an API endpoint or shared type, call \`get_contracts\` to ch
   return lines.join("\n\n");
 }
 
-// ------------------------------------------------------------------
-// Task-type-specific guideline text
-// ------------------------------------------------------------------
-
-function getTaskTypeGuidelines(taskType: TaskType): string {
-  switch (taskType) {
-    case "security":
-      return `**Task type: Security**
-
-This task directly involves security-sensitive functionality. Apply extra rigor:
-
-- Follow OWASP guidelines for the relevant vulnerability category (e.g. OWASP Top 10, ASVS).
-- Every input must be validated — no exceptions. Whitelist acceptable values where possible.
-- Document your security assumptions in code comments (e.g. "assumes caller is authenticated by middleware X").
-- If implementing authentication or authorization, ensure both positive (allowed) and negative (denied) test cases exist.
-- Review adjacent code for related security gaps and flag them via \`post_update\` if found.
-- Prefer fail-closed over fail-open: when in doubt, deny access.`;
-
-    case "backend_api":
-      return `**Task type: Backend API**
-
-- Use consistent error response shapes across all endpoints (match existing patterns in the codebase).
-- Validate all request inputs (params, query, body, headers) at the handler boundary, before business logic.
-- Return appropriate HTTP status codes: 400 for validation errors, 401 for unauthenticated, 403 for unauthorized, 404 for not found, 409 for conflicts, 500 for server errors.
-- Write integration tests that cover the happy path and at least one error/edge case per endpoint.
-- Register your endpoint contracts via \`register_contract\` so frontend and other workers can depend on them.
-- Document pagination, filtering, and sorting parameters if the endpoint returns lists.`;
-
-    case "frontend_ui":
-      return `**Task type: Frontend UI**
-
-- Use existing component patterns and the project's design system. Do not introduce new UI libraries.
-- Ensure accessibility: use semantic HTML, ARIA attributes where needed, and keyboard navigation support.
-- Handle loading, error, and empty states for all data-fetching components.
-- Check \`get_contracts\` for API endpoint schemas to ensure your fetch calls match the backend contract.
-- Follow existing state management patterns (check conventions for details).
-- Test user interactions, not implementation details.`;
-
-    case "database":
-      return `**Task type: Database**
-
-- **Migration safety**: Ensure migrations can be rolled back. Include a down/rollback migration.
-- **Index verification**: When adding columns used in WHERE, JOIN, or ORDER BY clauses, add appropriate indexes.
-- **Constraint checking**: Use database-level constraints (NOT NULL, UNIQUE, FOREIGN KEY, CHECK) to enforce data integrity, not just application-level validation.
-- **Data preservation**: Never drop columns or tables that contain production data without a data migration plan. If unsure, post an escalation.
-- **Naming consistency**: Follow existing table and column naming conventions (check \`get_decisions\`).
-- **Test with realistic data**: Verify queries perform well with representative data volumes, not just empty tables.`;
-
-    case "testing":
-      return `**Task type: Testing**
-
-- Aim for meaningful coverage of business logic, not just line-count metrics.
-- Include edge cases: empty inputs, boundary values, invalid types, concurrent operations, permission boundaries.
-- Follow existing mock/stub patterns in the codebase (check conventions).
-- Test error paths explicitly — verify correct status codes, error messages, and that no sensitive data leaks.
-- If testing security features, include both positive (authorized access works) and negative (unauthorized access is denied) test cases.
-- Keep tests independent — no shared mutable state between test cases.`;
-
-    case "infrastructure":
-      return `**Task type: Infrastructure**
-
-- **Environment parity**: Ensure changes work consistently across development, staging, and production environments.
-- **Secret management**: Use environment variables or a secrets manager. Never hardcode secrets in config files, even for local development.
-- **Rollback procedures**: Document how to revert the infrastructure change if something goes wrong.
-- **Idempotency**: Infrastructure scripts and migrations should be safe to run multiple times.
-- **Monitoring**: If adding new services or endpoints, ensure health checks and logging are in place.
-- If unsure about infrastructure conventions, check \`get_decisions\` or post an escalation.`;
-
-    case "general":
-      return `**Task type: General**
-
-- Follow existing code patterns and conventions in the codebase.
-- Read nearby files to understand the expected style before writing new code.
-- When in doubt about an architectural choice, check \`get_decisions\` for precedents.`;
-
-    default: {
-      // Exhaustive check — if a new TaskType is added, TypeScript will flag this
-      const _exhaustive: never = taskType;
-      return `Follow existing code patterns and conventions. ${_exhaustive}`;
-    }
-  }
-}

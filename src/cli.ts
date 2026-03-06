@@ -99,7 +99,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.1.5");
+  .version("0.1.6");
 
 // ============================================================
 // start command
@@ -269,6 +269,26 @@ program
             `code ${codeApproved}${flowInfo}, ${duration}`,
           ),
         );
+        // Phase durations breakdown
+        if (cycle.phase_durations) {
+          const pd = cycle.phase_durations;
+          const parts: string[] = [];
+          if (pd.planning_ms) parts.push(`plan: ${formatDuration(pd.planning_ms)}`);
+          if (pd.conventions_ms) parts.push(`conventions: ${formatDuration(pd.conventions_ms)}`);
+          if (pd.execution_ms) parts.push(`exec: ${formatDuration(pd.execution_ms)}`);
+          if (pd.code_review_ms) parts.push(`review: ${formatDuration(pd.code_review_ms)}`);
+          if (pd.flow_tracing_ms) parts.push(`flow: ${formatDuration(pd.flow_tracing_ms)}`);
+          if (parts.length > 0) {
+            console.log(chalk.gray(`             Phases: ${parts.join(", ")}`));
+          }
+        }
+        // Blast radius summary
+        if (cycle.blast_radius) {
+          const br = cycle.blast_radius;
+          const brInfo = `${br.files_changed} files, +${br.lines_added}/-${br.lines_removed} lines`;
+          const warningCount = br.warnings.length > 0 ? chalk.yellow(` (${br.warnings.length} warning(s))`) : "";
+          console.log(chalk.gray(`             Blast radius: ${brInfo}${warningCount}`));
+        }
       }
       console.log("");
     }

@@ -12,6 +12,8 @@ import type {
   CLIOptions,
   ExecutionWorkerManager,
   CycleRecord,
+  PhaseDurations,
+  BlastRadius,
   CodexVerdict,
   FlowTracingReport,
   FlowTracingSummary,
@@ -240,12 +242,17 @@ export class Orchestrator {
         this.logger.info(`  CYCLE ${cycleNum} of ${state.max_cycles}`);
         this.logger.info(`${"=".repeat(60)}\n`);
 
+        // Phase timing tracker
+        const phaseDurations: PhaseDurations = {};
+
         // Phase 1: Planning (skip on resume if tasks already exist)
         if (skipPlanningThisCycle) {
           skipPlanningThisCycle = false; // only skip once
           this.logger.info("Skipping planning phase (resuming with existing tasks).");
         } else {
+          const planStart = Date.now();
           planVersion = await this.plan(planVersion, cycleNum > 1);
+          phaseDurations.planning_ms = Date.now() - planStart;
         }
 
         // If dry run, print plan and exit
@@ -264,6 +271,7 @@ export class Orchestrator {
         }
 
         // Extract project conventions (pre-execution phase)
+        const conventionsStart = Date.now();
         await this.state.setProgress("Conventions: extracting project patterns...");
         await logProgress(this.options.project, "conventions", "Extracting project patterns");
         this.logger.info("Extracting project conventions...");
@@ -273,6 +281,7 @@ export class Orchestrator {
         }
         this.conventions = await extractConventions(this.options.project);
         this.projectRules = await loadWorkerRules(this.options.project);
+        phaseDurations.conventions_ms = Date.now() - conventionsStart;
 
         // Pass context to worker manager
         this.workers.setWorkerContext({
@@ -286,7 +295,9 @@ export class Orchestrator {
         });
 
         // Phase 2: Execution
+        const executionStart = Date.now();
         await this.execute();
+        phaseDurations.execution_ms = Date.now() - executionStart;
 
         if (this.state.get().status === "paused") {
           return;
@@ -320,9 +331,10 @@ export class Orchestrator {
         }
 
         // Phase 3: Code review and flow tracing in parallel (both are read-only)
+        const reviewStart = Date.now();
         const [approved, flowReport] = await Promise.all([
-          this.review(),
-          this.flowReview(cycleNum),
+          this.review().then((r) => { phaseDurations.code_review_ms = Date.now() - reviewStart; return r; }),
+          this.flowReview(cycleNum).then((r) => { phaseDurations.flow_tracing_ms = Date.now() - reviewStart; return r; }),
         ]);
 
 
@@ -339,7 +351,9 @@ export class Orchestrator {
         }
 
         // Phase 4: Checkpoint
+        const checkpointStart = Date.now();
         let result = await this.checkpoint();
+        phaseDurations.checkpoint_ms = Date.now() - checkpointStart;
 
         // If flow tracing found critical/high issues, force another cycle
         if (flowReport && (flowReport.summary.critical > 0 || flowReport.summary.high > 0)) {
@@ -361,6 +375,15 @@ export class Orchestrator {
         const completedTasks = await this.state.getTasksByStatus("completed");
         const failedTasks = await this.state.getTasksByStatus("failed");
 
+        // Log phase durations
+        this.logger.info("Phase durations: " + Object.entries(phaseDurations)
+          .filter(([, v]) => v !== undefined)
+          .map(([k, v]) => `${k.replace("_ms", "")}: ${Math.round(v! / 1000)}s`)
+          .join(", "));
+
+        // Compute blast radius from completed tasks
+        const blastRadius = await this.computeBlastRadius(completedTasks);
+
         const cycleRecord: CycleRecord = {
           cycle: cycleNum,
           plan_version: planVersion,
@@ -376,6 +399,8 @@ export class Orchestrator {
           flow_tracing: flowReport
             ? FlowTracer.toSummary(flowReport, flowReport.summary.total > 0 ? Date.now() - cycleStart : 0)
             : undefined,
+          phase_durations: phaseDurations,
+          blast_radius: blastRadius,
         };
         await this.state.recordCycle(cycleRecord);
 
@@ -931,6 +956,47 @@ export class Orchestrator {
       subjectToId.set(def.subject, taskId);
     }
 
+    // Validate dependency graph before creating tasks
+    let danglingDeps = 0;
+    for (const def of planOutput.tasks) {
+      for (const depSubject of def.depends_on_subjects) {
+        if (!subjectToId.has(depSubject)) {
+          this.logger.warn(
+            `Task "${def.subject}" depends on unknown subject "${depSubject}"; dependency will be skipped`,
+          );
+          danglingDeps++;
+        }
+      }
+    }
+
+    // Detect dependency cycles
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+    const hasCycle = (subject: string): boolean => {
+      if (inStack.has(subject)) return true;
+      if (visited.has(subject)) return false;
+      visited.add(subject);
+      inStack.add(subject);
+      const def = planOutput.tasks.find((t) => t.subject === subject);
+      if (def) {
+        for (const dep of def.depends_on_subjects) {
+          if (subjectToId.has(dep) && hasCycle(dep)) return true;
+        }
+      }
+      inStack.delete(subject);
+      return false;
+    };
+    for (const def of planOutput.tasks) {
+      if (hasCycle(def.subject)) {
+        this.logger.warn(`Dependency cycle detected involving task "${def.subject}". Dependencies may be ignored.`);
+        break;
+      }
+    }
+
+    if (danglingDeps > 0) {
+      this.logger.warn(`${danglingDeps} dangling dependency reference(s) detected in plan.`);
+    }
+
     // Second pass: create tasks with resolved dependency IDs
     for (let i = 0; i < planOutput.tasks.length; i++) {
       const def = planOutput.tasks[i];
@@ -941,10 +1007,6 @@ export class Orchestrator {
         const depId = subjectToId.get(depSubject);
         if (depId) {
           dependencyIds.push(depId);
-        } else {
-          this.logger.warn(
-            `Task "${def.subject}" depends on unknown subject "${depSubject}"; skipping dependency`,
-          );
         }
       }
 
@@ -1473,6 +1535,75 @@ export class Orchestrator {
     }
 
     return "complete";
+  }
+
+  // ================================================================
+  // Blast Radius Analysis
+  // ================================================================
+
+  private async computeBlastRadius(completedTasks: Task[]): Promise<BlastRadius> {
+    const allFiles = new Set<string>();
+    for (const task of completedTasks) {
+      for (const f of task.files_changed) {
+        allFiles.add(f);
+      }
+    }
+
+    // Detect critical files that were touched
+    const criticalPatterns = [
+      /package\.json$/,
+      /package-lock\.json$/,
+      /tsconfig\.json$/,
+      /\.env/,
+      /docker-compose/i,
+      /Dockerfile/i,
+      /\.github\/workflows\//,
+      /migrations?\//,
+      /schema\.(ts|js|sql|prisma)$/,
+    ];
+    const criticalFiles: string[] = [];
+    for (const f of allFiles) {
+      if (criticalPatterns.some((p) => p.test(f))) {
+        criticalFiles.push(f);
+      }
+    }
+
+    // Get line stats from git diff
+    let linesAdded = 0;
+    let linesRemoved = 0;
+    try {
+      const diffStat = await this.git.diffStatFromBase();
+      linesAdded = diffStat.additions;
+      linesRemoved = diffStat.deletions;
+    } catch {
+      // Git diff may fail if no base commit
+    }
+
+    const warnings: string[] = [];
+    if (allFiles.size > 50) {
+      warnings.push(`High file count: ${allFiles.size} files changed (threshold: 50)`);
+    }
+    if (linesAdded + linesRemoved > 2000) {
+      warnings.push(`Large diff: +${linesAdded}/-${linesRemoved} lines (threshold: 2000)`);
+    }
+    if (criticalFiles.length > 0) {
+      warnings.push(`Critical files modified: ${criticalFiles.join(", ")}`);
+    }
+
+    if (warnings.length > 0) {
+      this.logger.warn("Blast radius warnings:");
+      for (const w of warnings) {
+        this.logger.warn(`  - ${w}`);
+      }
+    }
+
+    return {
+      files_changed: allFiles.size,
+      lines_added: linesAdded,
+      lines_removed: linesRemoved,
+      critical_files_touched: criticalFiles,
+      warnings,
+    };
   }
 
   // ================================================================

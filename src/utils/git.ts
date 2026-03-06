@@ -88,4 +88,19 @@ export class GitManager {
   async pullRebase(): Promise<void> {
     await this.git.pull(["--rebase"]);
   }
+
+  /**
+   * Get line-level diff statistics from the base commit to HEAD.
+   * Returns total additions and deletions.
+   */
+  async diffStatFromBase(): Promise<{ additions: number; deletions: number }> {
+    const result = await this.git.diff(["--shortstat", "HEAD"]);
+    let additions = 0;
+    let deletions = 0;
+    const addMatch = result.match(/(\d+) insertion/);
+    const delMatch = result.match(/(\d+) deletion/);
+    if (addMatch) additions = parseInt(addMatch[1], 10);
+    if (delMatch) deletions = parseInt(delMatch[1], 10);
+    return { additions, deletions };
+  }
 }

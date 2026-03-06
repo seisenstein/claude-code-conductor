@@ -103,14 +103,17 @@ export class StateManager {
   }
 
   /**
-   * Save current state to disk.
+   * Save current state to disk atomically (write to temp, then rename).
    */
   async save(): Promise<void> {
     if (!this.state) {
       throw new Error("StateManager: no state to save — call initialize() or load() first");
     }
     const statePath = getStatePath(this.projectDir);
-    await fs.writeFile(statePath, JSON.stringify(this.state, null, 2) + "\n", "utf-8");
+    const tmpPath = statePath + ".tmp";
+    const content = JSON.stringify(this.state, null, 2) + "\n";
+    await fs.writeFile(tmpPath, content, "utf-8");
+    await fs.rename(tmpPath, statePath);
   }
 
   /**

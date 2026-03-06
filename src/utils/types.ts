@@ -40,6 +40,16 @@ export type OrchestratorStatus =
   | "failed"
   | "escalated";
 
+export interface PhaseDurations {
+  planning_ms?: number;
+  conventions_ms?: number;
+  codex_plan_review_ms?: number;
+  execution_ms?: number;
+  code_review_ms?: number;
+  flow_tracing_ms?: number;
+  checkpoint_ms?: number;
+}
+
 export interface CycleRecord {
   cycle: number;
   plan_version: number;
@@ -53,6 +63,16 @@ export interface CycleRecord {
   started_at: string;
   completed_at: string;
   flow_tracing?: FlowTracingSummary;
+  phase_durations?: PhaseDurations;
+  blast_radius?: BlastRadius;
+}
+
+export interface BlastRadius {
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  critical_files_touched: string[];
+  warnings: string[];
 }
 
 export interface FlowTracingSummary {
