@@ -21,6 +21,7 @@ import {
   CONTRACTS_DIR,
   DECISIONS_FILE,
 } from "../utils/constants.js";
+import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -216,9 +217,21 @@ export async function handlePostUpdate(
 
 export interface GetTasksInput {
   status_filter?: TaskStatus;
+  ranked?: boolean; // V2: Return tasks sorted by priority
 }
 
-export async function handleGetTasks(input: GetTasksInput): Promise<Task[]> {
+/**
+ * Get tasks from the task board.
+ *
+ * If ranked=true, returns only claimable tasks (pending with all dependencies
+ * completed), sorted by priority score (highest first). The returned tasks
+ * include priority_score and critical_path_depth fields.
+ *
+ * If ranked=false or omitted, returns all tasks sorted by ID.
+ */
+export async function handleGetTasks(
+  input: GetTasksInput,
+): Promise<Task[] | RankedTask[]> {
   const dir = tasksDir();
   await ensureDir(dir);
 
@@ -236,13 +249,26 @@ export async function handleGetTasks(input: GetTasksInput): Promise<Task[]> {
     const filePath = path.join(dir, file);
     const task = await readJsonFile<Task>(filePath);
     if (task) {
-      if (!input.status_filter || task.status === input.status_filter) {
+      // When ranked=true, we need all tasks for dependency computation
+      // so we skip status_filter here and filter after ranking
+      if (!input.ranked) {
+        if (!input.status_filter || task.status === input.status_filter) {
+          tasks.push(task);
+        }
+      } else {
         tasks.push(task);
       }
     }
   }
 
-  // Sort by id
+  // V2: If ranked=true, return prioritized claimable tasks
+  if (input.ranked) {
+    // rankClaimableTasks filters to pending tasks with completed deps
+    // and returns them sorted by priority score descending
+    return rankClaimableTasks(tasks);
+  }
+
+  // Default: sort by id
   tasks.sort((a, b) => a.id.localeCompare(b.id));
 
   return tasks;

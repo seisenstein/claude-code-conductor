@@ -122,15 +122,23 @@ async function main(): Promise<void> {
   // ----------------------------------------------------------
   server.tool(
     "get_tasks",
-    "List all tasks with their current status. Optionally filter by task status.",
+    "List all tasks with their current status. Optionally filter by status or get ranked claimable tasks.",
     {
       status_filter: z.enum(["pending", "in_progress", "completed", "failed"])
         .optional()
         .describe("Filter tasks by status. If omitted, returns all tasks."),
+      ranked: z.boolean()
+        .optional()
+        .describe(
+          "If true, returns only claimable tasks sorted by priority score " +
+          "(critical path depth + risk + type). Highest priority first. " +
+          "Response includes priority_score and critical_path_depth fields.",
+        ),
     },
     async (args) => {
       const tasks = await handleGetTasks({
         status_filter: args.status_filter,
+        ranked: args.ranked,
       });
       return {
         content: [
