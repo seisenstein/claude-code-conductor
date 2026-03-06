@@ -106,6 +106,9 @@ export interface Task {
   acceptance_criteria?: string[];
   risk_level?: "low" | "medium" | "high";
   review_feedback?: string[];
+  // V2: Worker resilience fields
+  retry_count?: number; // Number of retry attempts (0 = first attempt)
+  last_error?: string; // Error message from previous attempt (sanitized)
 }
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed";
@@ -520,3 +523,37 @@ export interface KnownIssue {
   addressed: boolean;
   assigned_to_task?: string;
 }
+
+// ============================================================
+// Project Auto-Detection Types (V2)
+// ============================================================
+
+export interface ProjectProfile {
+  detected_at: string;
+  languages: ("typescript" | "javascript" | "python")[];
+  frameworks: string[]; // e.g., 'nextjs', 'express', 'fastapi'
+  test_runners: string[]; // e.g., 'vitest', 'jest', 'pytest'
+  linters: string[]; // e.g., 'eslint', 'prettier', 'ruff'
+  ci_systems: string[]; // e.g., 'github-actions', 'gitlab-ci'
+  package_managers: string[]; // e.g., 'npm', 'yarn', 'pip'
+}
+
+// ============================================================
+// Structured Event Log Types (V2)
+// ============================================================
+
+export type StructuredEvent =
+  | { type: "phase_start"; phase: string; timestamp: string }
+  | { type: "phase_end"; phase: string; timestamp: string; duration_ms: number }
+  | { type: "worker_spawn"; session_id: string; timestamp: string }
+  | { type: "worker_complete"; session_id: string; timestamp: string; tasks_completed: number }
+  | { type: "worker_fail"; session_id: string; timestamp: string; error: string }
+  | { type: "worker_timeout"; session_id: string; timestamp: string; duration_ms: number }
+  | { type: "task_claimed"; task_id: string; session_id: string; timestamp: string }
+  | { type: "task_completed"; task_id: string; session_id: string; timestamp: string }
+  | { type: "task_failed"; task_id: string; session_id: string; timestamp: string; error: string }
+  | { type: "task_retried"; task_id: string; retry_count: number; timestamp: string }
+  | { type: "review_verdict"; verdict: string; timestamp: string }
+  | { type: "usage_warning"; utilization: number; timestamp: string }
+  | { type: "scheduling_decision"; task_id: string; score: number; timestamp: string }
+  | { type: "project_detection"; profile: ProjectProfile; timestamp: string };

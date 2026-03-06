@@ -1,4 +1,5 @@
 import path from "path";
+import type { TaskType } from "./types.js";
 
 // ============================================================
 // Directory & File Names
@@ -44,6 +45,51 @@ export const SENTINEL_WORKER_MAX_TURNS = 200;
 export const CONVENTIONS_EXTRACTION_MAX_TURNS = 20;
 export const INCREMENTAL_REVIEW_MAX_TURNS = 15;
 export const MAX_SEMGREP_RETRIES = 2;
+
+// ============================================================
+// Worker Resilience Configuration (V2)
+// ============================================================
+
+export const DEFAULT_WORKER_TIMEOUT_MS = 45 * 60 * 1000; // 45 minutes
+export const MAX_TASK_RETRIES = 2; // 2 retries = 3 total attempts
+export const HEARTBEAT_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+// ============================================================
+// Event Log Configuration (V2)
+// ============================================================
+
+export const EVENTS_FILE = "events.jsonl";
+export const EVENT_FLUSH_INTERVAL_MS = 1000; // 1 second
+export const MAX_EVENT_LOG_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB limit (DoS mitigation)
+
+// ============================================================
+// Project Detection Configuration (V2)
+// ============================================================
+
+export const PROJECT_PROFILE_FILE = "project-profile.json";
+
+// ============================================================
+// Task Scheduling Priority Configuration (V2)
+// ============================================================
+
+export const TASK_TYPE_PRIORITY: Record<TaskType, number> = {
+  security: 60,
+  database: 50,
+  backend_api: 40,
+  infrastructure: 30,
+  frontend_ui: 20,
+  testing: 10,
+  general: 0,
+};
+
+export const RISK_LEVEL_SCORE: Record<string, number> = {
+  high: 30,
+  medium: 15,
+  low: 0,
+};
+
+// Critical path depth multiplier for scheduling score
+export const CRITICAL_PATH_DEPTH_MULTIPLIER = 10;
 
 // ============================================================
 // Semgrep Configuration
@@ -213,4 +259,16 @@ export function getWorkerRulesPath(projectDir: string): string {
 
 export function getProgressLogPath(projectDir: string): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, PROGRESS_LOG_FILE);
+}
+
+// ============================================================
+// V2 Path Helpers
+// ============================================================
+
+export function getEventsPath(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, EVENTS_FILE);
+}
+
+export function getProjectProfilePath(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, PROJECT_PROFILE_FILE);
 }
