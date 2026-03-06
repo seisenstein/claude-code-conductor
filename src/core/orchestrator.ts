@@ -486,7 +486,9 @@ export class Orchestrator {
       await this.ensureExecutionRuntimeAvailable();
       await this.clearPauseSignalIfPresent(this.options.forceResume ? "force-resume" : "resume");
 
-      await this.setupCodexMcpConfig();
+      if (!this.options.skipCodex) {
+        await this.setupCodexMcpConfig();
+      }
       await this.state.resume(this.options.workerRuntime);
       this.logger.info(`Resumed conductor for: ${loaded.feature}`);
       return;
@@ -1864,6 +1866,17 @@ export class Orchestrator {
     await this.state.setActiveSessions(trackedSessions);
   }
 
+  /**
+   * Drains all pending worker events and returns the first rate-limit event.
+   *
+   * Note: `getWorkerEvents()` clears the pending events queue, so non-rate-limit
+   * events (e.g. `session_done`, `session_failed`) are intentionally discarded here.
+   * This is safe because worker lifecycle is tracked separately via
+   * `getActiveWorkers()` / `syncTrackedActiveSessions()`, not through events.
+   * Rate-limit events are also bounded (at most one per worker via
+   * `rateLimitReported`), and the caller breaks out of the monitor loop on the
+   * first one, so discarding additional rate-limit events is harmless.
+   */
   private consumeWorkerRateLimitEvent():
     { provider: WorkerRuntime; detail: string; resetsAt: string | null } | null {
     const events = this.workers.getWorkerEvents();
