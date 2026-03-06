@@ -30,6 +30,14 @@ describe("detectProviderRateLimit", () => {
     });
   });
 
+  it("detects 'rate limited' with a space separator", () => {
+    expect(
+      detectProviderRateLimit("claude", "Your account is rate limited, please wait"),
+    ).toMatchObject({
+      provider: "claude",
+    });
+  });
+
   it("ignores ordinary errors", () => {
     expect(detectProviderRateLimit("codex", "command failed with exit code 1")).toBeNull();
   });

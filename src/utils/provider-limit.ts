@@ -9,7 +9,7 @@ export interface ProviderRateLimitSignal {
 const RATE_LIMIT_PATTERNS = [
   /you['‘’]ve hit your limit/i,
   /rate limit exceeded/i,
-  /rate[_-]?limited/i,
+  /rate[ _-]?limited/i,
   /\b429\b/,
   /too many requests/i,
   /quota exceeded/i,

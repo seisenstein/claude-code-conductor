@@ -296,7 +296,9 @@ export class Orchestrator {
           const { provider, detail, resetsAt } = this.executionRateLimit;
           this.executionRateLimit = null;
           await this.handleProviderRateLimit(provider, detail, resetsAt);
-          return;
+          // handleProviderRateLimit waits for reset and auto-resumes;
+          // continue to the next cycle iteration.
+          continue;
         }
 
         const codexReviewAvailable = this.options.skipCodex
@@ -697,7 +699,9 @@ export class Orchestrator {
       `${provider} 5-hour usage is ${(snapshot.five_hour * 100).toFixed(1)}% ` +
       `before ${phase}.`;
     await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
-    return false;
+    // handleProviderRateLimit now waits for reset and auto-resumes,
+    // so the caller can safely continue.
+    return true;
   }
 
   // ================================================================
@@ -1613,9 +1617,21 @@ export class Orchestrator {
     console.log(
       chalk.yellow(
         `\n  ${provider} rate limit detected. Paused until ${resumeAfter}.\n` +
-        `  Resume with: conduct resume --project "${this.options.project}"\n`,
+        `  Will auto-resume when usage resets. Or resume manually with:\n` +
+        `  conduct resume --project "${this.options.project}"\n`,
       ),
     );
+
+    // Wait for the provider usage window to reset, then auto-resume
+    // (mirrors handleUsagePause behavior for usage-triggered pauses)
+    this.logger.info(`Waiting for ${provider} usage window to reset...`);
+    await usageMonitor.waitForReset();
+    await this.persistProviderUsage(provider, usageMonitor.getUsage());
+    this.usageCritical = false;
+    this.usageCriticalResetsAt = "unknown";
+
+    this.logger.info(`${provider} usage reset. Resuming conductor.`);
+    await this.state.resume();
   }
 
   /**
