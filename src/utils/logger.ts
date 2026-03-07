@@ -10,11 +10,12 @@ export class Logger {
   constructor(logDir: string, name: string) {
     this.name = name;
 
-    // Ensure the log directory exists
-    fs.mkdirSync(logDir, { recursive: true });
+    // Ensure the log directory exists with secure permissions (owner-only)
+    fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
 
     this.logFilePath = path.join(logDir, `${name}.log`);
-    this.logStream = fs.createWriteStream(this.logFilePath, { flags: "a" });
+    // Use mode 0o600 for owner-only read/write access (security requirement #15)
+    this.logStream = fs.createWriteStream(this.logFilePath, { flags: "a", mode: 0o600 });
   }
 
   info(message: string): void {
