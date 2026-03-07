@@ -24,6 +24,7 @@ import {
 import { getFlowWorkerPrompt } from "../flow-worker-prompt.js";
 import { loadFlowConfig } from "../utils/flow-config.js";
 import type { Logger } from "../utils/logger.js";
+import { mkdirSecure, writeFileSecure } from "../utils/secure-fs.js";
 
 // ============================================================
 // FlowTracer
@@ -64,9 +65,9 @@ export class FlowTracer {
     // Load project-specific flow config (or generic defaults)
     const config = await loadFlowConfig(this.projectDir);
 
-    // Ensure flow-tracing directory exists
+    // Ensure flow-tracing directory exists with secure permissions
     const flowDir = getFlowTracingDir(this.projectDir);
-    await fs.mkdir(flowDir, { recursive: true });
+    await mkdirSecure(flowDir, { recursive: true });
 
     // Step 1: Extract flows from the diff
     this.logger.info("Flow-tracing: extracting user flows from changes...");

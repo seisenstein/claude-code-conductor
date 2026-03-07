@@ -10,6 +10,7 @@ import { getPlanPath, getTasksDraftPath, getOrchestratorDir, PLANNER_ALLOWED_TOO
 import type { Logger } from "../utils/logger.js";
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
 import { validateTaskArray } from "../utils/task-validator.js";
+import { writeFileSecure } from "../utils/secure-fs.js";
 
 // ============================================================
 // Planner
@@ -162,7 +163,7 @@ export class Planner {
 
     // Write the plan markdown to disk with secure permissions
     const planPath = getPlanPath(this.projectDir, planVersion);
-    await fs.writeFile(planPath, planOutput, { encoding: "utf-8", mode: 0o600 });
+    await writeFileSecure(planPath, planOutput);
     this.logger.info(`Plan written to ${planPath} (${tasks.length} task(s))`);
 
     return {
@@ -238,8 +239,8 @@ export class Planner {
     const tasks = await this.readAndValidateTasksDraft();
 
     const planPath = getPlanPath(this.projectDir, planVersion);
-    // Use secure permissions: mode 0o600 for file (owner rw only)
-    await fs.writeFile(planPath, planOutput, { encoding: "utf-8", mode: 0o600 });
+    // Use secure permissions: writeFileSecure calls chmod after write
+    await writeFileSecure(planPath, planOutput);
     this.logger.info(`Replan written to ${planPath} (${tasks.length} task(s))`);
 
     return {
