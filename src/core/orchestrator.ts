@@ -1686,7 +1686,8 @@ export class Orchestrator {
         await this.git.commit(checkpointMsg);
         this.logger.info(`Git checkpoint: cycle-${cycleNum}`);
       } catch (err) {
-        this.logger.warn(
+        // Log at error level but continue - checkpoint failures shouldn't crash orchestrator
+        this.logger.error(
           `Git checkpoint failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       }

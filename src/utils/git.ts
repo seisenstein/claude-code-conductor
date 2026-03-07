@@ -49,8 +49,18 @@ export class GitManager {
   /**
    * Create a checkpoint commit: stage all changes and commit with
    * a checkpoint-prefixed tag message.
+   *
+   * @throws Error if repository is in detached HEAD state
    */
   async checkpoint(tag: string): Promise<void> {
+    // Check for detached HEAD state before attempting checkpoint
+    if (await this.isDetachedHead()) {
+      throw new Error(
+        "Cannot create checkpoint: repository is in detached HEAD state. " +
+        "Please checkout a branch before creating a checkpoint."
+      );
+    }
+
     await this.git.add("-A");
     await this.git.commit(`${GIT_CHECKPOINT_PREFIX}${tag}`);
   }
