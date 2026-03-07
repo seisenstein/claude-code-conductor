@@ -482,8 +482,9 @@ export class Orchestrator {
           // "continue" falls through to next cycle
         }
 
-        // Increment cycle
+        // Increment cycle and persist immediately to ensure it survives crashes
         state.current_cycle = cycleNum;
+        await this.state.save();
       }
 
       // Exhausted all cycles
