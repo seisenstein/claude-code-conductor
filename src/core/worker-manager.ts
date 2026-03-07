@@ -550,8 +550,9 @@ export class WorkerManager implements ExecutionWorkerManager {
     // that are relevant for orchestrator monitoring.
     const eventType = event.type as string | undefined;
 
-    // V2: Record heartbeat on activity events
-    if (eventType === "tool_use" || eventType === "result") {
+    // V2: Record heartbeat on all non-error events to prevent false stale detection
+    // (previously only recorded on tool_use/result, causing false positives)
+    if (eventType !== "error") {
       this.heartbeatTracker.recordHeartbeat(sessionId);
     }
 
