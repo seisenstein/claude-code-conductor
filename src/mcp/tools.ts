@@ -299,14 +299,16 @@ export async function handleClaimTask(
 
   let release: (() => Promise<void>) | undefined;
   try {
-    release = await lock(taskPath, { retries: { retries: 3, minTimeout: 100 } });
+    release = await lock(taskPath, { retries: { retries: 5, minTimeout: 100 } });
 
+    // Double-check pattern: Re-read task after acquiring lock to prevent TOCTOU race (#5)
+    // Another worker may have claimed or modified the task between our access check and lock acquisition
     const task = await readJsonFile<Task>(taskPath);
     if (!task) {
       return { success: false, error: `Task not found: ${input.task_id}` };
     }
 
-    // Verify task is pending
+    // Verify task is still pending after lock acquisition (double-check)
     if (task.status !== "pending") {
       return {
         success: false,
