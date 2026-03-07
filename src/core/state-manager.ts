@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { lock, unlock } from "proper-lockfile";
 
 import {
   type OrchestratorState,
@@ -105,6 +106,7 @@ export class StateManager {
 
   /**
    * Save current state to disk atomically (write to temp, then rename).
+   * Uses proper-lockfile to prevent concurrent write corruption.
    */
   async save(): Promise<void> {
     if (!this.state) {
@@ -113,10 +115,48 @@ export class StateManager {
     const statePath = getStatePath(this.projectDir);
     const tmpPath = statePath + ".tmp";
     const content = JSON.stringify(this.state, null, 2) + "\n";
+
     // Ensure the directory exists before writing
-    await fs.mkdir(path.dirname(statePath), { recursive: true });
-    await fs.writeFile(tmpPath, content, "utf-8");
-    await fs.rename(tmpPath, statePath);
+    await fs.mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
+
+    // Ensure state.json exists before locking (proper-lockfile requires file to exist)
+    try {
+      await fs.access(statePath);
+    } catch {
+      // File doesn't exist, create an empty one with secure permissions
+      await fs.writeFile(statePath, "{}\n", { encoding: "utf-8", mode: 0o600 });
+    }
+
+    let release: (() => Promise<void>) | undefined;
+    try {
+      // Acquire lock with retry configuration and stale detection
+      release = await lock(statePath, {
+        retries: { retries: 5, minTimeout: 100 },
+        stale: 5000, // Consider locks stale after 5 seconds
+      });
+
+      // Write to temp file first with secure permissions (mode 0o600)
+      await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+
+      // Atomic rename (prevents partial writes from being read)
+      await fs.rename(tmpPath, statePath);
+    } finally {
+      // Always release the lock, even if writing fails
+      if (release) {
+        try {
+          await release();
+        } catch {
+          // Lock may already be released if process is dying
+        }
+      }
+
+      // Clean up temp file if it still exists (in case rename failed)
+      try {
+        await fs.unlink(tmpPath);
+      } catch {
+        // Temp file may not exist if rename succeeded
+      }
+    }
   }
 
   /**
@@ -159,6 +199,7 @@ export class StateManager {
 
   /**
    * Create the .conductor/ directory structure.
+   * Uses mode 0o700 for owner-only access (security requirement #15).
    */
   async createDirectories(): Promise<void> {
     const dirs = [
@@ -172,7 +213,7 @@ export class StateManager {
     ];
 
     for (const dir of dirs) {
-      await fs.mkdir(dir, { recursive: true });
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     }
   }
 
@@ -211,9 +252,12 @@ export class StateManager {
       risk_level: definition.risk_level,
     };
 
-    // Write the task file
+    // Write the task file with secure permissions (mode 0o600)
     const taskPath = getTaskPath(this.projectDir, id);
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", "utf-8");
+    await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
 
     // Now compute `blocks` for all existing tasks:
     // If this new task depends on task X, then task X blocks this new task.
@@ -222,7 +266,10 @@ export class StateManager {
       if (depTask && !depTask.blocks.includes(id)) {
         depTask.blocks.push(id);
         const depPath = getTaskPath(this.projectDir, depId);
-        await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", "utf-8");
+        await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
       }
     }
 
@@ -322,7 +369,10 @@ export class StateManager {
         }
 
         const taskPath = getTaskPath(this.projectDir, task.id);
-        await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", "utf-8");
+        await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
       }
     }
 
