@@ -18,6 +18,7 @@ import {
   getCliLockPath,
   CLI_LOCK_STALE_TIMEOUT_MS,
 } from "./utils/constants.js";
+import { validateBounds } from "./utils/validation.js";
 
 // ============================================================
 // Helpers
@@ -261,12 +262,26 @@ program
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
 
+    // Parse numeric options
+    const concurrency = parseInt(opts.concurrency as string, 10) || 2;
+    const maxCycles = parseInt(opts.maxCycles as string, 10) || 5;
+    const usageThreshold = parseFloat(opts.usageThreshold as string) || 0.8;
+
+    // Validate bounds for CLI parameters (#20 - security: reject extreme values)
+    try {
+      validateBounds("concurrency", concurrency, 1, 10);
+      validateBounds("maxCycles", maxCycles, 1, 20);
+      validateBounds("usageThreshold", usageThreshold, 0.1, 1.0);
+    } catch (err) {
+      throw new InvalidArgumentError(err instanceof Error ? err.message : String(err));
+    }
+
     const options: CLIOptions = {
       project: projectDir,
       feature,
-      concurrency: parseInt(opts.concurrency as string, 10) || 2,
-      maxCycles: parseInt(opts.maxCycles as string, 10) || 5,
-      usageThreshold: parseFloat(opts.usageThreshold as string) || 0.8,
+      concurrency,
+      maxCycles,
+      usageThreshold,
       skipCodex: Boolean(opts.skipCodex),
       skipFlowReview: Boolean(opts.skipFlowReview),
       dryRun: Boolean(opts.dryRun),
