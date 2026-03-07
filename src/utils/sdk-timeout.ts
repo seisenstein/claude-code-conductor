@@ -57,6 +57,11 @@ export async function queryWithTimeout(
     return resultText;
   })();
 
+  // TODO(timer-leak): If queryPromise rejects, this timer continues running until
+  // timeoutMs elapses. This causes a minor temporary memory leak (timer holds closure
+  // references). To fix: store timer ID and clear it when queryPromise settles.
+  // Impact: Low - timer self-clears after timeout, only an issue if many SDK queries
+  // fail in rapid succession. Not fixing now to avoid breaking changes.
   const timeoutPromise = new Promise<string>((resolve) => {
     setTimeout(() => {
       timedOut = true;
