@@ -1656,68 +1656,86 @@ export class Orchestrator {
   // ================================================================
 
   private async checkpoint(): Promise<"continue" | "complete" | "escalate" | "pause"> {
-    await this.state.setStatus("checkpointing");
-    await this.state.setProgress("Checkpoint: evaluating results");
-    await logProgress(this.options.project, "checkpointing", "Evaluating cycle results");
-    this.logger.info("Checkpoint phase...");
-
-    const state = this.state.get();
-
-    // Count completed vs remaining tasks
-    const allTasks = await this.state.getAllTasks();
-    const completed = allTasks.filter((t) => t.status === "completed");
-
-    // Git checkpoint
     try {
-      const cycleNum = state.current_cycle + 1;
-      const completedSubjects = completed.map((t) => t.subject);
-      const checkpointMsg =
-        completedSubjects.length > 0
-          ? `feat: ${completedSubjects.slice(0, 3).join(", ")}${completedSubjects.length > 3 ? ` (+${completedSubjects.length - 3} more)` : ""}`
-          : `feat: cycle ${cycleNum} progress`;
-      await this.git.commit(checkpointMsg);
-      this.logger.info(`Git checkpoint: cycle-${cycleNum}`);
-    } catch (err) {
-      this.logger.warn(
-        `Git checkpoint failed: ${err instanceof Error ? err.message : String(err)}`,
+      await this.state.setStatus("checkpointing");
+      await this.state.setProgress("Checkpoint: evaluating results");
+      await logProgress(this.options.project, "checkpointing", "Evaluating cycle results");
+      this.logger.info("Checkpoint phase...");
+
+      const state = this.state.get();
+
+      // Count completed vs remaining tasks
+      const allTasks = await this.state.getAllTasks();
+      const completed = allTasks.filter((t) => t.status === "completed");
+
+      // Git checkpoint
+      try {
+        const cycleNum = state.current_cycle + 1;
+        const completedSubjects = completed.map((t) => t.subject);
+        const checkpointMsg =
+          completedSubjects.length > 0
+            ? `feat: ${completedSubjects.slice(0, 3).join(", ")}${completedSubjects.length > 3 ? ` (+${completedSubjects.length - 3} more)` : ""}`
+            : `feat: cycle ${cycleNum} progress`;
+        await this.git.commit(checkpointMsg);
+        this.logger.info(`Git checkpoint: cycle-${cycleNum}`);
+      } catch (err) {
+        this.logger.warn(
+          `Git checkpoint failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const failed = allTasks.filter((t) => t.status === "failed");
+      const pending = allTasks.filter((t) => t.status === "pending");
+      const inProgress = allTasks.filter((t) => t.status === "in_progress");
+      const remaining = pending.length + inProgress.length;
+
+      this.logger.info(
+        `Checkpoint summary: ${completed.length} completed, ${failed.length} failed, ` +
+        `${remaining} remaining (${pending.length} pending, ${inProgress.length} in progress)`,
       );
-    }
-    const failed = allTasks.filter((t) => t.status === "failed");
-    const pending = allTasks.filter((t) => t.status === "pending");
-    const inProgress = allTasks.filter((t) => t.status === "in_progress");
-    const remaining = pending.length + inProgress.length;
 
-    this.logger.info(
-      `Checkpoint summary: ${completed.length} completed, ${failed.length} failed, ` +
-      `${remaining} remaining (${pending.length} pending, ${inProgress.length} in progress)`,
-    );
+      // All tasks done
+      if (remaining === 0 && failed.length === 0) {
+        return "complete";
+      }
 
-    // All tasks done
-    if (remaining === 0 && failed.length === 0) {
+      // User-requested pause
+      if (this.userPauseRequested) {
+        return "pause";
+      }
+
+      // Usage wind-down needed
+      if (this.getExecutionUsageMonitor().isWindDownNeeded() || this.usageCritical) {
+        return "pause";
+      }
+
+      // Cycle limit reached
+      if (state.current_cycle + 1 >= state.max_cycles) {
+        return "escalate";
+      }
+
+      // Failed tasks but room for more cycles
+      if (failed.length > 0 || remaining > 0) {
+        return "continue";
+      }
+
       return "complete";
-    }
+    } catch (err) {
+      // Checkpoint failure should not crash the orchestrator - escalate to user
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Checkpoint phase failed: ${errorMessage}`);
 
-    // User-requested pause
-    if (this.userPauseRequested) {
-      return "pause";
-    }
+      // Try to save state before escalating
+      try {
+        await this.state.setStatus("escalated");
+        await this.state.setProgress(`Checkpoint failed: ${errorMessage}`);
+      } catch {
+        // If state save also fails, just log it
+        this.logger.error("Failed to save state during checkpoint error handling");
+      }
 
-    // Usage wind-down needed
-    if (this.getExecutionUsageMonitor().isWindDownNeeded() || this.usageCritical) {
-      return "pause";
-    }
-
-    // Cycle limit reached
-    if (state.current_cycle + 1 >= state.max_cycles) {
+      // Escalate to user for manual intervention
       return "escalate";
     }
-
-    // Failed tasks but room for more cycles
-    if (failed.length > 0 || remaining > 0) {
-      return "continue";
-    }
-
-    return "complete";
   }
 
   // ================================================================
