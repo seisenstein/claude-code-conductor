@@ -538,7 +538,7 @@ describe("Edge cases for critical fixes", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it("state manager handles empty state gracefully", async () => {
+  it("state manager rejects invalid/empty state with Zod validation", async () => {
     const stateManager = new StateManager(tempDir);
     await stateManager.createDirectories();
 
@@ -546,9 +546,27 @@ describe("Edge cases for critical fixes", () => {
     const statePath = path.join(tempDir, ".conductor", "state.json");
     await fs.writeFile(statePath, "{}\n", { mode: 0o600 });
 
-    // Load should work and return minimal state
+    // Load should throw with validation errors (Zod schema enforcement)
+    await expect(stateManager.load()).rejects.toThrow(/State file validation failed/);
+  });
+
+  it("state manager validates state.json with Zod schema", async () => {
+    const stateManager = new StateManager(tempDir);
+    await stateManager.createDirectories();
+
+    // Create valid state via initialize, then load it
+    await stateManager.initialize("test-feature", "test-branch", {
+      maxCycles: 5,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    // Load should work with valid state
     const state = await stateManager.load();
     expect(state).toBeDefined();
+    expect(state.feature).toBe("test-feature");
+    expect(state.branch).toBe("test-branch");
+    expect(state.status).toBe("initializing");
   });
 
   it("task files persist correct structure", async () => {

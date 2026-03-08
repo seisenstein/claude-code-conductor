@@ -19,22 +19,38 @@ import {
   CLI_LOCK_STALE_TIMEOUT_MS,
 } from "./utils/constants.js";
 import { validateBounds } from "./utils/validation.js";
+import { validateStateJsonLenient } from "./utils/state-schema.js";
 
 // ============================================================
 // Helpers
 // ============================================================
 
+/**
+ * Read and validate state.json using Zod schema.
+ *
+ * Uses lenient validation to handle backward compatibility with older state files.
+ * Returns null if file doesn't exist or validation fails (graceful degradation for CLI).
+ *
+ * @param projectDir - Project directory path
+ * @returns Validated state or null if not available
+ */
 async function readState(projectDir: string): Promise<OrchestratorState | null> {
   const statePath = getStatePath(projectDir);
   try {
     const raw = await fs.readFile(statePath, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<OrchestratorState>;
-    return {
-      ...parsed,
-      worker_runtime: parsed.worker_runtime ?? "claude",
-      claude_usage: parsed.claude_usage ?? null,
-      codex_usage: parsed.codex_usage ?? null,
-    } as OrchestratorState;
+
+    // Validate with Zod schema (CRITICAL - state.json validation)
+    const result = validateStateJsonLenient(raw);
+    if (!result.valid) {
+      // Log validation errors but return null for graceful degradation
+      console.error(chalk.yellow(`Warning: State file validation failed:`));
+      for (const error of result.errors) {
+        console.error(chalk.yellow(`  - ${error}`));
+      }
+      return null;
+    }
+
+    return result.state as OrchestratorState;
   } catch {
     return null;
   }

@@ -15,6 +15,7 @@ import {
   type CodexUsageMetrics,
   type TaskRetryTrackerInterface,
 } from "../utils/types.js";
+import { validateStateJsonLenient } from "../utils/state-schema.js";
 
 import {
   getOrchestratorDir,
@@ -92,17 +93,28 @@ export class StateManager {
 
   /**
    * Load existing state from disk (for resume).
+   *
+   * Uses Zod schema validation (CRITICAL - state.json) to catch:
+   * - Malformed JSON from partial writes
+   * - Missing required fields
+   * - Invalid field types
+   * - Version migrations (via lenient parsing with defaults)
+   *
+   * @throws Error if state file cannot be read or fails validation
    */
   async load(): Promise<OrchestratorState> {
     const statePath = getStatePath(this.projectDir);
     const raw = await fs.readFile(statePath, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<OrchestratorState>;
-    this.state = {
-      ...parsed,
-      worker_runtime: parsed.worker_runtime ?? "claude",
-      claude_usage: parsed.claude_usage ?? null,
-      codex_usage: parsed.codex_usage ?? null,
-    } as OrchestratorState;
+
+    // Validate with Zod schema (CRITICAL - state.json validation)
+    const result = validateStateJsonLenient(raw);
+    if (!result.valid) {
+      throw new Error(
+        `State file validation failed (${statePath}):\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+      );
+    }
+
+    this.state = result.state as OrchestratorState;
     return this.state;
   }
 
