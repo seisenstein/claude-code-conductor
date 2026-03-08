@@ -50,6 +50,8 @@ Use the AskUserQuestion tool to confirm configuration. Use a **two-step flow**:
   - **Worker runtime** (default: Claude workers; switch to Codex CLI workers)
   - **Max cycles** (default: 5 cycles before escalating)
   - **Skip Codex** (default: No -- Codex reviews plans and code each cycle)
+  - **Skip flow-review** (default: No -- set to yes to skip flow-tracing security review phase)
+  - **Current branch** (default: No -- set to yes to work on current branch instead of creating conduct/<slug>)
   - **Dry run** (default: No -- set to yes to only generate the plan without executing)
 - Then ask specific follow-up questions for each selected setting.
 
@@ -87,6 +89,8 @@ Worker Runtime: <claude|codex>
 Max Cycles: <n>
 Usage Threshold: <n>%
 Skip Codex: <yes/no>
+Skip Flow-Review: <yes/no>
+Current Branch: <yes/no>
 ```
 
 Create the `.conductor` directory first if it doesn't exist:
@@ -108,6 +112,8 @@ conduct start "<feature description>" \
   --max-cycles <n> \
   --usage-threshold <threshold> \
   [--skip-codex] \
+  [--skip-flow-review] \
+  [--current-branch] \
   [--dry-run] \
   --verbose \
   2>&1 | tee "$(pwd)/.conductor/logs/conductor-stdout.log" &
@@ -156,5 +162,6 @@ If the user says "status", "resume", "pause", "logs", or similar instead of desc
 - Execution workers default to Claude Code sessions. If the user wants Codex CLI to generate code, launch with `--worker-runtime codex`.
 - Usage is monitored via the OAuth endpoint -- auto-pauses at the threshold, auto-resumes when the window resets.
 - All state lives in `.conductor/` inside the project. Runs survive crashes and can be resumed.
-- Code goes on a `conduct/<feature-slug>` git branch.
+- Code goes on a `conduct/<feature-slug>` git branch. Use `--current-branch` to work on the current branch instead.
+- Flow-tracing security review runs after code review each cycle. Use `--skip-flow-review` to disable it for faster iterations.
 - If `conduct` is not found, the user needs to run `npm link` inside the `claude-code-conductor` package directory.

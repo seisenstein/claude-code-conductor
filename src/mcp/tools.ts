@@ -36,6 +36,18 @@ const MAX_CONTRACT_SPEC_LENGTH = 50_000;  // 50K chars
 const MAX_DECISION_LENGTH = 10_000;       // 10K chars
 const MAX_MESSAGE_CONTENT_LENGTH = 10_000; // 10K chars
 
+// Valid test file extensions (task-014 - test_files validation)
+const VALID_TEST_EXTENSIONS = [
+  '.test.ts',
+  '.test.js',
+  '.spec.ts',
+  '.spec.js',
+  '.test.tsx',
+  '.spec.tsx',
+  '.test.jsx',
+  '.spec.jsx',
+];
+
 // Zod schemas for input validation
 const CompleteTaskInputSchema = z.object({
   task_id: z.string(),
@@ -868,6 +880,28 @@ export async function handleRunTests(
 ): Promise<RunTestsResult> {
   const projectDir = getProjectDir();
   const timeout = input.timeout_ms ?? 60_000;
+
+  // Validate test_files if provided (task-014 - security)
+  if (input.test_files && input.test_files.length > 0) {
+    for (const file of input.test_files) {
+      // Check for path traversal
+      const validation = validateFileName(file);
+      if (!validation.valid) {
+        return {
+          passed: false,
+          output: `Invalid test file path "${file}": ${validation.reason}`,
+        };
+      }
+      // Check for valid test extension
+      const hasValidExt = VALID_TEST_EXTENSIONS.some(ext => file.endsWith(ext));
+      if (!hasValidExt) {
+        return {
+          passed: false,
+          output: `Invalid test file extension for "${file}". Must end with one of: ${VALID_TEST_EXTENSIONS.join(', ')}`,
+        };
+      }
+    }
+  }
 
   const args: string[] = ["test"];
   if (input.test_files && input.test_files.length > 0) {

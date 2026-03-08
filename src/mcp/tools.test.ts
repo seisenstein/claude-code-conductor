@@ -12,6 +12,19 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
+// Mock child_process.execFile to prevent real `npm test` subprocesses from spawning
+// during validation-pass tests. Tests that should fail validation never reach execFile.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    execFile: vi.fn((_cmd: string, _args: unknown, _opts: unknown, cb?: Function) => {
+      if (cb) cb(null, { stdout: "mocked test output", stderr: "" });
+      return { on: vi.fn(), stdout: null, stderr: null, pid: 0 };
+    }),
+  };
+});
+
 import {
   handleClaimTask,
   handleCompleteTask,
@@ -19,6 +32,7 @@ import {
   handleRegisterContract,
   handleRecordDecision,
   handlePostUpdate,
+  handleRunTests,
 } from "./tools.js";
 
 // ============================================================
@@ -493,5 +507,124 @@ describe("path traversal - mixed attack patterns", () => {
     });
     expect(result.success).toBe(false);
     expect(result.error).toContain("Invalid task_id");
+  });
+});
+
+// ============================================================
+// handleRunTests - test_files validation (task-014)
+// ============================================================
+
+describe("handleRunTests - test_files validation", () => {
+  it("rejects test_files with path traversal (../)", async () => {
+    const result = await handleRunTests({
+      test_files: ["../../../etc/passwd"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file path");
+    expect(result.output).toContain("..");
+  });
+
+  it("rejects test_files with absolute paths (/etc/passwd)", async () => {
+    const result = await handleRunTests({
+      test_files: ["/etc/passwd"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file path");
+    expect(result.output).toContain("Absolute");
+  });
+
+  it("rejects test_files without valid test extension", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/utils/validation.ts"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file extension");
+    expect(result.output).toContain(".test.ts");
+    expect(result.output).toContain(".spec.ts");
+  });
+
+  it("rejects test_files with plain .js extension", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/index.js"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file extension");
+  });
+
+  it("accepts valid test file paths with .test.ts extension", async () => {
+    // execFile is mocked at module level - no real subprocess spawned
+    const result = await handleRunTests({
+      test_files: ["src/utils/validation.test.ts"],
+    });
+    // Should not have validation error
+    expect(result.output).not.toContain("Invalid test file path");
+    expect(result.output).not.toContain("Invalid test file extension");
+  });
+
+  it("accepts valid test file paths with .spec.ts extension", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/core/scheduler.spec.ts"],
+    });
+    expect(result.output).not.toContain("Invalid test file path");
+    expect(result.output).not.toContain("Invalid test file extension");
+  });
+
+  it("accepts valid test file paths with .test.tsx extension", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/components/Button.test.tsx"],
+    });
+    expect(result.output).not.toContain("Invalid test file path");
+    expect(result.output).not.toContain("Invalid test file extension");
+  });
+
+  it("accepts valid test file paths with .spec.jsx extension", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/components/Button.spec.jsx"],
+    });
+    expect(result.output).not.toContain("Invalid test file path");
+    expect(result.output).not.toContain("Invalid test file extension");
+  });
+
+  it("rejects multiple test_files when any has path traversal", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/utils/validation.test.ts", "../secret.test.ts"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file path");
+    expect(result.output).toContain("..");
+  });
+
+  it("rejects multiple test_files when any has invalid extension", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/utils/validation.test.ts", "src/utils/helper.ts"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file extension");
+    expect(result.output).toContain("helper.ts");
+  });
+
+  it("rejects test_files with URL-encoded path traversal", async () => {
+    const result = await handleRunTests({
+      test_files: ["%2e%2e%2fsecret.test.ts"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file path");
+  });
+
+  it("rejects test_files with null byte injection", async () => {
+    const result = await handleRunTests({
+      test_files: ["src/utils/test\x00.test.ts"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file path");
+    expect(result.output).toContain("null byte");
+  });
+
+  it("rejects test_files with Windows absolute path", async () => {
+    const result = await handleRunTests({
+      test_files: ["C:\\Windows\\test.test.ts"],
+    });
+    expect(result.passed).toBe(false);
+    expect(result.output).toContain("Invalid test file path");
   });
 });

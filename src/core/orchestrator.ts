@@ -818,21 +818,38 @@ export class Orchestrator {
     const snapshot = await usageMonitor.poll();
     await this.persistProviderUsage(provider, snapshot);
 
-    // If usage data is critically stale (e.g. API has been 429'ing for 15+ min),
-    // we can't trust the cached thresholds. Safety-pause and wait for recovery.
+    // If usage data is critically stale, check if we have rate data to guide us.
+    // The usage API has a ~5 request/token limit (GH #30930), so 429s are expected.
     if (usageMonitor.getStaleDurationMs() >= USAGE_STALE_CRITICAL_MS) {
       const staleMin = Math.round(usageMonitor.getStaleDurationMs() / 60_000);
       const failures = usageMonitor.getConsecutiveFailures();
-      const detail =
-        `${provider} usage data is critically stale (${staleMin}min, ${failures} consecutive failures) ` +
-        `before ${phase}. Cannot verify capacity — safety-pausing.`;
-      this.logger.warn(detail);
-      await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
-      return true;
-    }
+      const hasRateData = usageMonitor.getUsageRatePerMinute() !== null;
 
-    // Warn (but don't pause) if data is stale but below critical threshold
-    if (usageMonitor.isDataStale()) {
+      if (hasRateData) {
+        // Trust rate prediction over stale absolute data
+        this.logger.warn(
+          `${provider} usage API stale (${staleMin}min, ${failures} failures) before ${phase}. ` +
+          `Using rate prediction: ${usageMonitor.getRateSummary()}`
+        );
+        // Check if rate prediction says we'd exceed threshold
+        if (usageMonitor.isThresholdPredicted()) {
+          const detail = `${provider} rate prediction indicates threshold will be reached before ${phase}. ` +
+            `(${usageMonitor.getRateSummary()})`;
+          this.logger.warn(detail);
+          await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
+          return true;
+        }
+      } else {
+        // No rate data — safety-pause
+        const detail =
+          `${provider} usage data is critically stale (${staleMin}min, ${failures} consecutive failures) ` +
+          `before ${phase} with no rate data. Cannot verify capacity — safety-pausing.`;
+        this.logger.warn(detail);
+        await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
+        return true;
+      }
+    } else if (usageMonitor.isDataStale()) {
+      // Warn (but don't pause) if data is stale but below critical threshold
       const staleMin = Math.round(usageMonitor.getStaleDurationMs() / 60_000);
       this.logger.warn(
         `${provider} usage data is stale (${staleMin}min old, ` +
@@ -841,12 +858,17 @@ export class Orchestrator {
     }
 
     if (!usageMonitor.isWindDownNeeded() && !usageMonitor.isCritical()) {
+      // Log rate prediction if available
+      const rateSummary = usageMonitor.getRateSummary();
+      if (rateSummary !== "rate: insufficient data") {
+        this.logger.debug(`${provider} usage OK before ${phase} (${rateSummary})`);
+      }
       return true;
     }
 
     const detail =
       `${provider} 5-hour usage is ${(snapshot.five_hour * 100).toFixed(1)}% ` +
-      `before ${phase}.`;
+      `before ${phase} (${usageMonitor.getRateSummary()}).`;
     await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
     return true;
   }
@@ -1254,22 +1276,60 @@ export class Orchestrator {
           break;
         }
 
-        // Check if usage data is critically stale (API has been unreachable too long)
+        // Predictive wind-down: if rate tracking predicts we'll hit the threshold
+        // before the next poll, start winding down proactively
+        if (usageMonitor.isThresholdPredicted()) {
+          const etaMin = usageMonitor.estimateMinutesUntilThreshold();
+          const utilization = usageMonitor.getUsage().five_hour;
+          this.logger.warn(
+            `Predictive wind-down: usage at ${(utilization * 100).toFixed(1)}%, ` +
+            `predicted to hit ${(this.options.usageThreshold * 100).toFixed(0)}% in ~${Math.round(etaMin ?? 0)}min. ` +
+            `Signaling workers to finish current tasks.`
+          );
+          recordUsageWarning(this.eventLog, utilization);
+          const resetTime = usageMonitor.getResetTime();
+          // Set executionRateLimit so the main loop pauses via handleProviderRateLimit
+          // after execute() returns, instead of continuing into review/next cycle.
+          this.executionRateLimit = {
+            provider: usageMonitor.provider,
+            detail: `Predictive wind-down: usage at ${(utilization * 100).toFixed(1)}%, predicted to hit threshold in ~${Math.round(etaMin ?? 0)}min.`,
+            resetsAt: resetTime ?? null,
+          };
+          await this.workers.signalWindDown("usage_limit", resetTime ?? undefined);
+          await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
+          break;
+        }
+
+        // Check if usage data is critically stale (API has been unreachable too long).
+        // Note: the usage API has a ~5 request/token limit (GH #30930), so 429s are
+        // expected and normal. Only safety-pause if data is stale AND we have no rate
+        // prediction to guide us.
         if (usageMonitor.getStaleDurationMs() >= USAGE_STALE_CRITICAL_MS) {
           const staleMin = Math.round(usageMonitor.getStaleDurationMs() / 60_000);
           const failures = usageMonitor.getConsecutiveFailures();
-          this.logger.warn(
-            `Usage data critically stale during execution (${staleMin}min, ` +
-            `${failures} failures). Winding down workers for safety.`
-          );
-          this.executionRateLimit = {
-            provider: usageMonitor.provider,
-            detail: `Usage API unreachable for ${staleMin}min (${failures} consecutive failures). Safety wind-down.`,
-            resetsAt: null,
-          };
-          await this.workers.signalWindDown("usage_limit");
-          await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
-          break;
+          const hasRateData = usageMonitor.getUsageRatePerMinute() !== null;
+
+          if (hasRateData) {
+            // We have rate data — trust the prediction instead of safety-pausing
+            this.logger.warn(
+              `Usage API stale (${staleMin}min, ${failures} failures) but rate prediction available. ` +
+              `Continuing with cached data. (${usageMonitor.getRateSummary()})`
+            );
+          } else {
+            // No rate data and API unreachable — safety-pause
+            this.logger.warn(
+              `Usage data critically stale during execution (${staleMin}min, ` +
+              `${failures} failures) and no rate data available. Winding down workers for safety.`
+            );
+            this.executionRateLimit = {
+              provider: usageMonitor.provider,
+              detail: `Usage API unreachable for ${staleMin}min (${failures} consecutive failures) with no rate data. Safety wind-down.`,
+              resetsAt: null,
+            };
+            await this.workers.signalWindDown("usage_limit");
+            await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
+            break;
+          }
         }
 
         // Check for user-requested pause signal file
@@ -1879,6 +1939,13 @@ export class Orchestrator {
     } catch {
       // Best effort
     }
+
+    // Close logger to prevent file descriptor leak (task-010)
+    try {
+      this.logger.close();
+    } catch {
+      // Best effort
+    }
   }
 
   private async complete(): Promise<void> {
@@ -2037,38 +2104,6 @@ export class Orchestrator {
 
     this.logger.info(`${provider} usage reset. Resuming conductor.`);
     await this.state.resume();
-  }
-
-  // TODO(dead-code): parseCodexResetTime is no longer used after retryCodexWithBackoff
-  // replaced handleCodexRateLimit. Could be removed or re-integrated if we want
-  // to use server-reported reset times as hints for backoff intervals.
-  /**
-   * Parse the Codex rate limit reset time from error output.
-   * Looks for "resets_at" (unix timestamp) or "resets_in_seconds" in the raw output.
-   * Returns epoch ms, or null if not found.
-   */
-  private parseCodexResetTime(rawOutput?: string): number | null {
-    if (!rawOutput) return null;
-
-    // Try "resets_at" (unix timestamp in seconds)
-    const resetsAtMatch = rawOutput.match(/"resets_at"\s*:\s*(\d{10,})/);
-    if (resetsAtMatch) {
-      const epochSec = parseInt(resetsAtMatch[1], 10);
-      if (!isNaN(epochSec) && epochSec > 0) {
-        return epochSec * 1000;
-      }
-    }
-
-    // Fall back to "resets_in_seconds"
-    const resetsInMatch = rawOutput.match(/"resets_in_seconds"\s*:\s*(\d+)/);
-    if (resetsInMatch) {
-      const seconds = parseInt(resetsInMatch[1], 10);
-      if (!isNaN(seconds) && seconds > 0) {
-        return Date.now() + seconds * 1000;
-      }
-    }
-
-    return null;
   }
 
   private async handleUsagePause(): Promise<void> {
@@ -2386,10 +2421,6 @@ export class Orchestrator {
     // Determine next task ID offset
     const allTasks = await this.state.getAllTasks();
     let nextTaskNum = allTasks.length + 1;
-
-    // TODO(dead-code): subjectToId is declared but never read. Was likely intended for dependency resolution
-    // between flow-tracing fix tasks, but current implementation has no dependencies. Remove if unneeded.
-    const subjectToId = new Map<string, string>();
 
     for (const finding of criticalAndHigh) {
       const taskId = `task-${String(nextTaskNum).padStart(3, "0")}`;

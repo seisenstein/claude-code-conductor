@@ -19,25 +19,56 @@ import {
   CLI_LOCK_STALE_TIMEOUT_MS,
 } from "./utils/constants.js";
 import { validateBounds } from "./utils/validation.js";
+import { validateStateJsonLenient } from "./utils/state-schema.js";
+
+// ============================================================
+// Module-level state
+// ============================================================
+
+/**
+ * Flag to prevent re-entrancy during shutdown.
+ * First SIGINT/SIGTERM triggers graceful shutdown.
+ * Second signal forces immediate exit (standard Unix pattern).
+ */
+let shutdownInProgress = false;
 
 // ============================================================
 // Helpers
 // ============================================================
 
-async function readState(projectDir: string): Promise<OrchestratorState | null> {
+/**
+ * Result of reading state.json, distinguishing between missing and invalid states.
+ */
+type ReadStateResult =
+  | { status: "ok"; state: OrchestratorState }
+  | { status: "missing" }
+  | { status: "invalid"; errors: string[] };
+
+/**
+ * Read and validate state.json using Zod schema.
+ *
+ * Uses lenient validation to handle backward compatibility with older state files.
+ * Returns a typed result distinguishing between missing file, invalid schema, and success.
+ *
+ * @param projectDir - Project directory path
+ * @returns Typed result with state or error information
+ */
+async function readState(projectDir: string): Promise<ReadStateResult> {
   const statePath = getStatePath(projectDir);
+  let raw: string;
   try {
-    const raw = await fs.readFile(statePath, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<OrchestratorState>;
-    return {
-      ...parsed,
-      worker_runtime: parsed.worker_runtime ?? "claude",
-      claude_usage: parsed.claude_usage ?? null,
-      codex_usage: parsed.codex_usage ?? null,
-    } as OrchestratorState;
+    raw = await fs.readFile(statePath, "utf-8");
   } catch {
-    return null;
+    return { status: "missing" };
   }
+
+  // Validate with Zod schema (CRITICAL - state.json validation)
+  const result = validateStateJsonLenient(raw);
+  if (!result.valid) {
+    return { status: "invalid", errors: result.errors };
+  }
+
+  return { status: "ok", state: result.state as OrchestratorState };
 }
 
 async function readAllTasks(projectDir: string): Promise<Task[]> {
@@ -307,7 +338,13 @@ program
       const orchestrator = new Orchestrator(options);
 
       // Graceful shutdown on SIGINT/SIGTERM (#19)
+      // Double-SIGINT protection: second signal forces immediate exit
       const shutdown = async () => {
+        if (shutdownInProgress) {
+          console.log('\nForce exit (second signal)');
+          process.exit(1);
+        }
+        shutdownInProgress = true;
         console.log('\nGraceful shutdown initiated...');
         try {
           await orchestrator.shutdown();
@@ -342,12 +379,21 @@ program
   .action(async (opts: Record<string, string>) => {
     const projectDir = path.resolve(opts.project);
 
-    const state = await readState(projectDir);
-    if (!state) {
+    const stateResult = await readState(projectDir);
+    if (stateResult.status === "missing") {
       console.log(chalk.yellow("\nNo conductor state found in this project."));
       console.log(chalk.gray(`Looked in: ${getStatePath(projectDir)}\n`));
       return;
     }
+    if (stateResult.status === "invalid") {
+      console.error(chalk.red("\nConductor state file exists but is invalid:"));
+      for (const error of stateResult.errors) {
+        console.error(chalk.yellow(`  - ${error}`));
+      }
+      console.error(chalk.gray(`File: ${getStatePath(projectDir)}\n`));
+      return;
+    }
+    const state = stateResult.state;
 
     const tasks = await readAllTasks(projectDir);
     const completed = tasks.filter((t) => t.status === "completed");
@@ -570,11 +616,20 @@ program
   .action(async (opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
 
-    const state = await readState(projectDir);
-    if (!state) {
+    const stateResult = await readState(projectDir);
+    if (stateResult.status === "missing") {
       console.error(chalk.red("\nNo conductor state found. Nothing to resume.\n"));
       process.exit(1);
     }
+    if (stateResult.status === "invalid") {
+      console.error(chalk.red("\nConductor state file exists but is invalid:"));
+      for (const error of stateResult.errors) {
+        console.error(chalk.yellow(`  - ${error}`));
+      }
+      console.error(chalk.gray(`File: ${getStatePath(projectDir)}\n`));
+      process.exit(1);
+    }
+    const state = stateResult.state;
 
     if (state.status === "completed" || state.status === "failed") {
       console.error(
@@ -588,7 +643,7 @@ program
 
     const forceResume = Boolean(opts.forceResume);
     const resumableStatuses = new Set(["paused", "escalated"]);
-    const forceableStatuses = new Set(["executing", "planning", "reviewing", "checkpointing"]);
+    const forceableStatuses = new Set(["executing", "planning", "reviewing", "checkpointing", "flow_tracing"]);
 
     if (!resumableStatuses.has(state.status)) {
       if (!forceResume || !forceableStatuses.has(state.status)) {
@@ -650,7 +705,13 @@ program
       const orchestrator = new Orchestrator(options);
 
       // Graceful shutdown on SIGINT/SIGTERM (#19)
+      // Double-SIGINT protection: second signal forces immediate exit
       const shutdown = async () => {
+        if (shutdownInProgress) {
+          console.log('\nForce exit (second signal)');
+          process.exit(1);
+        }
+        shutdownInProgress = true;
         console.log('\nGraceful shutdown initiated...');
         try {
           await orchestrator.shutdown();
@@ -685,11 +746,20 @@ program
   .action(async (opts: Record<string, string>) => {
     const projectDir = path.resolve(opts.project);
 
-    const state = await readState(projectDir);
-    if (!state) {
+    const stateResult = await readState(projectDir);
+    if (stateResult.status === "missing") {
       console.error(chalk.red("\nNo conductor state found. Nothing to pause.\n"));
       process.exit(1);
     }
+    if (stateResult.status === "invalid") {
+      console.error(chalk.red("\nConductor state file exists but is invalid:"));
+      for (const error of stateResult.errors) {
+        console.error(chalk.yellow(`  - ${error}`));
+      }
+      console.error(chalk.gray(`File: ${getStatePath(projectDir)}\n`));
+      process.exit(1);
+    }
+    const state = stateResult.state;
 
     if (state.status !== "executing" && state.status !== "planning" && state.status !== "reviewing") {
       console.error(

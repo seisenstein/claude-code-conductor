@@ -13,6 +13,9 @@ import {
   USAGE_POLL_MAX_INTERVAL_MS,
   USAGE_POLL_BACKOFF_MULTIPLIER,
   USAGE_STALE_THRESHOLD_MS,
+  USAGE_RATE_WINDOW_SIZE,
+  USAGE_RATE_ESTABLISHED_POLL_MS,
+  USAGE_API_429_BACKOFF_MS,
 } from "../utils/constants.js";
 import type {
   ProviderUsageMonitor,
@@ -39,6 +42,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** A timestamped usage sample for rate calculation. */
+interface UsageSample {
+  timestamp: number; // epoch ms
+  fiveHour: number; // 0.0 - 1.0
+}
+
 export class UsageMonitor implements ProviderUsageMonitor {
   readonly provider = "claude" as const;
   private threshold: number;
@@ -53,6 +62,10 @@ export class UsageMonitor implements ProviderUsageMonitor {
   private consecutiveFailures = 0;
   private lastSuccessfulPollTime = 0; // epoch ms, 0 = never polled successfully
   private running = false;
+
+  // Rate tracking: sliding window of recent usage samples
+  private usageSamples: UsageSample[] = [];
+  private rateWindowSize: number;
 
   constructor(options: {
     threshold?: number;
@@ -70,6 +83,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
     this.onCritical = options.onCritical;
     this.currentUsage = { ...DEFAULT_SNAPSHOT };
     this.logger = options.logger ?? new Logger(path.join(os.tmpdir(), "conductor-logs"), "usage-monitor");
+    this.rateWindowSize = USAGE_RATE_WINDOW_SIZE;
   }
 
   /**
@@ -222,15 +236,17 @@ export class UsageMonitor implements ProviderUsageMonitor {
           },
         });
 
-        // On 429, retry with backoff
+        // On 429, don't retry — the usage API has a ~5 request/token limit (GH #30930).
+        // Retrying just wastes the remaining budget. Back off aggressively and rely on
+        // cached data + rate prediction.
         if (response.status === 429) {
-          const backoffMs = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
           this.logger.warn(
-            `Usage API returned 429 (attempt ${attempt + 1}/${USAGE_MONITOR_MAX_RETRIES}), ` +
-            `retrying in ${backoffMs / 1000}s...`
+            `Usage API returned 429 — per-token rate limit likely reached (GH #30930). ` +
+            `Backing off to ${USAGE_API_429_BACKOFF_MS / 60_000}min. ` +
+            `Using cached data + rate prediction.`
           );
-          await sleep(backoffMs);
-          continue;
+          this.recordPollFailure429();
+          return this.getUsage();
         }
 
         if (!response.ok) {
@@ -254,10 +270,11 @@ export class UsageMonitor implements ProviderUsageMonitor {
         };
 
         this.recordPollSuccess();
+        this.recordUsageSample(this.currentUsage.five_hour);
 
         this.logger.debug(
           `Usage: 5h=${(this.currentUsage.five_hour * 100).toFixed(1)}% ` +
-          `7d=${(this.currentUsage.seven_day * 100).toFixed(1)}%`
+          `7d=${(this.currentUsage.seven_day * 100).toFixed(1)}% (${this.getRateSummary()})`
         );
 
         return this.getUsage();
@@ -305,6 +322,98 @@ export class UsageMonitor implements ProviderUsageMonitor {
     return Date.now() - this.lastSuccessfulPollTime;
   }
 
+  // ----------------------------------------------------------------
+  // Usage rate tracking
+  // ----------------------------------------------------------------
+
+  /**
+   * Record a usage sample for rate calculation.
+   * Maintains a sliding window of the last N samples.
+   */
+  private recordUsageSample(fiveHour: number): void {
+    const now = Date.now();
+
+    // If the usage dropped (window reset), clear the history since rate is meaningless across resets
+    const lastSample = this.usageSamples[this.usageSamples.length - 1];
+    if (lastSample && fiveHour < lastSample.fiveHour - 0.01) {
+      this.logger.debug(
+        `Usage dropped from ${(lastSample.fiveHour * 100).toFixed(1)}% to ${(fiveHour * 100).toFixed(1)}% — window reset detected, clearing rate history`
+      );
+      this.usageSamples = [];
+    }
+
+    this.usageSamples.push({ timestamp: now, fiveHour });
+
+    // Keep only the last N samples
+    if (this.usageSamples.length > this.rateWindowSize) {
+      this.usageSamples = this.usageSamples.slice(-this.rateWindowSize);
+    }
+  }
+
+  /**
+   * Get the current usage rate as percentage points per minute.
+   * Uses a running average across the sample window.
+   * Returns null if not enough data (need at least 2 samples).
+   */
+  getUsageRatePerMinute(): number | null {
+    if (this.usageSamples.length < 2) return null;
+
+    const first = this.usageSamples[0];
+    const last = this.usageSamples[this.usageSamples.length - 1];
+    const elapsedMs = last.timestamp - first.timestamp;
+
+    if (elapsedMs <= 0) return null;
+
+    const usageDelta = last.fiveHour - first.fiveHour;
+    const elapsedMin = elapsedMs / 60_000;
+
+    return usageDelta / elapsedMin;
+  }
+
+  /**
+   * Estimate minutes until the given threshold is reached, based on the current usage rate.
+   * Returns null if rate data is unavailable or rate is zero/negative (usage isn't growing).
+   */
+  estimateMinutesUntilThreshold(threshold?: number): number | null {
+    const target = threshold ?? this.threshold;
+    const rate = this.getUsageRatePerMinute();
+    if (rate === null || rate <= 0) return null;
+
+    const currentUsage = this.currentUsage.five_hour;
+    const remaining = target - currentUsage;
+
+    if (remaining <= 0) return 0; // Already at or past threshold
+
+    return remaining / rate;
+  }
+
+  /**
+   * Check if the predicted usage will exceed the threshold before the next poll.
+   * This allows pre-emptive wind-down instead of discovering we're over the limit.
+   */
+  isThresholdPredicted(): boolean {
+    const minutesUntil = this.estimateMinutesUntilThreshold();
+    if (minutesUntil === null) return false;
+
+    // If we predict hitting the threshold within the next poll interval, flag it
+    const nextPollMinutes = this.currentPollIntervalMs / 60_000;
+    return minutesUntil <= nextPollMinutes;
+  }
+
+  /**
+   * Get a human-readable rate summary for logging.
+   */
+  getRateSummary(): string {
+    const rate = this.getUsageRatePerMinute();
+    if (rate === null) return "rate: insufficient data";
+
+    const ratePerMin = (rate * 100).toFixed(2);
+    const etaMin = this.estimateMinutesUntilThreshold();
+    const etaStr = etaMin !== null ? `${Math.round(etaMin)}min` : "N/A";
+
+    return `rate: ${ratePerMin}%/min, ETA to ${(this.threshold * 100).toFixed(0)}%: ${etaStr}`;
+  }
+
   private recordPollSuccess(): void {
     if (this.consecutiveFailures > 0) {
       this.logger.info(
@@ -314,7 +423,18 @@ export class UsageMonitor implements ProviderUsageMonitor {
     }
     this.consecutiveFailures = 0;
     this.lastSuccessfulPollTime = Date.now();
-    this.currentPollIntervalMs = this.basePollIntervalMs;
+
+    // Once we have a rate established (2+ samples), extend the poll interval
+    // to conserve the ~5 request/token budget (GH #30930).
+    if (this.usageSamples.length >= 2) {
+      this.currentPollIntervalMs = USAGE_RATE_ESTABLISHED_POLL_MS;
+      this.logger.debug(
+        `Rate established (${this.usageSamples.length} samples). ` +
+        `Extended poll interval to ${USAGE_RATE_ESTABLISHED_POLL_MS / 60_000}min to conserve API budget.`
+      );
+    } else {
+      this.currentPollIntervalMs = this.basePollIntervalMs;
+    }
   }
 
   private recordPollFailure(): void {
@@ -334,6 +454,15 @@ export class UsageMonitor implements ProviderUsageMonitor {
   }
 
   /**
+   * Handle 429 specifically: the usage API has ~5 requests per OAuth token (GH #30930).
+   * Back off aggressively since retrying won't help — the limit is per-token, not time-based.
+   */
+  private recordPollFailure429(): void {
+    this.consecutiveFailures++;
+    this.currentPollIntervalMs = USAGE_API_429_BACKOFF_MS;
+  }
+
+  /**
    * Internal: poll and fire callbacks if thresholds are exceeded.
    */
   private async pollAndNotify(): Promise<void> {
@@ -348,6 +477,13 @@ export class UsageMonitor implements ProviderUsageMonitor {
     } else if (this.isWindDownNeeded()) {
       this.logger.warn(
         `WARNING: 5h utilization at ${(this.currentUsage.five_hour * 100).toFixed(1)}% — approaching limit`
+      );
+      this.onWarning(this.currentUsage.five_hour);
+    } else if (this.isThresholdPredicted()) {
+      const etaMin = this.estimateMinutesUntilThreshold();
+      this.logger.warn(
+        `PREDICTED: 5h utilization at ${(this.currentUsage.five_hour * 100).toFixed(1)}% — ` +
+        `predicted to hit ${(this.threshold * 100).toFixed(0)}% in ~${Math.round(etaMin ?? 0)}min (${this.getRateSummary()})`
       );
       this.onWarning(this.currentUsage.five_hour);
     }

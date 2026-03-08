@@ -37,7 +37,7 @@ export const DEFAULT_CONCURRENCY = 2;
 export const DEFAULT_MAX_CYCLES = 5;
 export const DEFAULT_USAGE_THRESHOLD = 0.80;
 export const DEFAULT_CRITICAL_THRESHOLD = 0.90;
-export const DEFAULT_USAGE_POLL_INTERVAL_MS = 60_000; // 60 seconds (increased from 30s per #7)
+export const DEFAULT_USAGE_POLL_INTERVAL_MS = 600_000; // 10 minutes — usage API has ~5 req/token limit (GH #30930)
 export const DEFAULT_WORKER_MAX_TURNS = 100;
 export const DEFAULT_WORKER_POLL_INTERVAL_MS = 5_000; // 5 seconds (orchestrator checks workers)
 export const FLOW_TRACING_WORKER_MAX_TURNS = 50;
@@ -60,8 +60,11 @@ export const HEARTBEAT_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 export const USAGE_MONITOR_MAX_RETRIES = 3; // Retries on 429 with exponential backoff (#7)
 export const USAGE_POLL_MAX_INTERVAL_MS = 10 * 60 * 1000; // 10 min cap for adaptive backoff
 export const USAGE_POLL_BACKOFF_MULTIPLIER = 2; // Double poll interval on failure
-export const USAGE_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 min — warn about stale data
-export const USAGE_STALE_CRITICAL_MS = 15 * 60 * 1000; // 15 min — safety-pause, data too old
+export const USAGE_STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 min — warn about stale data
+export const USAGE_STALE_CRITICAL_MS = 60 * 60 * 1000; // 60 min — safety-pause, data too old
+export const USAGE_RATE_WINDOW_SIZE = 6; // Number of samples for running average rate calculation
+export const USAGE_RATE_ESTABLISHED_POLL_MS = 30 * 60 * 1000; // 30 min — once rate is established, poll less
+export const USAGE_API_429_BACKOFF_MS = 60 * 60 * 1000; // 60 min — on 429, back off aggressively (token limit)
 
 // ============================================================
 // Event Log Configuration (V2)

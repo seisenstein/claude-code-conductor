@@ -116,6 +116,23 @@ export class CodexUsageMonitor implements ProviderUsageMonitor {
     return 0;
   }
 
+  // Codex reads local files — rate tracking is not meaningful
+  getUsageRatePerMinute(): number | null {
+    return null;
+  }
+
+  estimateMinutesUntilThreshold(_threshold?: number): number | null {
+    return null;
+  }
+
+  isThresholdPredicted(): boolean {
+    return false;
+  }
+
+  getRateSummary(): string {
+    return "rate: N/A (codex)";
+  }
+
   async waitForReset(): Promise<void> {
     const resetsAt = this.currentUsage.five_hour_resets_at;
 

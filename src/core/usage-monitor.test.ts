@@ -92,13 +92,16 @@ describe("UsageMonitor staleness tracking", () => {
     expect(monitor.isDataStale()).toBe(false);
   });
 
-  it("tracks consecutive failures on 429 responses", async () => {
+  it("tracks consecutive failures on 429 responses (no retry)", async () => {
     const monitor = makeMonitor();
     fetchMock.mockResolvedValue(make429Response());
 
-    await pollWithFakeTimers(monitor);
+    // 429 no longer retries — returns immediately with failure
+    await monitor.poll();
 
     expect(monitor.getConsecutiveFailures()).toBe(1);
+    // Should only have made 1 fetch call (no retries on 429)
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("resets consecutive failures after a successful poll", async () => {
@@ -122,11 +125,11 @@ describe("UsageMonitor staleness tracking", () => {
     await monitor.poll();
     expect(monitor.isDataStale()).toBe(false);
 
-    // Advance time past 5 min stale threshold
-    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+    // Advance time past 30 min stale threshold (USAGE_STALE_THRESHOLD_MS)
+    vi.advanceTimersByTime(30 * 60 * 1000 + 1);
 
     expect(monitor.isDataStale()).toBe(true);
-    expect(monitor.getStaleDurationMs()).toBeGreaterThanOrEqual(5 * 60 * 1000);
+    expect(monitor.getStaleDurationMs()).toBeGreaterThanOrEqual(30 * 60 * 1000);
   });
 
   it("clears stale status on successful poll", async () => {
@@ -134,7 +137,7 @@ describe("UsageMonitor staleness tracking", () => {
     fetchMock.mockResolvedValue(makeApiResponse(5.0));
 
     await monitor.poll();
-    vi.advanceTimersByTime(6 * 60 * 1000);
+    vi.advanceTimersByTime(31 * 60 * 1000);
     expect(monitor.isDataStale()).toBe(true);
 
     await monitor.poll();
@@ -168,6 +171,169 @@ describe("UsageMonitor staleness tracking", () => {
     await monitor.poll();
 
     expect(monitor.getConsecutiveFailures()).toBe(1);
+  });
+});
+
+describe("UsageMonitor rate tracking", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    fetchMock.mockReset();
+  });
+
+  it("returns null rate with insufficient data (< 2 samples)", async () => {
+    const monitor = makeMonitor();
+    fetchMock.mockResolvedValue(makeApiResponse(5.0));
+
+    await monitor.poll();
+    expect(monitor.getUsageRatePerMinute()).toBeNull();
+  });
+
+  it("calculates usage rate from two samples", async () => {
+    const monitor = makeMonitor();
+
+    // First poll: 5%
+    fetchMock.mockResolvedValue(makeApiResponse(5.0));
+    await monitor.poll();
+
+    // Advance 5 minutes
+    vi.advanceTimersByTime(5 * 60 * 1000);
+
+    // Second poll: 8% (3% increase over 5 minutes = 0.6%/min)
+    fetchMock.mockResolvedValue(makeApiResponse(8.0));
+    await monitor.poll();
+
+    const rate = monitor.getUsageRatePerMinute();
+    expect(rate).not.toBeNull();
+    // 3% over 5 min = 0.6%/min = 0.006 as fraction
+    expect(rate!).toBeCloseTo(0.006, 4);
+  });
+
+  it("calculates running average across multiple samples", async () => {
+    const monitor = makeMonitor();
+
+    // Sample 1: 10%
+    fetchMock.mockResolvedValue(makeApiResponse(10.0));
+    await monitor.poll();
+
+    // 5 min later, 13% (+3%)
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(13.0));
+    await monitor.poll();
+
+    // 5 min later, 20% (+7%)
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(20.0));
+    await monitor.poll();
+
+    const rate = monitor.getUsageRatePerMinute();
+    expect(rate).not.toBeNull();
+    // 10% increase over 10 min = 1%/min = 0.01 as fraction
+    expect(rate!).toBeCloseTo(0.01, 4);
+  });
+
+  it("estimates minutes until threshold", async () => {
+    const monitor = makeMonitor(); // default threshold 0.80
+
+    // 20%
+    fetchMock.mockResolvedValue(makeApiResponse(20.0));
+    await monitor.poll();
+
+    // 5 min later, 25% (+5%, so 1%/min)
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(25.0));
+    await monitor.poll();
+
+    // At 25%, threshold at 80%, rate 1%/min → 55 min
+    const eta = monitor.estimateMinutesUntilThreshold();
+    expect(eta).not.toBeNull();
+    expect(eta!).toBeCloseTo(55, 0);
+  });
+
+  it("returns 0 minutes when already past threshold", async () => {
+    const monitor = makeMonitor();
+
+    fetchMock.mockResolvedValue(makeApiResponse(80.0));
+    await monitor.poll();
+
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(85.0));
+    await monitor.poll();
+
+    const eta = monitor.estimateMinutesUntilThreshold();
+    expect(eta).toBe(0);
+  });
+
+  it("resets rate history on window reset (usage drops)", async () => {
+    const monitor = makeMonitor();
+
+    fetchMock.mockResolvedValue(makeApiResponse(50.0));
+    await monitor.poll();
+
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(55.0));
+    await monitor.poll();
+
+    expect(monitor.getUsageRatePerMinute()).not.toBeNull();
+
+    // Usage drops significantly — window reset
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(5.0));
+    await monitor.poll();
+
+    // Rate should be null — history was cleared, only 1 sample
+    expect(monitor.getUsageRatePerMinute()).toBeNull();
+  });
+
+  it("isThresholdPredicted returns true when ETA < poll interval", async () => {
+    const monitor = makeMonitor({ pollIntervalMs: 300_000 }); // 5 min polls
+
+    // 70%
+    fetchMock.mockResolvedValue(makeApiResponse(70.0));
+    await monitor.poll();
+
+    // 5 min later, 78% (+8%, so 1.6%/min) — threshold 80% is only 1.25 min away
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(78.0));
+    await monitor.poll();
+
+    expect(monitor.isThresholdPredicted()).toBe(true);
+  });
+
+  it("isThresholdPredicted returns false when ETA > poll interval", async () => {
+    const monitor = makeMonitor({ pollIntervalMs: 300_000 });
+
+    // 20%
+    fetchMock.mockResolvedValue(makeApiResponse(20.0));
+    await monitor.poll();
+
+    // 5 min later, 22% — slow rate, far from threshold
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(22.0));
+    await monitor.poll();
+
+    expect(monitor.isThresholdPredicted()).toBe(false);
+  });
+
+  it("getRateSummary returns readable string", async () => {
+    const monitor = makeMonitor();
+
+    fetchMock.mockResolvedValue(makeApiResponse(10.0));
+    await monitor.poll();
+
+    vi.advanceTimersByTime(5 * 60 * 1000);
+    fetchMock.mockResolvedValue(makeApiResponse(15.0));
+    await monitor.poll();
+
+    const summary = monitor.getRateSummary();
+    expect(summary).toContain("rate:");
+    expect(summary).toContain("%/min");
+    expect(summary).toContain("ETA");
   });
 });
 

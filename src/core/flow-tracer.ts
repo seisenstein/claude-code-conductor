@@ -60,8 +60,6 @@ export class FlowTracer {
     diff: string,
     cycle: number,
   ): Promise<FlowTracingReport> {
-    const startTime = Date.now();
-
     // Load project-specific flow config (or generic defaults)
     const config = await loadFlowConfig(this.projectDir);
 
@@ -123,7 +121,7 @@ export class FlowTracer {
     );
 
     // Step 5: Build and save report with secure permissions
-    const report = this.buildReport(deduplicated, flows.length, startTime);
+    const report = this.buildReport(deduplicated, flows.length);
     const reportPath = getFlowTracingReportPath(this.projectDir, cycle);
     await fs.writeFile(reportPath, JSON.stringify(report, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
 
@@ -475,12 +473,9 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
     };
   }
 
-  // TODO(dead-code): startTime parameter is unused. Was likely intended for timing metrics.
-  // Consider adding duration_ms to FlowTracingReport or removing parameter.
   private buildReport(
     findings: FlowFinding[],
     flowsTraced: number,
-    _startTime: number,
   ): FlowTracingReport {
     const summary = {
       critical: findings.filter((f) => f.severity === "critical").length,

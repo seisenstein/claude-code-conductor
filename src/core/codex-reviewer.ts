@@ -3,9 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-// TODO(dead-code): CodexJsonResponse is imported but never used. It's defined in types.ts
-// for potential structured response parsing but parseStructuredResponse uses dynamic parsing instead.
-import type { CodexReviewResult, CodexVerdict, CodexJsonResponse, CodexUsageMetrics } from "../utils/types.js";
+import type { CodexReviewResult, CodexVerdict, CodexUsageMetrics } from "../utils/types.js";
 import { getCodexReviewsDir } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
 
