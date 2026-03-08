@@ -6,6 +6,7 @@ export class Logger {
   private name: string;
   private logFilePath: string;
   private logStream: fs.WriteStream;
+  private closed: boolean = false;
 
   constructor(logDir: string, name: string) {
     this.name = name;
@@ -16,6 +17,26 @@ export class Logger {
     this.logFilePath = path.join(logDir, `${name}.log`);
     // Use mode 0o600 for owner-only read/write access (security requirement #15)
     this.logStream = fs.createWriteStream(this.logFilePath, { flags: "a", mode: 0o600 });
+
+    // Safety net: close stream on process exit to prevent file descriptor leak (task-010)
+    process.on("exit", () => this.close());
+  }
+
+  /**
+   * Close the write stream. Idempotent - safe to call multiple times.
+   * Fixes file descriptor leak when Logger instances are not explicitly closed.
+   */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.logStream.end();
+  }
+
+  /**
+   * Check if the logger has been closed.
+   */
+  isClosed(): boolean {
+    return this.closed;
   }
 
   info(message: string): void {
@@ -62,6 +83,8 @@ export class Logger {
   }
 
   private writeToFile(line: string): void {
+    // Don't write to closed stream
+    if (this.closed) return;
     this.logStream.write(line + "\n");
   }
 }

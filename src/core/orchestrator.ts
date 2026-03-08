@@ -1879,6 +1879,13 @@ export class Orchestrator {
     } catch {
       // Best effort
     }
+
+    // Close logger to prevent file descriptor leak (task-010)
+    try {
+      this.logger.close();
+    } catch {
+      // Best effort
+    }
   }
 
   private async complete(): Promise<void> {
