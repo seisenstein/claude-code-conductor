@@ -168,10 +168,22 @@ export class CodexUsageMonitor implements ProviderUsageMonitor {
     this.logger.info("Codex reset time reached, verifying utilization...");
     let snapshot = await this.poll();
 
+    // Keep waiting in 60s increments if still above the resume threshold.
+    // Bounded to MAX_WAIT_ITERATIONS to prevent infinite loops (C-1 fix, ported from UsageMonitor H23).
+    const MAX_WAIT_ITERATIONS = 60; // 60 * 60s = 1 hour max wait
+    let iterations = 0;
     while (snapshot.five_hour >= RESUME_UTILIZATION_THRESHOLD) {
+      if (iterations >= MAX_WAIT_ITERATIONS) {
+        this.logger.error(
+          `waitForReset exceeded max iterations (${MAX_WAIT_ITERATIONS}). ` +
+          `Utilization still at ${(snapshot.five_hour * 100).toFixed(1)}%. Returning to avoid infinite wait.`
+        );
+        break;
+      }
+      iterations++;
       this.logger.warn(
         `Codex utilization still at ${(snapshot.five_hour * 100).toFixed(1)}% ` +
-        `(need < ${(RESUME_UTILIZATION_THRESHOLD * 100).toFixed(0)}%). Waiting 60s...`,
+        `(need < ${(RESUME_UTILIZATION_THRESHOLD * 100).toFixed(0)}%). Waiting 60s... (attempt ${iterations}/${MAX_WAIT_ITERATIONS})`,
       );
       await sleep(60_000);
       snapshot = await this.poll();

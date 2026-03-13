@@ -19,7 +19,7 @@ import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
-import { appendJsonlLocked } from "../utils/secure-fs.js";
+import { appendJsonlLocked, writeFileSecure, mkdirSecure } from "../utils/secure-fs.js";
 
 interface WorkerHandle {
   sessionId: string;
@@ -128,7 +128,8 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     this.logger.info(`Sending wind-down signal to all workers: ${reason}`);
 
     const messagesDir = path.join(this.orchestratorDir, MESSAGES_DIR);
-    await fs.mkdir(messagesDir, { recursive: true });
+    // H-9/H-10 FIX: Use mkdirSecure for secure directory permissions (mode 0o700)
+    await mkdirSecure(messagesDir);
 
     const message: Message = {
       id: `orchestrator-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -269,7 +270,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
 
   private async initializeSessionStatus(sessionId: string, progress: string): Promise<void> {
     const sessionDir = path.join(this.orchestratorDir, SESSIONS_DIR, sessionId);
-    await fs.mkdir(sessionDir, { recursive: true });
+    await mkdirSecure(sessionDir);
 
     const initialStatus: SessionStatus = {
       session_id: sessionId,
@@ -280,10 +281,10 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       updated_at: new Date().toISOString(),
     };
 
-    await fs.writeFile(
+    // H-7 FIX: Use writeFileSecure for proper permissions (owner rw only)
+    await writeFileSecure(
       path.join(sessionDir, SESSION_STATUS_FILE),
       JSON.stringify(initialStatus, null, 2) + "\n",
-      "utf-8",
     );
   }
 
@@ -568,7 +569,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     const sessionDir = path.join(this.orchestratorDir, SESSIONS_DIR, sessionId);
 
     try {
-      await fs.mkdir(sessionDir, { recursive: true });
+      await mkdirSecure(sessionDir);
 
       const statusPath = path.join(sessionDir, SESSION_STATUS_FILE);
       let existing: SessionStatus | null = null;
@@ -589,8 +590,8 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
         updated_at: new Date().toISOString(),
       };
 
-      // Use secure permissions: mode 0o600 for file (owner rw only)
-      await fs.writeFile(statusPath, JSON.stringify(status, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+      // H-8 FIX: Use writeFileSecure for proper permissions (owner rw only)
+      await writeFileSecure(statusPath, JSON.stringify(status, null, 2) + "\n");
     } catch (err) {
       this.logger.error(
         `Failed to update session status for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,

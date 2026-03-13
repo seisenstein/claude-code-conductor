@@ -260,14 +260,16 @@ describe("CodexWorkerManager H17 - checkWorkerHealth timeout tracking", () => {
 // ================================================================
 
 describe("CodexWorkerManager general security", () => {
-  it("uses writeFile with mode 0o600 for session status", async () => {
+  it("uses writeFileSecure for session status writes", async () => {
     const source = await fs.readFile(
       path.join(__dirname, "codex-worker-manager.ts"),
       "utf-8",
     );
 
-    // Session status files should have secure permissions
-    expect(source).toContain("0o600");
+    // Session status files should use writeFileSecure for proper permissions (H-7/H-8 fix)
+    expect(source).toContain("writeFileSecure");
+    // Should import writeFileSecure from secure-fs
+    expect(source).toContain("writeFileSecure");
   });
 
   it("uses appendJsonlLocked for message writes", async () => {
