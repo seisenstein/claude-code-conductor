@@ -28,7 +28,7 @@ import type {
   ProjectProfile,
   ModelConfig,
 } from "../utils/types.js";
-import { MODEL_TIER_TO_ID } from "../utils/types.js";
+import { MODEL_TIER_TO_ID, ConductorExitError } from "../utils/types.js";
 
 import {
   BRANCH_PREFIX,
@@ -396,6 +396,11 @@ export class Orchestrator {
         }
 
         // Phase 3: Code review and flow tracing in parallel (both are read-only)
+        // Set status ONCE before Promise.all to avoid concurrent setStatus/save
+        // race condition (C2 fix). Individual review()/flowReview() methods must
+        // NOT call setStatus — only setProgress (which is informational/idempotent).
+        await this.state.setStatus("reviewing");
+
         // Use separate start timestamps for accurate per-phase duration tracking
         const reviewStart = Date.now();
         const flowStart = Date.now();
@@ -518,6 +523,11 @@ export class Orchestrator {
       this.logger.warn("Maximum cycles reached. Completing with current state.");
       await this.complete();
     } catch (err) {
+      if (err instanceof ConductorExitError) {
+        // Let the error propagate — CLI layer will handle process.exit
+        // after the finally block runs cleanup (event log flush, state save).
+        throw err;
+      }
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`Conductor failed: ${message}`);
       try {
@@ -1473,7 +1483,8 @@ export class Orchestrator {
     const reviewStartTime = Date.now();
     recordPhaseStart(this.eventLog, "reviewing");
 
-    await this.state.setStatus("reviewing");
+    // Note: setStatus("reviewing") is called ONCE before the Promise.all that runs
+    // review() and flowReview() in parallel — do NOT call setStatus here (C2 fix).
     await this.state.setProgress("Reviewing: checking code changes...");
     await logProgress(this.options.project, "reviewing", "Starting Codex code review");
     this.logger.info("Review phase: checking code changes...");
@@ -1701,7 +1712,8 @@ export class Orchestrator {
       return null;
     }
 
-    await this.state.setStatus("flow_tracing");
+    // Note: setStatus("reviewing") is called ONCE before the Promise.all that runs
+    // review() and flowReview() in parallel — do NOT call setStatus here (C2 fix).
     await this.state.setProgress("Reviewing: flow tracing user flows across layers...");
     await logProgress(this.options.project, "flow_tracing", "Tracing user flows across layers");
     this.logger.info("Flow-tracing review phase: tracing user flows across layers...");
@@ -2158,7 +2170,7 @@ export class Orchestrator {
           JSON.stringify(escalation, null, 2) + "\n",
           { encoding: "utf-8", mode: 0o600 },
         );
-        process.exit(2);
+        throw new ConductorExitError(2, "User requested pause");
       }
 
       // Interactive mode: just return and let the process exit naturally
@@ -2231,8 +2243,10 @@ export class Orchestrator {
 
       this.logger.info(`Escalation written to ${escalationPath} — exiting for external handler`);
 
-      // Exit with code 2 to signal "escalation needed" to the caller
-      process.exit(2);
+      // Throw ConductorExitError to signal "escalation needed" to the caller.
+      // This allows finally blocks to run cleanup (event log flush, state save)
+      // before the CLI layer translates it into process.exit(2).
+      throw new ConductorExitError(2, reason);
     }
 
     // Interactive mode: prompt via stdin
@@ -2436,13 +2450,20 @@ export class Orchestrator {
       (f) => f.severity === "critical" || f.severity === "high",
     );
 
-    // Determine next task ID offset
+    // Use "task-fix-" prefix to avoid ID collisions with replanned tasks
+    // that use the standard "task-NNN" scheme. Also check for existing IDs
+    // to be extra safe against collisions.
     const allTasks = await this.state.getAllTasks();
-    let nextTaskNum = allTasks.length + 1;
+    const existingIds = new Set(allTasks.map((t) => t.id));
+    let nextTaskNum = 1;
 
     for (const finding of criticalAndHigh) {
-      const taskId = `task-${String(nextTaskNum).padStart(3, "0")}`;
-      nextTaskNum++;
+      let taskId: string;
+      do {
+        taskId = `task-fix-${String(nextTaskNum).padStart(3, "0")}`;
+        nextTaskNum++;
+      } while (existingIds.has(taskId));
+      existingIds.add(taskId);
 
       const taskDef: TaskDefinition = {
         subject: `Fix: ${finding.title}`,
