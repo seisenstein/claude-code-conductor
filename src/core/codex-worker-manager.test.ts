@@ -741,14 +741,15 @@ describe("CodexWorkerManager H-10 - Retry Tracking and Session Resumption", () =
     expect(source).toContain("this.retryTracker = new TaskRetryTracker()");
   });
 
-  it("source has lastThreadIds map for storing thread IDs", async () => {
+  it("source has taskThreadIds map for storing thread IDs by task", async () => {
     const source = await fs.readFile(
       path.join(__dirname, "codex-worker-manager.ts"),
       "utf-8",
     );
 
-    // H-10: Must have lastThreadIds map
-    expect(source).toContain("lastThreadIds");
+    // H-10 FIX: Must have taskThreadIds map (keyed by TASK ID, not session ID)
+    // This enables session resumption when retrying a failed task with a new worker
+    expect(source).toContain("taskThreadIds");
     expect(source).toContain("Map<string, string>");
   });
 
@@ -774,28 +775,36 @@ describe("CodexWorkerManager H-10 - Retry Tracking and Session Resumption", () =
     expect(source).toContain("H-10");
   });
 
-  it("source records failure in retry tracker on worker failure", async () => {
+  it("source records failure in retry tracker on worker failure using task ID", async () => {
     const source = await fs.readFile(
       path.join(__dirname, "codex-worker-manager.ts"),
       "utf-8",
     );
 
-    // H-10: Must call retryTracker.recordFailure in the settle callback
-    expect(source).toContain("this.retryTracker.recordFailure(sessionId, message)");
+    // H-10 FIX: Must call retryTracker.recordFailure with TASK ID (not session ID)
+    // This is critical for retry attribution - StateManager.resetOrphanedTasks
+    // checks retries by task.id, so we must record against the task ID.
+    expect(source).toContain("this.retryTracker.recordFailure(taskId, message)");
+
+    // Must look up taskId from handle or sessionToTaskMap
+    expect(source).toContain("handle.taskId ?? this.sessionToTaskMap.get(sessionId)");
   });
 
-  it("source preserves threadId in lastThreadIds before cleanup", async () => {
+  it("source preserves threadId in taskThreadIds by task ID before cleanup", async () => {
     const source = await fs.readFile(
       path.join(__dirname, "codex-worker-manager.ts"),
       "utf-8",
     );
 
-    // H-10: Must store threadId in lastThreadIds before cleanup
-    expect(source).toContain("this.lastThreadIds.set(sessionId, handle.threadId)");
+    // H-10 FIX: Must store threadId in taskThreadIds by TASK ID (not session ID)
+    // This is critical: when a worker fails, we preserve the thread ID keyed by the
+    // TASK ID so that when a NEW worker session retries that task, it can retrieve
+    // the thread ID and resume the Codex session.
+    expect(source).toContain("this.taskThreadIds.set(failedTaskId, handle.threadId)");
     // H-10: Thread ID preservation must happen before tracker cleanup
-    const lastThreadIdsSetIdx = source.indexOf("this.lastThreadIds.set(sessionId");
+    const taskThreadIdsSetIdx = source.indexOf("this.taskThreadIds.set(failedTaskId");
     const stopTrackingIdx = source.indexOf("this.timeoutTracker.stopTracking(sessionId)");
-    expect(lastThreadIdsSetIdx).toBeLessThan(stopTrackingIdx);
+    expect(taskThreadIdsSetIdx).toBeLessThan(stopTrackingIdx);
   });
 
   // ================================================================

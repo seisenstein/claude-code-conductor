@@ -1304,6 +1304,13 @@ export class Orchestrator {
 
         // Check if all tasks are complete
         const allTasks = await this.state.getAllTasks();
+
+        // H-10 FIX: Sync task claim mappings for proper failure attribution.
+        // Workers claim tasks via MCP (separate process), so the orchestrator
+        // must poll task state to maintain the session-to-task mapping used
+        // for retry tracking when a worker crashes.
+        this.syncTaskClaimMappings(allTasks);
+
         const remaining = allTasks.filter(
           (t) => t.status === "pending" || t.status === "in_progress",
         );
@@ -2434,6 +2441,59 @@ export class Orchestrator {
   private async getWorkerCurrentTask(sessionId: string): Promise<Task | null> {
     const inProgressTasks = await this.state.getTasksByStatus("in_progress");
     return inProgressTasks.find((t) => t.owner === sessionId) ?? null;
+  }
+
+  /**
+   * H-10 FIX: Synchronize task claim mappings from polled task state.
+   *
+   * Workers claim tasks via the MCP coordination server (a separate process).
+   * The orchestrator must poll task files and update its internal session-to-task
+   * mapping so that when a worker crashes, we can correctly attribute the failure
+   * to the specific task ID (not the session ID). This is essential for retry
+   * tracking since StateManager.resetOrphanedTasks checks retries by task.id.
+   *
+   * This method:
+   * 1. Finds all in_progress tasks with an owner
+   * 2. Registers task claims for active workers
+   * 3. Clears task claims for completed/failed tasks
+   */
+  private syncTaskClaimMappings(allTasks: Task[]): void {
+    // Only proceed if the worker manager supports task claim tracking
+    if (!this.workers.registerTaskClaim || !this.workers.clearTaskClaim) {
+      return;
+    }
+
+    const activeWorkers = new Set(this.workers.getActiveWorkers());
+
+    // Track which sessions have in_progress tasks
+    const sessionsWithTasks = new Set<string>();
+
+    // Register claims for in_progress tasks with owners
+    for (const task of allTasks) {
+      if (task.status === "in_progress" && task.owner) {
+        sessionsWithTasks.add(task.owner);
+
+        // Only register if the owner is still an active worker
+        if (activeWorkers.has(task.owner)) {
+          // Check if this claim is already registered to avoid redundant logging
+          const currentClaim = this.workers.getClaimedTaskId?.(task.owner);
+          if (currentClaim !== task.id) {
+            this.workers.registerTaskClaim(task.owner, task.id);
+          }
+        }
+      }
+    }
+
+    // Clear claims for workers that no longer have in_progress tasks
+    // (e.g., their task was completed or failed)
+    for (const sessionId of activeWorkers) {
+      if (!sessionsWithTasks.has(sessionId)) {
+        const currentClaim = this.workers.getClaimedTaskId?.(sessionId);
+        if (currentClaim) {
+          this.workers.clearTaskClaim(sessionId);
+        }
+      }
+    }
   }
 
   /**

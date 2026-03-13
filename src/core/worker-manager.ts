@@ -409,6 +409,25 @@ export class WorkerManager implements ExecutionWorkerManager {
     return this.retryTracker;
   }
 
+  // H-10 FIX (Task 9): Task claim tracking for proper failure attribution
+  // These are optional on the interface but implemented for consistency.
+  // The Claude SDK worker manager doesn't need internal tracking because
+  // failures are recorded by the orchestrator via getWorkerCurrentTask().
+
+  private sessionToTaskMap: Map<string, string> = new Map();
+
+  registerTaskClaim(sessionId: string, taskId: string): void {
+    this.sessionToTaskMap.set(sessionId, taskId);
+  }
+
+  clearTaskClaim(sessionId: string): void {
+    this.sessionToTaskMap.delete(sessionId);
+  }
+
+  getClaimedTaskId(sessionId: string): string | null {
+    return this.sessionToTaskMap.get(sessionId) ?? null;
+  }
+
   // ----------------------------------------------------------------
   // Private: Worker execution
   // ----------------------------------------------------------------

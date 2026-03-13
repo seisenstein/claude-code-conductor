@@ -430,6 +430,42 @@ export interface ExecutionWorkerManager {
    * Returns null if retry tracking is not supported.
    */
   getRetryTracker(): TaskRetryTrackerInterface | null;
+
+  // H-10 FIX (Task 9): Task claim tracking for proper failure attribution
+  /**
+   * Register a task claim for failure attribution.
+   * Called when a worker claims a task.
+   */
+  registerTaskClaim?(sessionId: string, taskId: string): void;
+
+  /**
+   * Clear a task claim when a task is completed or released.
+   */
+  clearTaskClaim?(sessionId: string): void;
+
+  /**
+   * Get the task ID currently claimed by a session.
+   * Returns null if no task is claimed.
+   */
+  getClaimedTaskId?(sessionId: string): string | null;
+
+  // H-10 FIX: Session resumption support for retries
+  /**
+   * Spawn a worker specifically for retrying a failed task.
+   * If a thread ID was preserved from the previous failed attempt, the worker
+   * may use session resumption for better context continuity.
+   *
+   * @param sessionId - New session ID for the retry worker
+   * @param taskId - The task ID being retried
+   * @param correctivePrompt - Optional prompt explaining what went wrong
+   */
+  spawnWorkerForRetry?(sessionId: string, taskId: string, correctivePrompt?: string): Promise<void>;
+
+  /**
+   * Get a preserved thread ID for a task (for session resumption).
+   * Returns null if no thread ID is available for the task.
+   */
+  getThreadIdForTask?(taskId: string): string | null;
 }
 
 // ============================================================
