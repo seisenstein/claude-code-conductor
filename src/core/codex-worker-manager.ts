@@ -5,21 +5,27 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type {
   ExecutionWorkerManager,
   Message,
+  ModelConfig,
   OrchestratorEvent,
   SessionStatus,
   WorkerSharedContext,
 } from "../utils/types.js";
+import { DEFAULT_MODEL_CONFIG } from "../utils/types.js";
 import {
   MESSAGES_DIR,
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
   MAX_BUFFER_SIZE_BYTES,
+  CODEX_MODEL_MAP,
+  CODEX_JOB_MAX_RUNTIME_SECONDS,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
 import { appendJsonlLocked, writeFileSecure, mkdirSecure } from "../utils/secure-fs.js";
+// H-9 FIX: Import resilience trackers for heartbeat-based stale detection
+import { HeartbeatTracker, WorkerTimeoutTracker } from "./worker-resilience.js";
 
 interface WorkerHandle {
   sessionId: string;
@@ -29,6 +35,10 @@ interface WorkerHandle {
   child: ChildProcess | null;
   lastMessage: string | null;
   rateLimitReported: boolean;
+  // H-9: Monotonic timestamp of last JSONL event for heartbeat tracking
+  lastEventAt: bigint;
+  // H-9: Thread ID from thread.started JSONL event (used for session resumption in H-10)
+  threadId: string | null;
 }
 
 type CodexSandboxMode = "workspace-write" | "read-only";
@@ -39,12 +49,21 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
 
   private workerContext: WorkerSharedContext = {};
 
+  // H-9 FIX: Resilience trackers for heartbeat-based stale detection and wall-clock timeout
+  private heartbeatTracker: HeartbeatTracker;
+  private timeoutTracker: WorkerTimeoutTracker;
+
+  // M-19: Accept ModelConfig for Codex model selection and subagent model hints
   constructor(
     private projectDir: string,
     private orchestratorDir: string,
     private mcpServerPath: string,
     private logger: Logger,
-  ) {}
+    private modelConfig: ModelConfig = DEFAULT_MODEL_CONFIG,
+  ) {
+    this.heartbeatTracker = new HeartbeatTracker();
+    this.timeoutTracker = new WorkerTimeoutTracker();
+  }
 
   setWorkerContext(context: WorkerSharedContext): void {
     this.workerContext = context;
@@ -67,9 +86,14 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       child: null,
       lastMessage: null,
       rateLimitReported: false,
+      lastEventAt: process.hrtime.bigint(),
+      threadId: null,
     };
 
     this.activeWorkers.set(sessionId, handle);
+    // H-9 FIX: Start resilience tracking for heartbeat and timeout detection
+    this.timeoutTracker.startTracking(sessionId);
+    this.heartbeatTracker.recordHeartbeat(sessionId); // Initial heartbeat
     handle.promise = this.runCodexSession(
       sessionId,
       handle,
@@ -98,9 +122,14 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       child: null,
       lastMessage: null,
       rateLimitReported: false,
+      lastEventAt: process.hrtime.bigint(),
+      threadId: null,
     };
 
     this.activeWorkers.set(sentinelId, handle);
+    // H-9 FIX: Start resilience tracking for heartbeat and timeout detection
+    this.timeoutTracker.startTracking(sentinelId);
+    this.heartbeatTracker.recordHeartbeat(sentinelId); // Initial heartbeat
     handle.promise = this.runCodexSession(
       sentinelId,
       handle,
@@ -240,23 +269,22 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   /**
-   * Check worker health by comparing start times against a configurable timeout.
-   * H17: Returns workers that have exceeded the wall-clock timeout (30 minutes).
-   * Stale detection is not supported for Codex workers (no heartbeat mechanism).
+   * Check worker health using resilience trackers.
+   * H-9 FIX: Uses WorkerTimeoutTracker for wall-clock timeout and HeartbeatTracker
+   * for JSONL-stream-based stale detection (replaces hardcoded 30-minute timeout).
+   *
+   * Performance: O(n) where n = active workers.
    */
   checkWorkerHealth(): { timedOut: string[]; stale: string[] } {
-    const CODEX_WORKER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-    const now = Date.now();
-    const timedOut: string[] = [];
+    const timedOut = this.timeoutTracker
+      .getTimedOutWorkers()
+      .filter((id) => this.activeWorkers.has(id));
 
-    for (const [sessionId, handle] of this.activeWorkers) {
-      const startedAt = new Date(handle.startedAt).getTime();
-      if (now - startedAt > CODEX_WORKER_TIMEOUT_MS) {
-        timedOut.push(sessionId);
-      }
-    }
+    const stale = this.heartbeatTracker
+      .getStaleWorkers()
+      .filter((id) => this.activeWorkers.has(id) && !timedOut.includes(id));
 
-    return { timedOut, stale: [] };
+    return { timedOut, stale };
   }
 
   /**
@@ -339,6 +367,10 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
             this.recordEvent(handle, { type: "session_failed", sessionId, error: message });
             await this.updateSessionStatus(sessionId, "failed", message);
           }
+
+          // H-9 FIX: Clean up resilience trackers to prevent memory leaks
+          this.timeoutTracker.stopTracking(sessionId);
+          this.heartbeatTracker.cleanup(sessionId);
 
           handle.child = null;
           this.activeWorkers.delete(sessionId);
@@ -448,7 +480,17 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       return;
     }
 
+    // H-9 FIX: Every valid JSONL line serves as a heartbeat — update monotonic timestamp
+    handle.lastEventAt = process.hrtime.bigint();
+    this.heartbeatTracker.recordHeartbeat(sessionId);
+
     const eventType = typeof parsed.type === "string" ? parsed.type : "unknown";
+
+    // H-9: Capture thread ID from thread.started events for session resumption (H-10)
+    if (eventType === "thread.started" && typeof parsed.thread_id === "string" && parsed.thread_id.length > 0) {
+      handle.threadId = parsed.thread_id;
+      this.logger.debug(`Codex worker ${sessionId} thread started: ${handle.threadId}`);
+    }
 
     if (eventType === "error") {
       const message = coerceLogText(parsed.message ?? parsed);
@@ -527,8 +569,13 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     sandbox: CodexSandboxMode,
     outputPath: string,
   ): string[] {
+    // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
+    const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];
+
     return [
       "exec",
+      "--model",
+      codexModel,
       "--json",
       "--full-auto",
       "--sandbox",
@@ -600,9 +647,11 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   private buildWorkerPrompt(sessionId: string): string {
+    // M-19: Pass subagentModel so the worker prompt includes a model hint for spawned subagents
     return getWorkerPrompt({
       sessionId,
       runtime: "codex",
+      subagentModel: this.modelConfig.subagent,
       ...this.workerContext,
     });
   }

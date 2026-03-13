@@ -51,6 +51,7 @@ import {
   getTasksDraftPath,
   getFlowTracingSummaryPath,
   getKnownIssuesPath,
+  CODEX_JOB_MAX_RUNTIME_SECONDS,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -223,6 +224,7 @@ export class Orchestrator {
           orchestratorDir,
           mcpServerPath,
           this.logger,
+          options.modelConfig, // M-19: Pass model config for Codex model selection
         )
       : new WorkerManager(
           options.project,
@@ -772,6 +774,7 @@ export class Orchestrator {
     const configDir = path.join(this.options.project, ".codex");
     await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
 
+    // M-19: Include agents.job_max_runtime_seconds for belt-and-suspenders timeout
     const toml = [
       "[mcp_servers.coordinator]",
       `command = "node"`,
@@ -781,6 +784,9 @@ export class Orchestrator {
       `tool_timeout_sec = 30`,
       `enabled = true`,
       `required = false`,
+      "",
+      "[agents]",
+      `job_max_runtime_seconds = ${CODEX_JOB_MAX_RUNTIME_SECONDS}`,
       "",
     ].join("\n");
 
