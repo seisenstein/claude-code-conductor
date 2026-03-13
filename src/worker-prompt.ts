@@ -9,7 +9,7 @@
 
 import type { ProjectConventions, TaskType, WorkerRuntime, ClaudeModelTier } from "./utils/types.js";
 import { getPersona, formatPersonaPrompt } from "./worker-personas.js";
-import { sanitizePromptSection } from "./utils/sanitize.js";
+import { sanitizePromptSection, sanitizeConfigValue } from "./utils/sanitize.js";
 
 export interface WorkerPromptContext {
   sessionId: string;
@@ -142,11 +142,14 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
     convLines.push(``);
     convLines.push(`The following patterns were detected in the existing codebase. Follow them to maintain consistency.`);
 
+    // M-3 FIX: Sanitize all convention array items before prompt injection.
+    // Convention strings come from the conventions-extractor agent output and
+    // could contain prompt injection payloads (role markers, markdown headers).
     if (conv.auth_patterns.length > 0) {
       convLines.push(``);
       convLines.push(`### Authentication Patterns`);
       for (const p of conv.auth_patterns) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
@@ -154,7 +157,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(``);
       convLines.push(`### Validation Patterns`);
       for (const p of conv.validation_patterns) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
@@ -162,7 +165,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(``);
       convLines.push(`### Error Handling Patterns`);
       for (const p of conv.error_handling_patterns) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
@@ -170,7 +173,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(``);
       convLines.push(`### Key Libraries`);
       for (const lib of conv.key_libraries) {
-        convLines.push(`- **${lib.name}**: ${lib.purpose}`);
+        convLines.push(`- **${sanitizeConfigValue(lib.name, 100)}**: ${sanitizeConfigValue(lib.purpose, 400)}`);
       }
     }
 
@@ -178,7 +181,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(``);
       convLines.push(`### Test Patterns`);
       for (const p of conv.test_patterns) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
@@ -186,7 +189,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(``);
       convLines.push(`### Directory Structure`);
       for (const p of conv.directory_structure) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
@@ -194,7 +197,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(``);
       convLines.push(`### Naming Conventions`);
       for (const p of conv.naming_conventions) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
@@ -203,7 +206,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
       convLines.push(`### Security Invariants`);
       convLines.push(`These MUST be maintained. Breaking these is a blocking issue.`);
       for (const p of conv.security_invariants) {
-        convLines.push(`- ${p}`);
+        convLines.push(`- ${sanitizeConfigValue(p, 500)}`);
       }
     }
 
