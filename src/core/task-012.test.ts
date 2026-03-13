@@ -379,7 +379,7 @@ describe("task-012: clearTaskFiles on replan", () => {
 // ============================================================
 
 describe("task-012: handleGetTasks applies status_filter when ranked=true", () => {
-  it("source code applies status_filter after ranking", async () => {
+  it("source code handles status_filter with ranked=true correctly (H-11)", async () => {
     const source = await fs.readFile(
       path.join(process.cwd(), "src/mcp/tools.ts"),
       "utf-8",
@@ -393,16 +393,15 @@ describe("task-012: handleGetTasks applies status_filter when ranked=true", () =
 
     const funcBody = source.substring(funcStart, funcStart + 1500);
 
-    // Should apply status_filter after ranking
+    // Should handle status_filter
     expect(funcBody).toContain("input.status_filter");
 
-    // There should be a filter after rankClaimableTasks
-    const rankPos = funcBody.indexOf("rankClaimableTasks");
-    const filterPos = funcBody.indexOf(
-      "ranked.filter",
-      rankPos,
-    );
-    expect(filterPos).toBeGreaterThan(rankPos);
+    // H-11: When status_filter is non-pending with ranked=true,
+    // should skip ranking entirely and just filter by status.
+    // This is the correct fix — ranking only returns pending tasks,
+    // so a non-pending filter after ranking was always empty.
+    expect(funcBody).toContain('status_filter !== "pending"');
+    expect(funcBody).toContain("rankClaimableTasks");
   });
 });
 

@@ -46,7 +46,7 @@ describe("readJsonlFile", () => {
       filePath,
       '{"id":1,"name":"alice"}\nNOT_VALID_JSON\n{"id":2,"name":"bob"}\n{broken\n{"id":3,"name":"charlie"}\n',
     );
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const result = await readJsonlFile<{ id: number; name: string }>(filePath);
 
     expect(result).toHaveLength(3);
@@ -54,22 +54,24 @@ describe("readJsonlFile", () => {
     expect(result[1]).toEqual({ id: 2, name: "bob" });
     expect(result[2]).toEqual({ id: 3, name: "charlie" });
 
-    // Should have warned about the 2 malformed lines
-    expect(warnSpy).toHaveBeenCalledTimes(2);
-    expect(warnSpy.mock.calls[0]![0]).toContain("Skipping malformed JSON line");
-    expect(warnSpy.mock.calls[0]![0]).toContain("NOT_VALID_JSON");
-    expect(warnSpy.mock.calls[1]![0]).toContain("{broken");
-    warnSpy.mockRestore();
+    // Should have warned about the 2 malformed lines via process.stderr.write
+    const stderrCalls = stderrSpy.mock.calls.filter(c => String(c[0]).includes("[readJsonlFile]"));
+    expect(stderrCalls).toHaveLength(2);
+    expect(String(stderrCalls[0]![0])).toContain("Skipping malformed JSON line");
+    expect(String(stderrCalls[0]![0])).toContain("NOT_VALID_JSON");
+    expect(String(stderrCalls[1]![0])).toContain("{broken");
+    stderrSpy.mockRestore();
   });
 
   it("returns empty array for entirely malformed file", async () => {
     const filePath = path.join(tempDir, "allbad.jsonl");
     await fs.writeFile(filePath, "garbage\nmore garbage\nnope\n");
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const result = await readJsonlFile<unknown>(filePath);
     expect(result).toEqual([]);
-    expect(warnSpy).toHaveBeenCalledTimes(3);
-    warnSpy.mockRestore();
+    const stderrCalls = stderrSpy.mock.calls.filter(c => String(c[0]).includes("[readJsonlFile]"));
+    expect(stderrCalls).toHaveLength(3);
+    stderrSpy.mockRestore();
   });
 
   it("returns empty array for non-existent file", async () => {
@@ -104,24 +106,28 @@ describe("readJsonlFile", () => {
     const filePath = path.join(tempDir, "long-bad.jsonl");
     const longLine = "x".repeat(200);
     await fs.writeFile(filePath, longLine + "\n");
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     await readJsonlFile<unknown>(filePath);
     // The warning should truncate at 100 chars
-    const warnMsg = warnSpy.mock.calls[0]![0] as string;
+    const stderrCalls = stderrSpy.mock.calls.filter(c => String(c[0]).includes("[readJsonlFile]"));
+    expect(stderrCalls).toHaveLength(1);
+    const warnMsg = String(stderrCalls[0]![0]);
     expect(warnMsg).toContain("x".repeat(100));
     expect(warnMsg).not.toContain("x".repeat(200));
-    warnSpy.mockRestore();
+    stderrSpy.mockRestore();
   });
 
-  it("handles read errors gracefully (non-ENOENT)", async () => {
-    // Create a directory with the same name to trigger EISDIR
+  it("re-throws non-ENOENT read errors (M-28)", async () => {
+    // M-28: Non-ENOENT errors (like EISDIR, EACCES) should be re-thrown
+    // instead of silently returning an empty array
     const filePath = path.join(tempDir, "isdir.jsonl");
     await fs.mkdir(filePath, { recursive: true });
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const result = await readJsonlFile<unknown>(filePath);
-    expect(result).toEqual([]);
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0]![0]).toContain("Error reading");
-    warnSpy.mockRestore();
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await expect(readJsonlFile<unknown>(filePath)).rejects.toThrow("EISDIR");
+    // Should still log the error before re-throwing
+    const stderrCalls = stderrSpy.mock.calls.filter(c => String(c[0]).includes("[readJsonlFile]"));
+    expect(stderrCalls).toHaveLength(1);
+    expect(String(stderrCalls[0]![0])).toContain("Error reading");
+    stderrSpy.mockRestore();
   });
 });

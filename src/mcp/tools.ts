@@ -64,10 +64,18 @@ const RegisterContractInputSchema = z.object({
   spec: z.string().max(MAX_CONTRACT_SPEC_LENGTH, {
     message: `spec exceeds maximum length of ${MAX_CONTRACT_SPEC_LENGTH} characters`,
   }),
+  task_id: z.string().optional(), // H-12: Optional task_id for accurate contract provenance
 });
 
+// M-26: Valid ArchitecturalDecision categories matching the type in types.ts
+const VALID_DECISION_CATEGORIES = [
+  "naming", "auth", "data_model", "error_handling",
+  "api_design", "testing", "performance", "other",
+] as const;
+
 const RecordDecisionInputSchema = z.object({
-  category: z.string(),
+  // M-26: Validate category against allowed enum values instead of allowing any string
+  category: z.enum(VALID_DECISION_CATEGORIES),
   decision: z.string().max(MAX_DECISION_LENGTH, {
     message: `decision exceeds maximum length of ${MAX_DECISION_LENGTH} characters`,
   }),
@@ -78,7 +86,17 @@ const RecordDecisionInputSchema = z.object({
 });
 
 const PostUpdateInputSchema = z.object({
-  type: z.string(),
+  // M-25: Validate type against MessageType enum values instead of allowing any string
+  type: z.enum([
+    "status",
+    "question",
+    "answer",
+    "broadcast",
+    "wind_down",
+    "task_completed",
+    "error",
+    "escalation",
+  ]),
   content: z.string().max(MAX_MESSAGE_CONTENT_LENGTH, {
     message: `content exceeds maximum length of ${MAX_MESSAGE_CONTENT_LENGTH} characters`,
   }),
@@ -181,22 +199,23 @@ export async function readJsonlFile<T>(filePath: string): Promise<T[]> {
         results.push(JSON.parse(line) as T);
       } catch {
         // Skip malformed lines - log warning but don't crash
-        console.warn(
-          `[readJsonlFile] Skipping malformed JSON line in ${filePath}: ${line.substring(0, 100)}`,
+        process.stderr.write(
+          `[readJsonlFile] Skipping malformed JSON line in ${filePath}: ${line.substring(0, 100)}\n`,
         );
       }
     }
     return results;
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    const errCode = (err as NodeJS.ErrnoException).code;
+    if (errCode === "ENOENT") {
       return [];
     }
-    // For other read errors (permissions, etc.), log and return empty array
-    // rather than crashing the entire MCP server
-    console.warn(
-      `[readJsonlFile] Error reading ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+    // M-28: Re-throw permission errors (EACCES, EPERM) instead of silently swallowing.
+    // Only ENOENT (file not found) should return an empty array.
+    process.stderr.write(
+      `[readJsonlFile] Error reading ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`,
     );
-    return [];
+    throw err;
   }
 }
 
@@ -215,7 +234,9 @@ export async function handleReadUpdates(
   await ensureDir(dir);
 
   const sessionId = getSessionId();
-  const sinceTs = input.since ? new Date(input.since).getTime() : 0;
+  // M-27: Guard against invalid timestamps — NaN would cause all messages to pass the filter
+  const rawSinceTs = input.since ? new Date(input.since).getTime() : 0;
+  const sinceTs = Number.isNaN(rawSinceTs) ? 0 : rawSinceTs;
 
   let files: string[];
   try {
@@ -350,15 +371,18 @@ export async function handleGetTasks(
 
   // V2: If ranked=true, return prioritized claimable tasks
   if (input.ranked) {
+    // H-11: When status_filter is set to a non-pending value with ranked=true,
+    // skip ranking (which only returns pending tasks with completed deps) and
+    // just filter all tasks by the requested status.
+    if (input.status_filter && input.status_filter !== "pending") {
+      const filtered = tasks.filter((t) => t.status === input.status_filter);
+      filtered.sort((a, b) => a.id.localeCompare(b.id));
+      return filtered;
+    }
+
     // rankClaimableTasks filters to pending tasks with completed deps
     // and returns them sorted by priority score descending
-    let ranked = rankClaimableTasks(tasks);
-
-    // H28: Apply status_filter after ranking if provided.
-    // Previously status_filter was silently ignored when ranked=true.
-    if (input.status_filter) {
-      ranked = ranked.filter((t) => t.status === input.status_filter);
-    }
+    const ranked = rankClaimableTasks(tasks);
 
     return ranked;
   }
@@ -707,6 +731,7 @@ export interface RegisterContractInput {
   contract_id: string;
   contract_type: "api_endpoint" | "type_definition" | "event_schema" | "database_schema";
   spec: string;
+  task_id?: string; // H-12: Optional task_id for accurate contract provenance
 }
 
 export async function handleRegisterContract(
@@ -732,13 +757,34 @@ export async function handleRegisterContract(
     contract_id: input.contract_id,
     contract_type: input.contract_type,
     spec: input.spec,
-    owner_task_id: sessionId,
+    // H-12: Use task_id for owner_task_id when provided; fall back to sessionId for backward compat
+    owner_task_id: input.task_id ?? sessionId,
     registered_by: sessionId,
     registered_at: new Date().toISOString(),
   };
 
   const filePath = path.join(dir, `${input.contract_id}.json`);
-  await fs.writeFile(filePath, JSON.stringify(contract, null, 2), { encoding: "utf-8", mode: 0o600 });
+
+  // M-37: Use file locking for concurrency safety when writing contracts
+  let release: (() => Promise<void>) | undefined;
+  try {
+    // Ensure file exists for locking (create empty if needed)
+    try {
+      await fs.access(filePath);
+    } catch {
+      await fs.writeFile(filePath, "{}", { encoding: "utf-8", mode: 0o600 });
+    }
+    release = await lock(filePath, { retries: { retries: 3, minTimeout: 100 } });
+    await fs.writeFile(filePath, JSON.stringify(contract, null, 2), { encoding: "utf-8", mode: 0o600 });
+  } finally {
+    if (release) {
+      try {
+        await release();
+      } catch {
+        // Lock may already be released
+      }
+    }
+  }
 
   return contract;
 }
@@ -818,7 +864,8 @@ export async function handleRecordDecision(
     id: `dec-${timestamp}-${rand}`,
     task_id: input.task_id ?? "",
     session_id: sessionId,
-    category: input.category as ArchitecturalDecision["category"],
+    // M-26: category is now validated by RecordDecisionInputSchema (z.enum)
+    category: sizeValidation.data.category,
     decision: input.decision,
     rationale: input.rationale,
     timestamp: new Date().toISOString(),
@@ -916,8 +963,11 @@ export async function handleRunTests(
       output: output.length > 5000 ? output.slice(-5000) : output,
     };
   } catch (err: unknown) {
-    const execErr = err as { stdout?: string; stderr?: string; code?: number };
-    const output = ((execErr.stdout ?? "") + "\n" + (execErr.stderr ?? "")).trim();
+    // M-31: Use safe property access instead of unsafe type cast
+    const execErr = err && typeof err === "object" ? (err as Record<string, unknown>) : {};
+    const stdout = typeof execErr.stdout === "string" ? execErr.stdout : "";
+    const stderr = typeof execErr.stderr === "string" ? execErr.stderr : "";
+    const output = (stdout + "\n" + stderr).trim();
     return {
       passed: false,
       output: output.length > 5000 ? output.slice(-5000) : output,

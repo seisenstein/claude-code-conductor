@@ -36,6 +36,39 @@ function validateEnv(): void {
 }
 
 // ============================================================
+// M-36: Error handler wrapper for MCP tool handlers
+// ============================================================
+
+/**
+ * Wraps an async tool handler to catch unexpected errors and return a
+ * structured error response instead of crashing the MCP server.
+ */
+function wrapToolHandler<T>(
+  toolName: string,
+  handler: (args: T) => Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }>,
+): (args: T) => Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+  return async (args: T) => {
+    try {
+      return await handler(args);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown internal error";
+      process.stderr.write(
+        `[coordination-server] Error in tool '${toolName}': ${message}\n`,
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ error: `Internal error in ${toolName}: ${message}` }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  };
+}
+
+// ============================================================
 // MCP Server setup
 // ============================================================
 
@@ -65,7 +98,7 @@ async function main(): Promise<void> {
         "ISO 8601 timestamp. Only return messages newer than this. If omitted, returns all messages."
       ),
     },
-    async (args) => {
+    wrapToolHandler("read_updates", async (args: { since?: string }) => {
       const messages = await handleReadUpdates({ since: args.since });
       return {
         content: [
@@ -75,7 +108,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -100,8 +133,8 @@ async function main(): Promise<void> {
         "Target session ID. Omit for broadcast messages."
       ),
     },
-    async (args) => {
-      const message = await handlePostUpdate({
+    wrapToolHandler("post_update", async (args: { type: "status" | "question" | "answer" | "broadcast" | "wind_down" | "task_completed" | "error" | "escalation"; content: string; to?: string }) => {
+      const result = await handlePostUpdate({
         type: args.type,
         content: args.content,
         to: args.to,
@@ -110,11 +143,11 @@ async function main(): Promise<void> {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(message, null, 2),
+            text: JSON.stringify(result, null, 2),
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -135,7 +168,7 @@ async function main(): Promise<void> {
           "Response includes priority_score and critical_path_depth fields.",
         ),
     },
-    async (args) => {
+    wrapToolHandler("get_tasks", async (args: { status_filter?: "pending" | "in_progress" | "completed" | "failed"; ranked?: boolean }) => {
       const tasks = await handleGetTasks({
         status_filter: args.status_filter,
         ranked: args.ranked,
@@ -148,7 +181,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -160,7 +193,7 @@ async function main(): Promise<void> {
     {
       task_id: z.string().describe("The ID of the task to claim"),
     },
-    async (args) => {
+    wrapToolHandler("claim_task", async (args: { task_id: string }) => {
       const result = await handleClaimTask({ task_id: args.task_id });
       return {
         content: [
@@ -171,7 +204,7 @@ async function main(): Promise<void> {
         ],
         isError: !result.success,
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -189,7 +222,7 @@ async function main(): Promise<void> {
         "List of file paths that were created or modified"
       ),
     },
-    async (args) => {
+    wrapToolHandler("complete_task", async (args: { task_id: string; result_summary: string; files_changed?: string[] }) => {
       const result = await handleCompleteTask({
         task_id: args.task_id,
         result_summary: args.result_summary,
@@ -204,7 +237,7 @@ async function main(): Promise<void> {
         ],
         isError: !result.success,
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -216,7 +249,7 @@ async function main(): Promise<void> {
     {
       session_id: z.string().describe("The session ID to look up"),
     },
-    async (args) => {
+    wrapToolHandler("get_session_status", async (args: { session_id: string }) => {
       const result = await handleGetSessionStatus({
         session_id: args.session_id,
       });
@@ -240,11 +273,12 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
   // Tool: register_contract
+  // H-12: Added task_id parameter for accurate contract provenance
   // ----------------------------------------------------------
   server.tool(
     "register_contract",
@@ -253,12 +287,14 @@ async function main(): Promise<void> {
       contract_id: z.string().describe("Unique identifier for the contract (e.g. 'POST /api/users', 'UserProfile type')"),
       contract_type: z.enum(["api_endpoint", "type_definition", "event_schema", "database_schema"]).describe("The kind of contract being registered"),
       spec: z.string().describe("The contract specification (e.g. TypeScript interface, OpenAPI snippet, SQL DDL)"),
+      task_id: z.string().optional().describe("The task ID that owns this contract. If omitted, defaults to the session ID."),
     },
-    async (args) => {
+    wrapToolHandler("register_contract", async (args: { contract_id: string; contract_type: "api_endpoint" | "type_definition" | "event_schema" | "database_schema"; spec: string; task_id?: string }) => {
       const result = await handleRegisterContract({
         contract_id: args.contract_id,
         contract_type: args.contract_type,
         spec: args.spec,
+        task_id: args.task_id,
       });
       return {
         content: [
@@ -268,7 +304,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -281,7 +317,7 @@ async function main(): Promise<void> {
       contract_type: z.string().optional().describe("Filter by contract type (api_endpoint, type_definition, event_schema, database_schema)"),
       pattern: z.string().optional().describe("Substring pattern to match against contract_id"),
     },
-    async (args) => {
+    wrapToolHandler("get_contracts", async (args: { contract_type?: string; pattern?: string }) => {
       const result = await handleGetContracts({
         contract_type: args.contract_type,
         pattern: args.pattern,
@@ -294,7 +330,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -309,7 +345,7 @@ async function main(): Promise<void> {
       rationale: z.string().describe("Why this decision was made"),
       task_id: z.string().optional().describe("The task that prompted this decision"),
     },
-    async (args) => {
+    wrapToolHandler("record_decision", async (args: { category: string; decision: string; rationale: string; task_id?: string }) => {
       const result = await handleRecordDecision({
         category: args.category,
         decision: args.decision,
@@ -324,7 +360,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -336,7 +372,7 @@ async function main(): Promise<void> {
     {
       category: z.string().optional().describe("Filter decisions by category"),
     },
-    async (args) => {
+    wrapToolHandler("get_decisions", async (args: { category?: string }) => {
       const result = await handleGetDecisions({
         category: args.category,
       });
@@ -348,7 +384,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
@@ -361,7 +397,7 @@ async function main(): Promise<void> {
       test_files: z.array(z.string()).optional().describe("Specific test files to run. If omitted, runs full test suite."),
       timeout_ms: z.number().optional().describe("Timeout in milliseconds (default 60000)"),
     },
-    async (args) => {
+    wrapToolHandler("run_tests", async (args: { test_files?: string[]; timeout_ms?: number }) => {
       const result = await handleRunTests({
         test_files: args.test_files,
         timeout_ms: args.timeout_ms,
@@ -374,7 +410,7 @@ async function main(): Promise<void> {
           },
         ],
       };
-    }
+    })
   );
 
   // ----------------------------------------------------------
