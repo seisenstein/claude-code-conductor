@@ -198,13 +198,14 @@ export const PLANNER_ALLOWED_TOOLS = [
 // Flow-Tracing Worker Configuration (read-only)
 // ============================================================
 
+// Note: Task tool is intentionally EXCLUDED — it allows spawning subagents with
+// write access, which would defeat the purpose of read-only flow-tracing workers.
 export const FLOW_TRACING_READ_ONLY_TOOLS = [
   "Read",
   "Bash",
   "Glob",
   "Grep",
   "LSP", // Language Server Protocol for code intelligence (read-only)
-  "Task", // so flow workers can use subagents for deeper investigation
 ];
 
 // ============================================================

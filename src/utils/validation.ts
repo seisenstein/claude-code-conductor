@@ -14,7 +14,16 @@ export interface FileNameValidationResult {
 }
 
 /**
- * Validates a filename or path segment to prevent path traversal attacks.
+ * Validates a filename or relative path to prevent path traversal attacks.
+ *
+ * Despite its name, this function validates both single filenames and relative
+ * paths containing forward slashes (e.g., "src/utils/file.ts"). Forward slashes
+ * are intentionally allowed because this function is used to validate:
+ * - `files_changed` entries (relative paths from project root)
+ * - Other user-provided path references
+ *
+ * For task_id validation specifically, the calling code in tools.ts additionally
+ * rejects forward slashes to ensure task IDs are simple identifiers, not paths.
  *
  * Rejects:
  * - Path traversal sequences: "..", "./"
