@@ -25,7 +25,8 @@ import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
 import { appendJsonlLocked, writeFileSecure, mkdirSecure } from "../utils/secure-fs.js";
 // H-9 FIX: Import resilience trackers for heartbeat-based stale detection
-import { HeartbeatTracker, WorkerTimeoutTracker } from "./worker-resilience.js";
+// H-10 FIX: Import TaskRetryTracker for retry tracking with session resumption
+import { HeartbeatTracker, TaskRetryTracker, WorkerTimeoutTracker } from "./worker-resilience.js";
 
 interface WorkerHandle {
   sessionId: string;
@@ -52,6 +53,10 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   // H-9 FIX: Resilience trackers for heartbeat-based stale detection and wall-clock timeout
   private heartbeatTracker: HeartbeatTracker;
   private timeoutTracker: WorkerTimeoutTracker;
+  // H-10 FIX: Retry tracker for task failure tracking with session resumption
+  private retryTracker: TaskRetryTracker;
+  // H-10: Store thread IDs from completed/failed sessions for resume support
+  private lastThreadIds: Map<string, string> = new Map();
 
   // M-19: Accept ModelConfig for Codex model selection and subagent model hints
   constructor(
@@ -63,6 +68,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   ) {
     this.heartbeatTracker = new HeartbeatTracker();
     this.timeoutTracker = new WorkerTimeoutTracker();
+    this.retryTracker = new TaskRetryTracker();
   }
 
   setWorkerContext(context: WorkerSharedContext): void {
@@ -288,12 +294,12 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   /**
-   * Get retry tracker. CodexWorkerManager does not currently support
-   * retry tracking, so this returns null.
+   * H-10 FIX: Get the retry tracker for task failure handling.
+   * Returns a TaskRetryTracker instance (parity with WorkerManager).
+   * The orchestrator uses this to record failures and check retry eligibility.
    */
-  getRetryTracker(): null {
-    // Codex workers don't support retry tracking yet
-    return null;
+  getRetryTracker(): TaskRetryTracker {
+    return this.retryTracker;
   }
 
   private async initializeSessionStatus(sessionId: string, progress: string): Promise<void> {
@@ -366,6 +372,13 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
             this.maybeRecordRateLimit(handle, sessionId, message);
             this.recordEvent(handle, { type: "session_failed", sessionId, error: message });
             await this.updateSessionStatus(sessionId, "failed", message);
+            // H-10 FIX: Record failure in retry tracker for retry eligibility checks
+            this.retryTracker.recordFailure(sessionId, message);
+          }
+
+          // H-10: Preserve thread ID from completed/failed session for resume support
+          if (handle.threadId && handle.threadId.length > 0) {
+            this.lastThreadIds.set(sessionId, handle.threadId);
           }
 
           // H-9 FIX: Clean up resilience trackers to prevent memory leaks
@@ -605,6 +618,67 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       "-c",
       "mcp_servers.coordinator.required=false",
       prompt,
+    ];
+  }
+
+  /**
+   * H-10 FIX: Build resume args for retrying a failed Codex session.
+   * Uses `codex exec resume --last` when a thread ID is available from the
+   * previous session, which is more powerful than a fresh start because
+   * Codex can resume from its SQLite-persisted session state.
+   *
+   * Returns null if no thread ID is available (caller should fall back to fresh start).
+   */
+  private buildResumeArgs(
+    sessionId: string,
+    correctivePrompt: string,
+    sandbox: CodexSandboxMode,
+    outputPath: string,
+  ): string[] | null {
+    // Check lastThreadIds for a preserved thread ID from a previous failed session
+    const threadId = this.lastThreadIds.get(sessionId);
+    if (!threadId || threadId.length === 0) {
+      return null; // No session to resume — caller falls back to fresh start
+    }
+
+    // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
+    const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];
+
+    return [
+      "exec",
+      "resume",
+      "--last",
+      "--model",
+      codexModel,
+      "--json",
+      "--full-auto",
+      "--sandbox",
+      sandbox,
+      "--skip-git-repo-check",
+      "--ephemeral",
+      "--color",
+      "never",
+      "-o",
+      outputPath,
+      "-C",
+      this.projectDir,
+      "-c",
+      'mcp_servers.coordinator.command="node"',
+      "-c",
+      `mcp_servers.coordinator.args=[${JSON.stringify(this.mcpServerPath)}]`,
+      "-c",
+      `mcp_servers.coordinator.env.CONDUCTOR_DIR=${JSON.stringify(this.orchestratorDir)}`,
+      "-c",
+      `mcp_servers.coordinator.env.SESSION_ID=${JSON.stringify(sessionId)}`,
+      "-c",
+      "mcp_servers.coordinator.startup_timeout_sec=10",
+      "-c",
+      "mcp_servers.coordinator.tool_timeout_sec=30",
+      "-c",
+      "mcp_servers.coordinator.enabled=true",
+      "-c",
+      "mcp_servers.coordinator.required=false",
+      correctivePrompt,
     ];
   }
 
