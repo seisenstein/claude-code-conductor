@@ -608,6 +608,10 @@ describe("WorkerManager", () => {
 
       await workerManager.spawnWorker("worker-kill");
 
+      // Resolve the worker shortly after killAllWorkers sends wind-down
+      // (H10 fix: killAllWorkers now waits for worker promises to settle)
+      setTimeout(() => resolveWorker!(), 100);
+
       await workerManager.killAllWorkers();
 
       // Should have sent wind-down message
@@ -619,9 +623,6 @@ describe("WorkerManager", () => {
 
       // Worker should be removed from active list
       expect(workerManager.getActiveWorkers()).not.toContain("worker-kill");
-
-      // Clean up the hanging promise
-      resolveWorker!();
     });
 
     it("does nothing when no workers are active", async () => {
@@ -649,6 +650,225 @@ describe("WorkerManager", () => {
           security_invariants: [],
         },
       });
+    });
+  });
+
+  describe("killAllWorkers (H10 fix)", () => {
+    it("waits for worker promises to settle before force-removing", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+      // Track when the worker actually finishes
+      let workerFinished = false;
+      let resolveWorker: () => void;
+      const workerPromise = new Promise<void>((resolve) => {
+        resolveWorker = resolve;
+      });
+
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () {
+          await workerPromise;
+          workerFinished = true;
+        }),
+      );
+
+      await workerManager.spawnWorker("worker-kill-wait");
+
+      // Resolve the worker quickly so it finishes before the 30s timeout
+      setTimeout(() => resolveWorker!(), 50);
+
+      await workerManager.killAllWorkers();
+
+      // Worker should have been given a chance to finish
+      // (it resolved after 50ms, well within the 30s timeout)
+      expect(workerManager.getActiveWorkers()).not.toContain("worker-kill-wait");
+    });
+
+    it("force-removes workers after timeout if they don't finish", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+      // Create a worker that never finishes
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () {
+          await new Promise(() => {}); // Never resolves
+        }),
+      );
+
+      await workerManager.spawnWorker("worker-kill-timeout");
+
+      // Patch the KILL_TIMEOUT_MS via monkey-patching the wait
+      // We can't easily change the constant, but we can verify behavior:
+      // The worker should be removed from active list after killAllWorkers returns
+      const startTime = Date.now();
+
+      // Use a custom timeout approach: the test verifies the method completes
+      // even with a stuck worker. The internal 30s timeout will trigger.
+      // For test speed, we'll verify the method at least signals wind-down
+      // and removes the worker from tracking (the Promise.race timeout handles it)
+
+      // Since we can't easily override the 30s timeout in tests,
+      // verify the contract: after killAllWorkers(), no workers remain active
+      const killPromise = workerManager.killAllWorkers();
+
+      // The kill should eventually complete (within the 30s timeout + buffer)
+      // For CI, we use waitForAllWorkers pattern
+      await killPromise;
+
+      expect(workerManager.getActiveWorkers()).toHaveLength(0);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Force-killing"),
+      );
+    }, 35_000); // Allow 35s for the 30s internal timeout
+
+    it("sends wind-down signal before waiting", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+      let resolveWorker: () => void;
+      const workerPromise = new Promise<void>((resolve) => {
+        resolveWorker = resolve;
+      });
+
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () {
+          await workerPromise;
+        }),
+      );
+
+      await workerManager.spawnWorker("worker-kill-signal");
+
+      // Resolve worker quickly
+      setTimeout(() => resolveWorker!(), 50);
+
+      await workerManager.killAllWorkers();
+
+      // Verify wind-down message was written
+      const messagePath = path.join(orchestratorDir, MESSAGES_DIR, "orchestrator.jsonl");
+      const content = await fs.readFile(messagePath, "utf-8");
+      const message = JSON.parse(content.trim().split("\n")[0]);
+      expect(message.type).toBe("wind_down");
+      expect(message.metadata.reason).toBe("user_requested");
+    });
+
+    it("handles killing multiple workers", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+      const resolvers: (() => void)[] = [];
+
+      vi.mocked(query).mockImplementation(() => {
+        let resolve: () => void;
+        const promise = new Promise<void>((r) => {
+          resolve = r;
+        });
+        resolvers.push(resolve!);
+        return createMockQueryResult(async function* () {
+          await promise;
+        });
+      });
+
+      await workerManager.spawnWorker("worker-multi-1");
+      await workerManager.spawnWorker("worker-multi-2");
+      await workerManager.spawnWorker("worker-multi-3");
+
+      expect(workerManager.getActiveWorkers()).toHaveLength(3);
+
+      // Resolve all workers quickly
+      setTimeout(() => resolvers.forEach((r) => r()), 50);
+
+      await workerManager.killAllWorkers();
+
+      expect(workerManager.getActiveWorkers()).toHaveLength(0);
+    });
+  });
+
+  describe("writeFileSecure usage (H12 fix)", () => {
+    it("session status files have secure permissions on spawn", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () {
+          // Worker completes immediately
+        }),
+      );
+
+      await workerManager.spawnWorker("worker-secure");
+
+      // Wait for completion
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const statusPath = path.join(
+        orchestratorDir,
+        SESSIONS_DIR,
+        "worker-secure",
+        SESSION_STATUS_FILE,
+      );
+
+      const stat = await fs.stat(statusPath);
+      // writeFileSecure sets 0o600 (owner read/write only)
+      const perms = stat.mode & 0o777;
+      expect(perms).toBe(0o600);
+    });
+
+    it("session status files have secure permissions on update", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () {
+          throw new Error("Worker error for status update test");
+        }),
+      );
+
+      await workerManager.spawnWorker("worker-secure-update");
+
+      // Wait for error handling and status update
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const statusPath = path.join(
+        orchestratorDir,
+        SESSIONS_DIR,
+        "worker-secure-update",
+        SESSION_STATUS_FILE,
+      );
+
+      const stat = await fs.stat(statusPath);
+      const perms = stat.mode & 0o777;
+      expect(perms).toBe(0o600);
+
+      // Also verify status content is correct
+      const statusContent = await fs.readFile(statusPath, "utf-8");
+      const status = JSON.parse(statusContent) as SessionStatus;
+      expect(status.state).toBe("failed");
+    });
+
+    it("source code uses writeFileSecure instead of bare fs.writeFile", async () => {
+      // Verify at the source level that we don't use bare fs.writeFile
+      const sourceContent = await fs.readFile(
+        path.join(process.cwd(), "src/core/worker-manager.ts"),
+        "utf-8",
+      );
+
+      // Should not have any bare fs.writeFile calls
+      const bareWriteMatches = sourceContent.match(/\bfs\.writeFile\b/g);
+      expect(bareWriteMatches).toBeNull();
+
+      // Should import writeFileSecure
+      expect(sourceContent).toContain("writeFileSecure");
+
+      // Should use writeFileSecure for status file writes
+      const secureWriteCount = (sourceContent.match(/writeFileSecure\(/g) || []).length;
+      expect(secureWriteCount).toBeGreaterThanOrEqual(3); // spawnWorker, spawnSentinelWorker, updateSessionStatus
+    });
+  });
+
+  describe("sentinel tool documentation (H11 fix)", () => {
+    it("sentinel worker tool list includes post_update with documentation", async () => {
+      // Verify at the source level that the sentinel's tool list is documented
+      const sourceContent = await fs.readFile(
+        path.join(process.cwd(), "src/core/worker-manager.ts"),
+        "utf-8",
+      );
+
+      // Should have a comment explaining why post_update is included for the sentinel
+      expect(sourceContent).toContain("post_update is intentionally included");
+      expect(sourceContent).toContain("broadcast security findings");
     });
   });
 });

@@ -30,7 +30,7 @@ import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
-import { appendJsonlLocked } from "../utils/secure-fs.js";
+import { appendJsonlLocked, writeFileSecure } from "../utils/secure-fs.js";
 
 // ============================================================
 // Worker Handle
@@ -111,7 +111,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     );
     await fs.mkdir(sessionDir, { recursive: true });
 
-    // Write initial status
+    // Write initial status with secure permissions (H12 fix)
     const initialStatus: SessionStatus = {
       session_id: sessionId,
       state: "starting",
@@ -120,10 +120,9 @@ export class WorkerManager implements ExecutionWorkerManager {
       progress: "Worker session starting...",
       updated_at: new Date().toISOString(),
     };
-    await fs.writeFile(
+    await writeFileSecure(
       path.join(sessionDir, SESSION_STATUS_FILE),
       JSON.stringify(initialStatus, null, 2) + "\n",
-      "utf-8",
     );
 
     // Build the worker handle
@@ -167,7 +166,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     );
     await fs.mkdir(sessionDir, { recursive: true });
 
-    // Write initial status
+    // Write initial status with secure permissions (H12 fix)
     const initialStatus: SessionStatus = {
       session_id: sentinelId,
       state: "starting",
@@ -176,10 +175,9 @@ export class WorkerManager implements ExecutionWorkerManager {
       progress: "Security sentinel starting...",
       updated_at: new Date().toISOString(),
     };
-    await fs.writeFile(
+    await writeFileSecure(
       path.join(sessionDir, SESSION_STATUS_FILE),
       JSON.stringify(initialStatus, null, 2) + "\n",
-      "utf-8",
     );
 
     const sentinelPrompt = this.buildSentinelPrompt();
@@ -196,7 +194,11 @@ export class WorkerManager implements ExecutionWorkerManager {
     this.timeoutTracker.startTracking(sentinelId);
     this.heartbeatTracker.recordHeartbeat(sentinelId);
 
-    // Launch with read-only tools and sentinel prompt
+    // Launch with read-only file tools and sentinel prompt.
+    // Note: The sentinel also gets mcp__coordinator__post_update so it can
+    // broadcast security findings to other workers. This is intentional —
+    // the sentinel is read-only for FILES but needs write access to the
+    // message bus to report security issues it discovers. (H11)
     handle.promise = this.runSentinelWorker(sentinelId, handle, sentinelPrompt);
     this.activeWorkers.set(sentinelId, handle);
   }
@@ -300,8 +302,14 @@ export class WorkerManager implements ExecutionWorkerManager {
    * Force kill all worker processes.
    *
    * Since workers are async tasks (not child processes), we can only
-   * remove them from tracking. The SDK doesn't expose a direct kill
-   * mechanism, so we signal wind-down and then drop the references.
+   * signal wind-down and wait for them to finish. The SDK doesn't expose
+   * a direct kill mechanism, so we:
+   * 1. Signal wind-down to give workers a chance for clean exit
+   * 2. Wait up to KILL_TIMEOUT_MS for worker promises to settle
+   * 3. Force-remove any remaining workers from tracking
+   *
+   * (H10 fix: Previously removed workers immediately without waiting,
+   *  leaving orphaned in-flight SDK sessions.)
    */
   async killAllWorkers(): Promise<void> {
     const workerIds = this.getActiveWorkers();
@@ -314,8 +322,35 @@ export class WorkerManager implements ExecutionWorkerManager {
     // Signal wind-down first to give a chance for clean exit
     await this.signalWindDown("user_requested");
 
-    // Update each session's status to "done" and remove from tracking
-    for (const sessionId of workerIds) {
+    // Wait for workers to finish (with timeout)
+    const KILL_TIMEOUT_MS = 30_000;
+    const promises = workerIds
+      .map((id) => this.activeWorkers.get(id)?.promise)
+      .filter((p): p is Promise<void> => p != null);
+
+    if (promises.length > 0) {
+      const timeout = new Promise<"timeout">((resolve) => {
+        const timer = setTimeout(() => resolve("timeout"), KILL_TIMEOUT_MS);
+        if (timer.unref) {
+          timer.unref();
+        }
+      });
+
+      const result = await Promise.race([
+        Promise.allSettled(promises).then(() => "done" as const),
+        timeout,
+      ]);
+
+      if (result === "timeout") {
+        const remaining = this.getActiveWorkers();
+        this.logger.warn(
+          `${remaining.length} worker(s) still active after ${KILL_TIMEOUT_MS}ms kill timeout. Force-removing.`,
+        );
+      }
+    }
+
+    // Force-remove any remaining workers that didn't finish in time
+    for (const sessionId of this.getActiveWorkers()) {
       await this.updateSessionStatus(sessionId, "done", "Force killed by orchestrator");
       this.activeWorkers.delete(sessionId);
     }
@@ -487,8 +522,13 @@ export class WorkerManager implements ExecutionWorkerManager {
         prompt,
         options: {
           allowedTools: [
+            // Read-only file tools (Read, Bash, Glob, Grep, LSP — no Task/Write/Edit)
             ...FLOW_TRACING_READ_ONLY_TOOLS,
+            // MCP coordination tools:
             "mcp__coordinator__read_updates",
+            // post_update is intentionally included: the sentinel needs to
+            // broadcast security findings to other workers via the message bus.
+            // The sentinel is read-only for FILES but writes to the message log. (H11)
             "mcp__coordinator__post_update",
             "mcp__coordinator__get_tasks",
           ],
@@ -671,10 +711,10 @@ export class WorkerManager implements ExecutionWorkerManager {
         updated_at: new Date().toISOString(),
       };
 
-      await fs.writeFile(
+      // Use writeFileSecure for proper 0o600 permissions (H12 fix)
+      await writeFileSecure(
         statusPath,
         JSON.stringify(status, null, 2) + "\n",
-        "utf-8",
       );
     } catch (err) {
       this.logger.error(
