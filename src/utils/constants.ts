@@ -1,5 +1,5 @@
 import path from "path";
-import type { TaskType } from "./types.js";
+import type { ClaudeModelTier, TaskType } from "./types.js";
 
 // ============================================================
 // Directory & File Names
@@ -65,6 +65,20 @@ export const USAGE_STALE_CRITICAL_MS = 60 * 60 * 1000; // 60 min — safety-paus
 export const USAGE_RATE_WINDOW_SIZE = 6; // Number of samples for running average rate calculation
 export const USAGE_RATE_ESTABLISHED_POLL_MS = 30 * 60 * 1000; // 30 min — once rate is established, poll less
 export const USAGE_API_429_BACKOFF_MS = 60 * 60 * 1000; // 60 min — on 429, back off aggressively (token limit)
+
+// ============================================================
+// Codex Worker Parity Configuration
+// ============================================================
+
+/** Maps Claude model tiers to Codex/OpenAI model names for --model flag. */
+export const CODEX_MODEL_MAP: Record<ClaudeModelTier, string> = {
+  opus: "o3",
+  sonnet: "o4-mini",
+  haiku: "o4-mini",
+};
+
+/** Job timeout for Codex workers in seconds, derived from DEFAULT_WORKER_TIMEOUT_MS. */
+export const CODEX_JOB_MAX_RUNTIME_SECONDS = Math.floor(DEFAULT_WORKER_TIMEOUT_MS / 1000);
 
 // ============================================================
 // Event Log Configuration (V2)
