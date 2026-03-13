@@ -15,6 +15,12 @@ export interface QueryOptions {
   extendedContext?: boolean;
   /** Settings sources to load (e.g. ["project"] for .claude/settings.json). */
   settingSources?: SettingSource[];
+  /**
+   * AbortController for cancelling the SDK query externally.
+   * When aborted, the SDK will stop processing and clean up resources.
+   * Used by FlowTracer to cancel in-flight workers on overall timeout.
+   */
+  abortController?: AbortController;
 }
 
 /**
@@ -50,6 +56,7 @@ export async function queryWithTimeout(
         ...(options.model ? { model: options.model } : {}),
         ...(options.extendedContext ? { betas: ["context-1m-2025-08-07" as const] } : {}),
         ...(options.settingSources ? { settingSources: options.settingSources } : {}),
+        ...(options.abortController ? { abortController: options.abortController } : {}),
       },
     });
 

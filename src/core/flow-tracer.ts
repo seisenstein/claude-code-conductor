@@ -95,6 +95,10 @@ export class FlowTracer {
     // the timeout fires via Promise.race, creating orphaned SDK sessions.
     const abortController = new AbortController();
 
+    // Shared accumulator: traceFlowsConcurrently pushes findings here
+    // incrementally so they survive an overall timeout (Issue #5 fix).
+    const partialFindings: FlowFinding[] = [];
+
     // Create timeout promise to enforce 30-minute overall deadline
     const timeoutPromise = new Promise<"timeout">((resolve) => {
       const timer = setTimeout(() => resolve("timeout"), FLOW_TRACING_OVERALL_TIMEOUT_MS);
@@ -104,7 +108,7 @@ export class FlowTracer {
       }
     });
 
-    const tracingPromise = this.traceFlowsConcurrently(flows, changedFiles, config, abortController.signal);
+    const tracingPromise = this.traceFlowsConcurrently(flows, changedFiles, config, abortController.signal, partialFindings);
     const raceResult = await Promise.race([
       tracingPromise.then((findings) => ({ type: "success" as const, findings })),
       timeoutPromise.then(() => ({ type: "timeout" as const })),
@@ -119,7 +123,11 @@ export class FlowTracer {
       );
       // Wait briefly for in-flight workers to acknowledge abort
       await new Promise((resolve) => setTimeout(resolve, 2000));
-      allFindings = [];
+      // Preserve findings from already-completed workers instead of discarding them
+      allFindings = partialFindings;
+      this.logger.info(
+        `Flow-tracing: preserved ${allFindings.length} finding(s) from completed workers before timeout.`,
+      );
     } else {
       allFindings = raceResult.findings;
     }
@@ -255,8 +263,11 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
     changedFiles: string[],
     config: FlowConfig,
     signal?: AbortSignal,
+    partialFindings?: FlowFinding[],
   ): Promise<FlowFinding[]> {
-    const allFindings: FlowFinding[] = [];
+    // Use shared accumulator if provided (for timeout resilience),
+    // otherwise use a local array.
+    const allFindings: FlowFinding[] = partialFindings ?? [];
     const queue = [...flows];
     const running: Promise<FlowFinding[]>[] = [];
 
@@ -324,19 +335,32 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const prompt = getFlowWorkerPrompt(flow, changedFiles, config);
 
-    const resultText = await queryWithTimeout(
-      prompt,
-      { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"] },
-      10 * 60 * 1000, // 10 min
-      `flow-tracing-${flow.id}`,
-    );
+    // C4 fix: Create a per-worker AbortController that aborts when the
+    // parent signal fires. This threads cancellation into the SDK query
+    // so in-flight workers are actually killed on overall timeout, rather
+    // than continuing to run as orphaned processes.
+    const workerAbort = new AbortController();
+    const onParentAbort = () => workerAbort.abort();
+    signal?.addEventListener("abort", onParentAbort, { once: true });
 
-    // H26: Save raw output for debugging with secure permissions
-    const flowDir = getFlowTracingDir(this.projectDir);
-    const rawPath = path.join(flowDir, `raw-${flow.id}.md`);
-    await writeFileSecure(rawPath, resultText);
+    try {
+      const resultText = await queryWithTimeout(
+        prompt,
+        { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"], abortController: workerAbort },
+        10 * 60 * 1000, // 10 min
+        `flow-tracing-${flow.id}`,
+      );
 
-    return this.parseFlowFindings(resultText, flow.id);
+      // H26: Save raw output for debugging with secure permissions
+      const flowDir = getFlowTracingDir(this.projectDir);
+      const rawPath = path.join(flowDir, `raw-${flow.id}.md`);
+      await writeFileSecure(rawPath, resultText);
+
+      return this.parseFlowFindings(resultText, flow.id);
+    } finally {
+      // Clean up the event listener to avoid memory leaks
+      signal?.removeEventListener("abort", onParentAbort);
+    }
   }
 
   // ----------------------------------------------------------------
@@ -615,39 +639,63 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
  * Exported for testing.
  */
 export function findBalancedJsonArray(text: string): string | null {
-  const start = text.indexOf("[");
-  if (start === -1) return null;
+  // Iterate through candidate [ positions. If the first balanced [...]
+  // substring doesn't JSON.parse as an array (e.g. "[note]" in prose),
+  // continue searching from the next [ position.
+  let searchFrom = 0;
 
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
+  while (searchFrom < text.length) {
+    const start = text.indexOf("[", searchFrom);
+    if (start === -1) return null;
 
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let endFound = false;
 
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
 
-    if (ch === "\\") {
-      if (inString) escaped = true;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-
-    if (inString) continue;
-
-    if (ch === "[") depth++;
-    else if (ch === "]") {
-      depth--;
-      if (depth === 0) {
-        return text.substring(start, i + 1);
+      if (escaped) {
+        escaped = false;
+        continue;
       }
+
+      if (ch === "\\") {
+        if (inString) escaped = true;
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) continue;
+
+      if (ch === "[") depth++;
+      else if (ch === "]") {
+        depth--;
+        if (depth === 0) {
+          const candidate = text.substring(start, i + 1);
+          try {
+            const parsed = JSON.parse(candidate);
+            if (Array.isArray(parsed)) {
+              return candidate;
+            }
+          } catch {
+            // Balanced brackets but not valid JSON array; try next [
+          }
+          endFound = true;
+          searchFrom = i + 1;
+          break;
+        }
+      }
+    }
+
+    // If no closing bracket was found for this start position, no point continuing
+    if (!endFound) {
+      return null;
     }
   }
 

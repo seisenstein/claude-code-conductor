@@ -24,9 +24,9 @@ function sanitizePromptContent(content: string, maxLength: number = MAX_PROMPT_C
   let sanitized = content;
   // Strip role markers that could confuse the model
   sanitized = sanitized.replace(/Human:|Assistant:|User:|System:/gi, "[removed]");
-  // Strip instruction markers
-  sanitized = sanitized.replace(/\[INST\].*?\[\/INST\]/gi, "[removed]");
-  sanitized = sanitized.replace(/<<SYS>>.*?<\/SYS>>/gi, "[removed]");
+  // Strip instruction markers (use [\s\S]*? for multiline matching)
+  sanitized = sanitized.replace(/\[INST\][\s\S]*?\[\/INST\]/gi, "[removed]");
+  sanitized = sanitized.replace(/<<SYS>>[\s\S]*?<<\/SYS>>/gi, "[removed]");
   // Truncate to max length
   if (sanitized.length > maxLength) {
     sanitized = sanitized.substring(0, maxLength) + "\n[truncated]";
@@ -471,14 +471,20 @@ export class CodexReviewer {
       if (idx !== -1) {
         let braceStart = output.lastIndexOf("{", idx);
         while (braceStart >= 0) {
-          try {
-            const candidate = output.substring(braceStart);
-            JSON.parse(candidate);
-            jsonStr = candidate;
-            break;
-          } catch {
-            braceStart = output.lastIndexOf("{", braceStart - 1);
+          // H13 fix: Extract a balanced JSON object using depth tracking
+          // instead of JSON.parse(substring) which fails when valid JSON
+          // is followed by trailing text (JSON.parse rejects trailing content).
+          const balanced = extractBalancedJsonObject(output, braceStart);
+          if (balanced) {
+            try {
+              JSON.parse(balanced);
+              jsonStr = balanced;
+              break;
+            } catch {
+              // Balanced but not valid JSON; try earlier brace
+            }
           }
+          braceStart = output.lastIndexOf("{", braceStart - 1);
         }
       }
     }
@@ -602,4 +608,58 @@ export class CodexReviewer {
       throw err; // Propagate so caller knows
     }
   }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/**
+ * H13 fix: Extract a balanced JSON object from text starting at the given
+ * position. Uses depth tracking to find the matching closing brace,
+ * respecting string literals and escape sequences.
+ *
+ * This avoids JSON.parse(output.substring(start)) which fails when the
+ * valid JSON is followed by trailing text (JSON.parse rejects any
+ * non-whitespace content after the root value).
+ *
+ * Exported for testing.
+ */
+export function extractBalancedJsonObject(text: string, start: number): string | null {
+  if (start < 0 || start >= text.length || text[start] !== "{") return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      if (inString) escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return text.substring(start, i + 1);
+      }
+    }
+  }
+
+  return null;
 }

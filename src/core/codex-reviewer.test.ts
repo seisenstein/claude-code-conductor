@@ -3,6 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { extractBalancedJsonObject } from "./codex-reviewer.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -29,8 +31,9 @@ describe("CodexReviewer H13 - parseStructuredResponse backwards JSON search", ()
     expect(source).toContain('output.indexOf(\'"review_performed"\')');
     expect(source).toContain("lastIndexOf");
 
-    // H13: Should use JSON.parse progressively
-    expect(source).toContain("JSON.parse(candidate)");
+    // H13: Should use balanced object extraction then JSON.parse
+    expect(source).toContain("extractBalancedJsonObject(output, braceStart)");
+    expect(source).toContain("JSON.parse(balanced)");
     expect(source).toContain("braceStart = output.lastIndexOf");
   });
 
@@ -157,7 +160,10 @@ And here is the review:
   });
 
   it("H13: backwards search handles trailing text after JSON", () => {
-    // This is the scenario where the old greedy regex would fail
+    // JSON.parse rejects trailing non-whitespace content after the root value.
+    // The balanced-object extraction (extractBalancedJsonObject) solves this
+    // by extracting only the matched {...} substring, excluding trailing text.
+
     const output = `Review result:
 {
   "review_performed": true,
@@ -173,26 +179,26 @@ Some trailing text that shouldn't interfere.
     let jsonStr: string | null = null;
 
     while (braceStart >= 0) {
-      try {
-        const candidate = output.substring(braceStart);
-        // JSON.parse will succeed on the first valid JSON it finds from this position
-        // but if there's trailing text, it may fail. We need the exact candidate.
-        // Actually JSON.parse ignores trailing content — let's test both approaches
-        JSON.parse(candidate);
-        jsonStr = candidate;
-        break;
-      } catch {
-        braceStart = output.lastIndexOf("{", braceStart - 1);
+      const balanced = extractBalancedJsonObject(output, braceStart);
+      if (balanced) {
+        try {
+          JSON.parse(balanced);
+          jsonStr = balanced;
+          break;
+        } catch {
+          // balanced but not valid JSON, try earlier brace
+        }
       }
+      braceStart = output.lastIndexOf("{", braceStart - 1);
     }
 
-    // If JSON.parse succeeds with trailing text, jsonStr includes everything from braceStart
-    // The H13 fix accepts this — the parsed result is still the review JSON
-    if (jsonStr) {
-      const parsed = JSON.parse(jsonStr);
-      expect(parsed.review_performed).toBe(true);
-    }
-    // Either way, the algorithm should not crash
+    // The balanced extraction should find the review JSON
+    expect(jsonStr).not.toBeNull();
+    const parsed = JSON.parse(jsonStr!);
+    expect(parsed.review_performed).toBe(true);
+    expect(parsed.verdict).toBe("APPROVE");
+    // Trailing text should NOT be included in the extracted JSON
+    expect(jsonStr).not.toContain("Some trailing text");
   });
 
   it("H13: returns null when no review_performed found", () => {
@@ -208,8 +214,8 @@ describe("sanitizePromptContent logic verification", () => {
     if (!content) return "";
     let sanitized = content;
     sanitized = sanitized.replace(/Human:|Assistant:|User:|System:/gi, "[removed]");
-    sanitized = sanitized.replace(/\[INST\].*?\[\/INST\]/gi, "[removed]");
-    sanitized = sanitized.replace(/<<SYS>>.*?<\/SYS>>/gi, "[removed]");
+    sanitized = sanitized.replace(/\[INST\][\s\S]*?\[\/INST\]/gi, "[removed]");
+    sanitized = sanitized.replace(/<<SYS>>[\s\S]*?<<\/SYS>>/gi, "[removed]");
     if (sanitized.length > maxLength) {
       sanitized = sanitized.substring(0, maxLength) + "\n[truncated]";
     }
@@ -265,5 +271,20 @@ describe("sanitizePromptContent logic verification", () => {
     const input = "This is a normal task description with no injection attempts.";
     const result = sanitizePromptContent(input);
     expect(result).toBe(input);
+  });
+
+  it("strips multiline INST injection", () => {
+    const input = "Some text [INST]malicious\ninstruction\nacross lines[/INST] more text";
+    const result = sanitizePromptContent(input);
+    expect(result).not.toContain("[INST]");
+    expect(result).not.toContain("[/INST]");
+    expect(result).not.toContain("malicious");
+  });
+
+  it("strips multiline SYS injection", () => {
+    const input = "Text <<SYS>>injected\nsystem\nprompt<</SYS>> end";
+    const result = sanitizePromptContent(input);
+    expect(result).not.toContain("<<SYS>>");
+    expect(result).not.toContain("injected");
   });
 });

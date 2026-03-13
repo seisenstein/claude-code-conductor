@@ -351,14 +351,19 @@ export class StateManager {
       const raw = await fs.readFile(taskPath, "utf-8");
       const parsed: unknown = JSON.parse(raw);
 
-      // Runtime validation of required fields (H20)
+      // Runtime validation of required fields (H20, Issue #6 hardening)
+      const p = parsed as Record<string, unknown>;
       if (
         !parsed ||
         typeof parsed !== "object" ||
-        !("id" in parsed) ||
-        !("status" in parsed) ||
-        typeof (parsed as Record<string, unknown>).id !== "string" ||
-        typeof (parsed as Record<string, unknown>).status !== "string"
+        typeof p.id !== "string" ||
+        typeof p.status !== "string" ||
+        typeof p.subject !== "string" ||
+        typeof p.description !== "string" ||
+        !Array.isArray(p.depends_on) ||
+        !Array.isArray(p.blocks) ||
+        !Array.isArray(p.files_changed) ||
+        typeof p.created_at !== "string"
       ) {
         console.warn(`[state-manager] Task file ${taskId} has invalid structure — skipping`);
         return null;
@@ -397,14 +402,20 @@ export class StateManager {
         const raw = await fs.readFile(path.join(tasksDir, entry), "utf-8");
         const parsed: unknown = JSON.parse(raw);
 
-        // Basic runtime validation: task must have id and status (H19)
+        // Runtime validation: task must have required fields that downstream
+        // code accesses without null checks (H19, Issue #6 hardening).
+        const p = parsed as Record<string, unknown>;
         if (
           !parsed ||
           typeof parsed !== "object" ||
-          !("id" in parsed) ||
-          !("status" in parsed) ||
-          typeof (parsed as Record<string, unknown>).id !== "string" ||
-          typeof (parsed as Record<string, unknown>).status !== "string"
+          typeof p.id !== "string" ||
+          typeof p.status !== "string" ||
+          typeof p.subject !== "string" ||
+          typeof p.description !== "string" ||
+          !Array.isArray(p.depends_on) ||
+          !Array.isArray(p.blocks) ||
+          !Array.isArray(p.files_changed) ||
+          typeof p.created_at !== "string"
         ) {
           console.warn(`[state-manager] Skipping malformed task file: ${entry}`);
           continue;
