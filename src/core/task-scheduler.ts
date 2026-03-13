@@ -127,58 +127,8 @@ export function computeCriticalPathDepths(tasks: Task[]): Map<string, number> {
   return depths;
 }
 
-/**
- * Detects cycles in the task dependency graph.
- *
- * @param tasks Array of all tasks
- * @returns Array of cycles, where each cycle is an array of task IDs forming the cycle
- */
-export function detectCycles(tasks: Task[]): string[][] {
-  const cycles: string[][] = [];
-  const visited = new Set<string>();
-  const recStack = new Set<string>();
-  const path: string[] = [];
-
-  // Build dependency graph
-  const dependsOnGraph = new Map<string, string[]>();
-  for (const task of tasks) {
-    dependsOnGraph.set(task.id, task.depends_on);
-  }
-
-  function dfs(taskId: string): void {
-    visited.add(taskId);
-    recStack.add(taskId);
-    path.push(taskId);
-
-    const dependencies = dependsOnGraph.get(taskId) ?? [];
-    for (const depId of dependencies) {
-      if (!visited.has(depId)) {
-        // Only visit if the dependency exists in our task list
-        if (dependsOnGraph.has(depId)) {
-          dfs(depId);
-        }
-      } else if (recStack.has(depId)) {
-        // Found a cycle - extract it
-        const cycleStartIdx = path.indexOf(depId);
-        if (cycleStartIdx !== -1) {
-          const cycle = [...path.slice(cycleStartIdx), depId];
-          cycles.push(cycle);
-        }
-      }
-    }
-
-    path.pop();
-    recStack.delete(taskId);
-  }
-
-  for (const task of tasks) {
-    if (!visited.has(task.id)) {
-      dfs(task.id);
-    }
-  }
-
-  return cycles;
-}
+// detectCycles() was removed as dead code — only referenced in test files, never in production code.
+// Cycle detection for task validation is handled separately by src/utils/task-validator.ts.
 
 // ============================================================
 // Task Scoring
@@ -281,31 +231,4 @@ export function rankClaimableTasks(tasks: Task[]): RankedTask[] {
   return rankedTasks;
 }
 
-/**
- * Returns all tasks ranked by priority score (highest first), regardless of claimability.
- * Useful for displaying the full task board with priority information.
- *
- * @param tasks Array of all tasks
- * @returns Array of all tasks with priority_score and critical_path_depth attached
- */
-export function rankAllTasks(tasks: Task[]): RankedTask[] {
-  // Compute critical path depths for all tasks
-  const depths = computeCriticalPathDepths(tasks);
-
-  // Score and rank all tasks
-  const rankedTasks: RankedTask[] = tasks.map((task) => {
-    const criticalPathDepth = depths.get(task.id) ?? 0;
-    const priorityScore = scoreTask(task, criticalPathDepth);
-
-    return {
-      ...task,
-      priority_score: priorityScore,
-      critical_path_depth: criticalPathDepth,
-    };
-  });
-
-  // Sort by priority score descending (highest priority first)
-  rankedTasks.sort((a, b) => b.priority_score - a.priority_score);
-
-  return rankedTasks;
-}
+// rankAllTasks() was removed as dead code — only referenced in test files, never in production code.

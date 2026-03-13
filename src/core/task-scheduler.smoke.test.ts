@@ -9,8 +9,6 @@
 import { describe, it, expect } from "vitest";
 import {
   computeCriticalPathDepths,
-  detectCycles,
-  rankAllTasks,
   rankClaimableTasks,
 } from "./task-scheduler.js";
 import type { Task } from "../utils/types.js";
@@ -57,18 +55,15 @@ describe("Task Scheduler - Performance Smoke Test", () => {
 
     // Verify all operations complete without hanging
     expect(() => computeCriticalPathDepths(tasks)).not.toThrow();
-    expect(() => detectCycles(tasks)).not.toThrow();
-    expect(() => rankAllTasks(tasks)).not.toThrow();
     expect(() => rankClaimableTasks(tasks)).not.toThrow();
 
     const depths = computeCriticalPathDepths(tasks);
     expect(depths.size).toBe(100);
 
-    const ranked = rankAllTasks(tasks);
-    expect(ranked.length).toBe(100);
-
-    const cycles = detectCycles(tasks);
-    expect(cycles).toEqual([]);
+    const claimable = rankClaimableTasks(tasks);
+    // Only the 10 anchor tasks are claimable (pending with no deps);
+    // the 90 dependent tasks are blocked by pending anchors
+    expect(claimable.length).toBe(10);
   }, 10_000); // 10 second timeout
 
   it("handles 100 tasks with deep dependency chains", () => {
@@ -86,8 +81,6 @@ describe("Task Scheduler - Performance Smoke Test", () => {
     }
 
     expect(() => computeCriticalPathDepths(tasks)).not.toThrow();
-    expect(() => detectCycles(tasks)).not.toThrow();
-    expect(() => rankAllTasks(tasks)).not.toThrow();
 
     const depths = computeCriticalPathDepths(tasks);
     expect(depths.size).toBe(100);
@@ -96,9 +89,6 @@ describe("Task Scheduler - Performance Smoke Test", () => {
     expect(depths.get("chain-0")).toBe(50); // Deepest in the chain
     expect(depths.get("chain-49")).toBe(1); // End of chain, only blocks leaves
     expect(depths.get("leaf-0")).toBe(0); // Leaves have no downstream
-
-    const cycles = detectCycles(tasks);
-    expect(cycles).toEqual([]);
   }, 10_000);
 
   it("handles 100 tasks with wide fan-out", () => {
@@ -113,8 +103,6 @@ describe("Task Scheduler - Performance Smoke Test", () => {
     }
 
     expect(() => computeCriticalPathDepths(tasks)).not.toThrow();
-    expect(() => detectCycles(tasks)).not.toThrow();
-    expect(() => rankAllTasks(tasks)).not.toThrow();
 
     const depths = computeCriticalPathDepths(tasks);
     expect(depths.size).toBe(100);

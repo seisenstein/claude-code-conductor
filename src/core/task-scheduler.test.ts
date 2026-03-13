@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   computeCriticalPathDepths,
-  detectCycles,
   scoreTask,
   isTaskClaimable,
   rankClaimableTasks,
-  rankAllTasks,
 } from "./task-scheduler.js";
 import type { Task, TaskType } from "../utils/types.js";
 
@@ -169,55 +167,8 @@ describe("computeCriticalPathDepths", () => {
   });
 });
 
-// ============================================================
-// detectCycles Tests
-// ============================================================
-
-describe("detectCycles", () => {
-  it("returns empty array for acyclic graph", () => {
-    const tasks = [
-      makeTask("A"),
-      makeTask("B", ["A"]),
-      makeTask("C", ["B"]),
-    ];
-
-    const cycles = detectCycles(tasks);
-    expect(cycles).toEqual([]);
-  });
-
-  it("detects simple two-node cycle and returns cycle members", () => {
-    const tasks = [makeTask("A", ["B"]), makeTask("B", ["A"])];
-
-    const cycles = detectCycles(tasks);
-    expect(cycles.length).toBeGreaterThan(0);
-
-    // Verify cycle contains both members
-    const allCycleMembers = cycles.flat();
-    expect(allCycleMembers).toContain("A");
-    expect(allCycleMembers).toContain("B");
-  });
-
-  it("detects self-referential cycle", () => {
-    const tasks = [makeTask("A", ["A"])];
-
-    const cycles = detectCycles(tasks);
-    expect(cycles.length).toBeGreaterThan(0);
-    expect(cycles[0]).toContain("A");
-  });
-
-  it("returns empty for empty task list", () => {
-    const cycles = detectCycles([]);
-    expect(cycles).toEqual([]);
-  });
-
-  it("handles missing dependency references", () => {
-    const tasks = [makeTask("A"), makeTask("B", ["X"])];
-
-    expect(() => detectCycles(tasks)).not.toThrow();
-    const cycles = detectCycles(tasks);
-    expect(cycles).toEqual([]);
-  });
-});
+// detectCycles tests removed — function was removed as dead code (only used in tests, not production).
+// Cycle detection for task validation is handled by src/utils/task-validator.ts.
 
 // ============================================================
 // scoreTask Tests
@@ -419,25 +370,4 @@ describe("rankClaimableTasks", () => {
   });
 });
 
-// ============================================================
-// rankAllTasks Tests
-// ============================================================
-
-describe("rankAllTasks", () => {
-  it("returns all tasks regardless of status", () => {
-    const tasks = [
-      makeTask("A", [], { status: "completed" }),
-      makeTask("B", [], { status: "pending" }),
-      makeTask("C", [], { status: "in_progress" }),
-      makeTask("D", [], { status: "failed" }),
-    ];
-
-    const ranked = rankAllTasks(tasks);
-    expect(ranked.length).toBe(4);
-  });
-
-  it("handles empty task list", () => {
-    const ranked = rankAllTasks([]);
-    expect(ranked).toEqual([]);
-  });
-});
+// rankAllTasks tests removed — function was removed as dead code (only used in tests, not production).
