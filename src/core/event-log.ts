@@ -145,23 +145,34 @@ export class EventLog {
 
   /**
    * Flushes all buffered events to disk.
-   * Safe to call concurrently - will wait for previous flush to complete.
+   * Safe to call concurrently - serializes via flushPromise.
+   *
+   * H-4 FIX: After awaiting an in-flight flush, re-check buffer.length
+   * (the prior flush may have already drained it). Use finally to null
+   * flushPromise so a failed write doesn't permanently block future flushes.
    */
   async flush(): Promise<void> {
-    // Wait for any in-flight flush to complete
+    // Wait for any in-flight flush to complete before proceeding
     if (this.flushPromise) {
       await this.flushPromise;
+      // After waiting, re-check buffer — the flush we waited on may have
+      // already drained events added between the two calls.
     }
 
     if (this.buffer.length === 0) return;
 
-    // Swap buffer
+    // Swap buffer atomically (single-threaded, no yield between read & write)
     const events = this.buffer;
     this.buffer = [];
 
     this.flushPromise = this.writeEvents(events);
-    await this.flushPromise;
-    this.flushPromise = null;
+    try {
+      await this.flushPromise;
+    } finally {
+      // Always clear flushPromise — if writeEvents threw, a stuck promise
+      // would permanently block future flush() calls.
+      this.flushPromise = null;
+    }
   }
 
   /**
