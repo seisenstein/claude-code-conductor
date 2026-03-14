@@ -137,14 +137,41 @@ Tell the user the conductor has launched and give them these commands to monitor
 - **Logs**: `conduct log --project "$(pwd)" -n 100`
 - **Full stdout**: `tail -f .conductor/logs/conductor-stdout.log`
 
+### Step 6: Start automatic monitoring
+
+After launching, immediately set up a recurring check using **CronCreate** to monitor the conductor every 15 minutes:
+
+```
+CronCreate(
+  cron: "*/15 * * * *",
+  prompt: "Check on the conductor run: run `conduct status --project \"$(pwd)\"` and report progress. If status is COMPLETED, cancel this cron job with CronDelete, show the final results summary, and check if there is a conduct/ branch to merge. If status is FAILED, check the logs with `tail -30 .conductor/logs/conductor.log` and either resume or report the error. If status is PAUSED, check for escalation files.",
+  recurring: true
+)
+```
+
+Tell the user you've set up automatic monitoring and will check every 15 minutes. Include the cron job ID so they can cancel it manually if needed.
+
 ## Phase 3: Monitor for Escalations
 
-After launching, periodically check progress and escalations:
+The 15-minute cron job handles routine monitoring automatically. When it fires, run:
 ```bash
-# Latest progress update
-tail -1 "$(pwd)/.conductor/progress.jsonl" 2>/dev/null
+conduct status --project "$(pwd)"
+```
 
-# Check for escalation
+**If COMPLETED**: Cancel the cron job with CronDelete. Show the user a summary of results (task counts, cycle count, any review findings). If on a conduct/ branch, ask the user if they want to merge to main.
+
+**If FAILED**: Check the logs:
+```bash
+tail -30 "$(pwd)/.conductor/logs/conductor.log"
+```
+Attempt to diagnose the failure. If it looks recoverable (e.g., a worker crashed), clean up stale state and resume:
+```bash
+conduct resume --project "$(pwd)" --force-resume --verbose
+```
+If not recoverable, report the error to the user and cancel the cron job.
+
+**If PAUSED**: Check for escalation or rate limit pause:
+```bash
 cat "$(pwd)/.conductor/escalation.json" 2>/dev/null
 ```
 
@@ -153,9 +180,13 @@ If an escalation file exists:
 2. Ask the user how they want to proceed:
    - **Continue**: Just resume with `conduct resume`
    - **Redirect**: Get new guidance from the user, write it to `.conductor/context.md`, then resume
-   - **Stop**: Leave it stopped
+   - **Stop**: Leave it stopped, cancel the cron job
 3. Delete the escalation file after handling it
 4. If continuing/redirecting, run: `conduct resume --project "$(pwd)" --verbose`
+
+If paused due to rate limit (check progress message), just report the pause and expected resume time. The conductor will auto-resume when the rate limit resets -- no action needed.
+
+**If EXECUTING/PLANNING/REVIEWING**: Report the current progress (task counts, active workers, usage %) and let the cron continue.
 
 If the run is stuck in a stale state like `executing` even though no workers are alive, resume with:
 `conduct resume --project "$(pwd)" --force-resume --verbose`
