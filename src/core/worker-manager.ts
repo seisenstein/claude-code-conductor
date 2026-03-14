@@ -369,6 +369,26 @@ export class WorkerManager implements ExecutionWorkerManager {
   }
 
   /**
+   * Terminate a specific worker by session ID.
+   * SDK-based workers cannot be force-killed (Agent SDK manages lifecycle),
+   * so this removes the worker from tracking and marks it done.
+   */
+  async terminateWorker(sessionId: string): Promise<void> {
+    const handle = this.activeWorkers.get(sessionId);
+    if (!handle) {
+      return;
+    }
+
+    this.logger.warn(`Terminating worker ${sessionId}`);
+
+    // Clean up tracking state
+    this.timeoutTracker.stopTracking(sessionId);
+    this.heartbeatTracker.cleanup(sessionId);
+    this.activeWorkers.delete(sessionId);
+    await this.updateSessionStatus(sessionId, "done", "Terminated by orchestrator (timed out/stale)");
+  }
+
+  /**
    * Get combined events from all workers (past and present).
    */
   getWorkerEvents(): OrchestratorEvent[] {
@@ -407,6 +427,25 @@ export class WorkerManager implements ExecutionWorkerManager {
    */
   getRetryTracker(): TaskRetryTracker {
     return this.retryTracker;
+  }
+
+  // H-10 FIX (Task 9): Task claim tracking for proper failure attribution
+  // These are optional on the interface but implemented for consistency.
+  // The Claude SDK worker manager doesn't need internal tracking because
+  // failures are recorded by the orchestrator via getWorkerCurrentTask().
+
+  private sessionToTaskMap: Map<string, string> = new Map();
+
+  registerTaskClaim(sessionId: string, taskId: string): void {
+    this.sessionToTaskMap.set(sessionId, taskId);
+  }
+
+  clearTaskClaim(sessionId: string): void {
+    this.sessionToTaskMap.delete(sessionId);
+  }
+
+  getClaimedTaskId(sessionId: string): string | null {
+    return this.sessionToTaskMap.get(sessionId) ?? null;
   }
 
   // ----------------------------------------------------------------

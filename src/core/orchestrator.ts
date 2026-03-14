@@ -26,7 +26,7 @@ import type {
   UsageSnapshot,
   WorkerRuntime,
   ProjectProfile,
-  ModelConfig,
+
 } from "../utils/types.js";
 import { MODEL_TIER_TO_ID, ConductorExitError } from "../utils/types.js";
 
@@ -51,6 +51,7 @@ import {
   getTasksDraftPath,
   getFlowTracingSummaryPath,
   getKnownIssuesPath,
+  CODEX_JOB_MAX_RUNTIME_SECONDS,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -223,6 +224,7 @@ export class Orchestrator {
           orchestratorDir,
           mcpServerPath,
           this.logger,
+          options.modelConfig, // M-19: Pass model config for Codex model selection
         )
       : new WorkerManager(
           options.project,
@@ -772,6 +774,7 @@ export class Orchestrator {
     const configDir = path.join(this.options.project, ".codex");
     await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
 
+    // M-19: Include agents.job_max_runtime_seconds for belt-and-suspenders timeout
     const toml = [
       "[mcp_servers.coordinator]",
       `command = "node"`,
@@ -781,6 +784,9 @@ export class Orchestrator {
       `tool_timeout_sec = 30`,
       `enabled = true`,
       `required = false`,
+      "",
+      "[agents]",
+      `job_max_runtime_seconds = ${CODEX_JOB_MAX_RUNTIME_SECONDS}`,
       "",
     ].join("\n");
 
@@ -1298,6 +1304,13 @@ export class Orchestrator {
 
         // Check if all tasks are complete
         const allTasks = await this.state.getAllTasks();
+
+        // H-10 FIX: Sync task claim mappings for proper failure attribution.
+        // Workers claim tasks via MCP (separate process), so the orchestrator
+        // must poll task state to maintain the session-to-task mapping used
+        // for retry tracking when a worker crashes.
+        this.syncTaskClaimMappings(allTasks);
+
         const remaining = allTasks.filter(
           (t) => t.status === "pending" || t.status === "in_progress",
         );
@@ -1436,6 +1449,16 @@ export class Orchestrator {
           }
         }
 
+        // Terminate timed-out and stale workers before resetting their tasks
+        // to prevent zombie workers from continuing to modify files while a
+        // retry worker is spawned for the same task.
+        const deadWorkerIds = [...timedOut, ...stale];
+        for (const sessionId of deadWorkerIds) {
+          if (this.workers.terminateWorker) {
+            await this.workers.terminateWorker(sessionId);
+          }
+        }
+
         // Check for orphaned tasks: in_progress tasks whose owner worker is dead
         const activeWorkers = this.workers.getActiveWorkers();
         await this.syncTrackedActiveSessions(activeWorkers);
@@ -1467,9 +1490,20 @@ export class Orchestrator {
           this.logger.info(
             `All workers done but ${pendingNow.length} task(s) remain. Respawning ${respawnCount} worker(s)...`,
           );
+          // Identify retry-eligible tasks (tasks that were reset from a previous failure)
+          const retryTasks = pendingNow.filter((t) => (t.retry_count ?? 0) > 0);
           for (let i = 0; i < respawnCount; i++) {
             const sessionId = `worker-${Date.now()}-respawn-${i}`;
-            await this.workers.spawnWorker(sessionId);
+            const retryTask = retryTasks[i]; // May be undefined if fewer retries than workers
+            // Use spawnWorkerForRetry for retry-eligible tasks when the manager supports it
+            if (retryTask && this.workers.spawnWorkerForRetry) {
+              const correctivePrompt = retryTask.last_error
+                ? `Previous attempt failed: ${retryTask.last_error}. Please fix this and complete the task.`
+                : undefined;
+              await this.workers.spawnWorkerForRetry(sessionId, retryTask.id, correctivePrompt);
+            } else {
+              await this.workers.spawnWorker(sessionId);
+            }
             await this.state.addActiveSession(sessionId);
             // V2: Record worker spawn event
             recordWorkerSpawn(this.eventLog, sessionId);
@@ -2428,6 +2462,59 @@ export class Orchestrator {
   private async getWorkerCurrentTask(sessionId: string): Promise<Task | null> {
     const inProgressTasks = await this.state.getTasksByStatus("in_progress");
     return inProgressTasks.find((t) => t.owner === sessionId) ?? null;
+  }
+
+  /**
+   * H-10 FIX: Synchronize task claim mappings from polled task state.
+   *
+   * Workers claim tasks via the MCP coordination server (a separate process).
+   * The orchestrator must poll task files and update its internal session-to-task
+   * mapping so that when a worker crashes, we can correctly attribute the failure
+   * to the specific task ID (not the session ID). This is essential for retry
+   * tracking since StateManager.resetOrphanedTasks checks retries by task.id.
+   *
+   * This method:
+   * 1. Finds all in_progress tasks with an owner
+   * 2. Registers task claims for active workers
+   * 3. Clears task claims for completed/failed tasks
+   */
+  private syncTaskClaimMappings(allTasks: Task[]): void {
+    // Only proceed if the worker manager supports task claim tracking
+    if (!this.workers.registerTaskClaim || !this.workers.clearTaskClaim) {
+      return;
+    }
+
+    const activeWorkers = new Set(this.workers.getActiveWorkers());
+
+    // Track which sessions have in_progress tasks
+    const sessionsWithTasks = new Set<string>();
+
+    // Register claims for in_progress tasks with owners
+    for (const task of allTasks) {
+      if (task.status === "in_progress" && task.owner) {
+        sessionsWithTasks.add(task.owner);
+
+        // Only register if the owner is still an active worker
+        if (activeWorkers.has(task.owner)) {
+          // Check if this claim is already registered to avoid redundant logging
+          const currentClaim = this.workers.getClaimedTaskId?.(task.owner);
+          if (currentClaim !== task.id) {
+            this.workers.registerTaskClaim(task.owner, task.id);
+          }
+        }
+      }
+    }
+
+    // Clear claims for workers that no longer have in_progress tasks
+    // (e.g., their task was completed or failed)
+    for (const sessionId of activeWorkers) {
+      if (!sessionsWithTasks.has(sessionId)) {
+        const currentClaim = this.workers.getClaimedTaskId?.(sessionId);
+        if (currentClaim) {
+          this.workers.clearTaskClaim(sessionId);
+        }
+      }
+    }
   }
 
   /**

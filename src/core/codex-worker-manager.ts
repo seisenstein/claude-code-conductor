@@ -5,21 +5,27 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type {
   ExecutionWorkerManager,
   Message,
+  ModelConfig,
   OrchestratorEvent,
   SessionStatus,
   WorkerSharedContext,
 } from "../utils/types.js";
+import { DEFAULT_MODEL_CONFIG } from "../utils/types.js";
 import {
   MESSAGES_DIR,
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
   MAX_BUFFER_SIZE_BYTES,
+  CODEX_MODEL_MAP,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
 import { appendJsonlLocked, writeFileSecure, mkdirSecure } from "../utils/secure-fs.js";
+// H-9 FIX: Import resilience trackers for heartbeat-based stale detection
+// H-10 FIX: Import TaskRetryTracker for retry tracking with session resumption
+import { HeartbeatTracker, TaskRetryTracker, WorkerTimeoutTracker } from "./worker-resilience.js";
 
 interface WorkerHandle {
   sessionId: string;
@@ -29,6 +35,16 @@ interface WorkerHandle {
   child: ChildProcess | null;
   lastMessage: string | null;
   rateLimitReported: boolean;
+  // H-9: Monotonic timestamp of last JSONL event for heartbeat tracking
+  lastEventAt: bigint;
+  // H-9: Thread ID from thread.started JSONL event (used for session resumption in H-10)
+  threadId: string | null;
+  // H-10 FIX: Task ID for retry attribution (set when worker claims a task)
+  taskId: string | null;
+  // Flag to prevent double-counting failures when orchestrator terminates a worker.
+  // When set, the settle path should NOT record a separate failure since the
+  // orchestrator already recorded one before calling terminateWorker().
+  terminatedByOrchestrator: boolean;
 }
 
 type CodexSandboxMode = "workspace-write" | "read-only";
@@ -39,12 +55,31 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
 
   private workerContext: WorkerSharedContext = {};
 
+  // H-9 FIX: Resilience trackers for heartbeat-based stale detection and wall-clock timeout
+  private heartbeatTracker: HeartbeatTracker;
+  private timeoutTracker: WorkerTimeoutTracker;
+  // H-10 FIX: Retry tracker for task failure tracking with session resumption
+  private retryTracker: TaskRetryTracker;
+  // H-10 FIX: Store thread IDs by TASK ID (not session ID) for resume support.
+  // When a worker fails on a task, we preserve the thread ID so that when a new
+  // worker retries that task, it can attempt to resume the Codex session.
+  private taskThreadIds: Map<string, string> = new Map();
+  // H-10 FIX (Task 9): Authoritative session-to-task mapping for failure attribution
+  // Maps sessionId -> taskId. Updated when orchestrator notifies us of task claims.
+  private sessionToTaskMap: Map<string, string> = new Map();
+
+  // M-19: Accept ModelConfig for Codex model selection and subagent model hints
   constructor(
     private projectDir: string,
     private orchestratorDir: string,
     private mcpServerPath: string,
     private logger: Logger,
-  ) {}
+    private modelConfig: ModelConfig = DEFAULT_MODEL_CONFIG,
+  ) {
+    this.heartbeatTracker = new HeartbeatTracker();
+    this.timeoutTracker = new WorkerTimeoutTracker();
+    this.retryTracker = new TaskRetryTracker();
+  }
 
   setWorkerContext(context: WorkerSharedContext): void {
     this.workerContext = context;
@@ -67,9 +102,16 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       child: null,
       lastMessage: null,
       rateLimitReported: false,
+      lastEventAt: process.hrtime.bigint(),
+      threadId: null,
+      taskId: null, // H-10 FIX: Task ID set via registerTaskClaim()
+      terminatedByOrchestrator: false,
     };
 
     this.activeWorkers.set(sessionId, handle);
+    // H-9 FIX: Start resilience tracking for heartbeat and timeout detection
+    this.timeoutTracker.startTracking(sessionId);
+    this.heartbeatTracker.recordHeartbeat(sessionId); // Initial heartbeat
     handle.promise = this.runCodexSession(
       sessionId,
       handle,
@@ -98,9 +140,16 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       child: null,
       lastMessage: null,
       rateLimitReported: false,
+      lastEventAt: process.hrtime.bigint(),
+      threadId: null,
+      taskId: null, // Sentinel doesn't work on tasks
+      terminatedByOrchestrator: false,
     };
 
     this.activeWorkers.set(sentinelId, handle);
+    // H-9 FIX: Start resilience tracking for heartbeat and timeout detection
+    this.timeoutTracker.startTracking(sentinelId);
+    this.heartbeatTracker.recordHeartbeat(sentinelId); // Initial heartbeat
     handle.promise = this.runCodexSession(
       sentinelId,
       handle,
@@ -227,10 +276,60 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     // Force-remove any remaining workers from tracking
     for (const sessionId of [...this.activeWorkers.keys()]) {
       await this.updateSessionStatus(sessionId, "done", "Force killed by orchestrator");
+      this.sessionToTaskMap.delete(sessionId);
       this.activeWorkers.delete(sessionId);
     }
 
     this.logger.info("All Codex workers have been killed and removed from tracking.");
+  }
+
+  /**
+   * Terminate a specific worker by session ID.
+   * Sends SIGTERM, waits up to 5s, then SIGKILL if still running.
+   * Cleans up all tracking state for the worker.
+   */
+  async terminateWorker(sessionId: string): Promise<void> {
+    const handle = this.activeWorkers.get(sessionId);
+    if (!handle) {
+      return;
+    }
+
+    this.logger.warn(`Terminating worker ${sessionId}`);
+
+    // Mark as orchestrator-terminated so the settle path does not double-count
+    // the failure (the orchestrator already recorded it in the retry tracker).
+    handle.terminatedByOrchestrator = true;
+
+    // Send SIGTERM
+    if (handle.child && !handle.child.killed) {
+      handle.child.kill("SIGTERM");
+    }
+
+    // Wait up to 5s for graceful exit
+    const TERM_TIMEOUT_MS = 5_000;
+    const timeout = new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), TERM_TIMEOUT_MS),
+    );
+
+    if (handle.promise) {
+      const result = await Promise.race([
+        handle.promise.then(() => "done" as const).catch(() => "done" as const),
+        timeout,
+      ]);
+
+      if (result === "timeout" && handle.child && !handle.child.killed) {
+        this.logger.warn(`Worker ${sessionId} did not exit after SIGTERM; sending SIGKILL`);
+        handle.child.kill("SIGKILL");
+      }
+    }
+
+    // Clean up tracking state
+    this.timeoutTracker.stopTracking(sessionId);
+    this.heartbeatTracker.cleanup(sessionId);
+    this.sessionToTaskMap.delete(sessionId);
+    handle.child = null;
+    this.activeWorkers.delete(sessionId);
+    await this.updateSessionStatus(sessionId, "done", "Terminated by orchestrator (timed out/stale)");
   }
 
   getWorkerEvents(): OrchestratorEvent[] {
@@ -240,32 +339,163 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   /**
-   * Check worker health by comparing start times against a configurable timeout.
-   * H17: Returns workers that have exceeded the wall-clock timeout (30 minutes).
-   * Stale detection is not supported for Codex workers (no heartbeat mechanism).
+   * Check worker health using resilience trackers.
+   * H-9 FIX: Uses WorkerTimeoutTracker for wall-clock timeout and HeartbeatTracker
+   * for JSONL-stream-based stale detection (replaces hardcoded 30-minute timeout).
+   *
+   * Performance: O(n) where n = active workers.
    */
   checkWorkerHealth(): { timedOut: string[]; stale: string[] } {
-    const CODEX_WORKER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-    const now = Date.now();
-    const timedOut: string[] = [];
+    const timedOut = this.timeoutTracker
+      .getTimedOutWorkers()
+      .filter((id) => this.activeWorkers.has(id));
 
-    for (const [sessionId, handle] of this.activeWorkers) {
-      const startedAt = new Date(handle.startedAt).getTime();
-      if (now - startedAt > CODEX_WORKER_TIMEOUT_MS) {
-        timedOut.push(sessionId);
-      }
-    }
+    const stale = this.heartbeatTracker
+      .getStaleWorkers()
+      .filter((id) => this.activeWorkers.has(id) && !timedOut.includes(id));
 
-    return { timedOut, stale: [] };
+    return { timedOut, stale };
   }
 
   /**
-   * Get retry tracker. CodexWorkerManager does not currently support
-   * retry tracking, so this returns null.
+   * H-10 FIX: Get the retry tracker for task failure handling.
+   * Returns a TaskRetryTracker instance (parity with WorkerManager).
+   * The orchestrator uses this to record failures and check retry eligibility.
    */
-  getRetryTracker(): null {
-    // Codex workers don't support retry tracking yet
-    return null;
+  getRetryTracker(): TaskRetryTracker {
+    return this.retryTracker;
+  }
+
+  /**
+   * H-10 FIX (Task 9): Register a task claim for proper failure attribution.
+   * Called by the orchestrator when it detects (via task file watching or polling)
+   * that a worker has claimed a task. This maintains the authoritative
+   * session-to-task mapping needed for retry attribution.
+   *
+   * @param sessionId - The worker session ID
+   * @param taskId - The task ID that was claimed
+   */
+  registerTaskClaim(sessionId: string, taskId: string): void {
+    this.sessionToTaskMap.set(sessionId, taskId);
+    const handle = this.activeWorkers.get(sessionId);
+    if (handle) {
+      handle.taskId = taskId;
+    }
+    this.logger.debug(`Registered task claim: session ${sessionId} -> task ${taskId}`);
+  }
+
+  /**
+   * H-10 FIX (Task 9): Clear task claim when a task is completed or released.
+   * Called by the orchestrator when a task transitions out of in_progress.
+   *
+   * @param sessionId - The worker session ID
+   */
+  clearTaskClaim(sessionId: string): void {
+    this.sessionToTaskMap.delete(sessionId);
+    const handle = this.activeWorkers.get(sessionId);
+    if (handle) {
+      handle.taskId = null;
+    }
+  }
+
+  /**
+   * H-10 FIX (Task 9): Get the task ID currently claimed by a session.
+   * Returns null if the session has no claimed task.
+   *
+   * @param sessionId - The worker session ID
+   */
+  getClaimedTaskId(sessionId: string): string | null {
+    return this.sessionToTaskMap.get(sessionId) ?? null;
+  }
+
+  /**
+   * H-10 FIX: Get a preserved thread ID for a task (used for session resumption).
+   * Returns null if no thread ID is available for the task.
+   *
+   * @param taskId - The task ID to look up
+   */
+  getThreadIdForTask(taskId: string): string | null {
+    return this.taskThreadIds.get(taskId) ?? null;
+  }
+
+  /**
+   * H-10 FIX: Spawn a worker specifically for retrying a failed task.
+   * If a thread ID was preserved from the previous failed attempt, this method
+   * will use `codex exec resume --last` for session resumption, which allows
+   * Codex to resume from its SQLite-persisted session state.
+   *
+   * This is more powerful than a fresh start because the worker can see what
+   * was already attempted and continue from there.
+   *
+   * @param sessionId - New session ID for the retry worker
+   * @param taskId - The task ID being retried
+   * @param correctivePrompt - Optional corrective prompt explaining what went wrong
+   */
+  async spawnWorkerForRetry(
+    sessionId: string,
+    taskId: string,
+    correctivePrompt?: string,
+  ): Promise<void> {
+    if (this.activeWorkers.has(sessionId)) {
+      this.logger.warn(`Worker ${sessionId} is already active; skipping spawn`);
+      return;
+    }
+
+    const preservedThreadId = this.taskThreadIds.get(taskId);
+    const hasResumeCapability = preservedThreadId && preservedThreadId.length > 0;
+
+    if (hasResumeCapability) {
+      this.logger.info(`Spawning Codex worker ${sessionId} with session resumption for task ${taskId}`);
+    } else {
+      this.logger.info(`Spawning Codex worker ${sessionId} for retry of task ${taskId} (no resume available)`);
+    }
+
+    await this.initializeSessionStatus(sessionId, "Worker session starting (retry)...");
+
+    const handle: WorkerHandle = {
+      sessionId,
+      promise: Promise.resolve(),
+      events: [],
+      startedAt: new Date().toISOString(),
+      child: null,
+      lastMessage: null,
+      rateLimitReported: false,
+      lastEventAt: process.hrtime.bigint(),
+      threadId: null,
+      taskId, // Pre-set task ID since this is a retry
+      terminatedByOrchestrator: false,
+    };
+
+    // Pre-register the task claim since we know which task this worker will retry
+    this.sessionToTaskMap.set(sessionId, taskId);
+
+    this.activeWorkers.set(sessionId, handle);
+    this.timeoutTracker.startTracking(sessionId);
+    this.heartbeatTracker.recordHeartbeat(sessionId);
+
+    // Use resume if we have a preserved thread ID, otherwise fresh start.
+    // A default corrective prompt is used when none is provided, so resume
+    // is not skipped just because the caller omitted a prompt.
+    if (hasResumeCapability) {
+      const resumePrompt = correctivePrompt ?? "Continue working on this task. The previous attempt did not complete successfully.";
+      handle.promise = this.runCodexSessionWithResume(
+        sessionId,
+        handle,
+        taskId,
+        resumePrompt,
+        "workspace-write",
+        "Codex worker running (resumed session)...",
+      );
+    } else {
+      // Fall back to regular spawn - worker will claim the task via MCP
+      handle.promise = this.runCodexSession(
+        sessionId,
+        handle,
+        this.buildWorkerPrompt(sessionId),
+        "workspace-write",
+        "Codex worker running (retry)...",
+      );
+    }
   }
 
   private async initializeSessionStatus(sessionId: string, progress: string): Promise<void> {
@@ -338,7 +568,194 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
             this.maybeRecordRateLimit(handle, sessionId, message);
             this.recordEvent(handle, { type: "session_failed", sessionId, error: message });
             await this.updateSessionStatus(sessionId, "failed", message);
+            // H-10 FIX: Record failure in retry tracker using TASK ID (not session ID)
+            // This is critical for retry attribution - StateManager.resetOrphanedTasks
+            // checks retries by task.id, so we must record against the task ID.
+            // Skip if the orchestrator already recorded this failure (terminatedByOrchestrator flag)
+            // to avoid double-counting which can prematurely exhaust retries.
+            const failedTaskId = handle.taskId ?? this.sessionToTaskMap.get(sessionId);
+            if (failedTaskId && !handle.terminatedByOrchestrator) {
+              this.retryTracker.recordFailure(failedTaskId, message);
+              this.logger.debug(`Recorded failure for task ${failedTaskId} (session ${sessionId})`);
+
+              // H-10 FIX: Preserve thread ID by TASK ID for resume support.
+              // When a worker fails, we store its thread ID keyed by task ID (not session ID)
+              // so that when a NEW session retries that task, it can retrieve the thread ID.
+              if (handle.threadId && handle.threadId.length > 0) {
+                this.taskThreadIds.set(failedTaskId, handle.threadId);
+                this.logger.debug(`Preserved thread ID for task ${failedTaskId}: ${handle.threadId}`);
+              }
+            } else if (failedTaskId && handle.terminatedByOrchestrator) {
+              this.logger.debug(
+                `Skipping failure recording for task ${failedTaskId} (session ${sessionId}) - already recorded by orchestrator`,
+              );
+              // Still preserve thread ID for resume support even on orchestrator-terminated workers
+              if (handle.threadId && handle.threadId.length > 0) {
+                this.taskThreadIds.set(failedTaskId, handle.threadId);
+              }
+            } else {
+              // Fallback: sentinel or worker that never claimed a task
+              this.logger.warn(`Worker ${sessionId} failed but has no associated task ID`);
+            }
           }
+
+          // H-9 FIX: Clean up resilience trackers to prevent memory leaks
+          this.timeoutTracker.stopTracking(sessionId);
+          this.heartbeatTracker.cleanup(sessionId);
+          this.sessionToTaskMap.delete(sessionId);
+
+          handle.child = null;
+          this.activeWorkers.delete(sessionId);
+        })()
+          .then(() => {
+            if (success) {
+              resolve();
+            } else {
+              reject(new Error(message));
+            }
+          })
+          .catch(reject);
+      };
+
+      child.stdout.setEncoding("utf-8");
+      child.stderr.setEncoding("utf-8");
+
+      child.stdout.on("data", (chunk: string) => {
+        stdoutBuffer = this.consumeLines(stdoutBuffer + chunk, (line) => {
+          this.processCodexOutputLine(sessionId, handle, line);
+        });
+      });
+
+      child.stderr.on("data", (chunk: string) => {
+        stderrBuffer = this.consumeLines(stderrBuffer + chunk, (line) => {
+          if (line.trim().length > 0) {
+            this.maybeRecordRateLimit(handle, sessionId, line);
+            this.logger.debug(`Codex worker ${sessionId} stderr: ${line}`);
+          }
+        });
+      });
+
+      child.on("error", (err) => {
+        settle(false, err.message);
+      });
+
+      child.on("close", (code, signal) => {
+        stdoutBuffer = this.consumeLines(stdoutBuffer, (line) => {
+          this.processCodexOutputLine(sessionId, handle, line);
+        }, true);
+        stderrBuffer = this.consumeLines(stderrBuffer, (line) => {
+          if (line.trim().length > 0) {
+            this.maybeRecordRateLimit(handle, sessionId, line);
+            this.logger.debug(`Codex worker ${sessionId} stderr: ${line}`);
+          }
+        }, true);
+
+        if (code === 0) {
+          settle(true, "Completed successfully");
+          return;
+        }
+
+        const reason = signal
+          ? `Codex worker terminated by signal ${signal}`
+          : `Codex exited with code ${code ?? "unknown"}`;
+        settle(false, reason);
+      });
+    });
+  }
+
+  /**
+   * H-10 FIX: Run a Codex session with resume capability.
+   * This method attempts to use `codex exec resume --last` when a thread ID
+   * is available from a previous failed session on the same task.
+   *
+   * If resume args cannot be built (no preserved thread ID), falls back to
+   * a fresh start with the corrective prompt.
+   */
+  private async runCodexSessionWithResume(
+    sessionId: string,
+    handle: WorkerHandle,
+    taskId: string,
+    correctivePrompt: string,
+    sandbox: CodexSandboxMode,
+    progress: string,
+  ): Promise<void> {
+    const outputPath = path.join(
+      this.orchestratorDir,
+      SESSIONS_DIR,
+      sessionId,
+      "codex-last-message.txt",
+    );
+
+    await this.updateSessionStatus(sessionId, "working", progress);
+
+    // Try to build resume args using preserved thread ID
+    const resumeArgs = this.buildResumeArgs(sessionId, taskId, correctivePrompt, sandbox, outputPath);
+
+    if (!resumeArgs) {
+      // No preserved thread ID - fall back to fresh start with corrective context
+      this.logger.info(`No resume capability for task ${taskId}, using fresh start`);
+      const freshPrompt = `${this.buildWorkerPrompt(sessionId)}\n\n## Retry Context\n\nThis is a retry of a previously failed task. ${correctivePrompt}`;
+      return this.runCodexSession(sessionId, handle, freshPrompt, sandbox, progress);
+    }
+
+    this.logger.info(`Using session resumption for task ${taskId}`);
+
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn("codex", resumeArgs, {
+        cwd: this.projectDir,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      handle.child = child;
+
+      let stdoutBuffer = "";
+      let stderrBuffer = "";
+      let settled = false;
+
+      const settle = (success: boolean, message: string): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+
+        void (async () => {
+          if (success) {
+            this.logger.info(`Codex worker ${sessionId} (resumed) completed successfully.`);
+            if (handle.lastMessage) {
+              this.logger.debug(
+                `Codex worker ${sessionId} final message: ${handle.lastMessage.substring(0, 200)}`,
+              );
+            }
+            this.recordEvent(handle, { type: "session_done", sessionId });
+            await this.updateSessionStatus(sessionId, "done", "Completed successfully (resumed)");
+            // Clear the preserved thread ID on success since the task is done
+            this.taskThreadIds.delete(taskId);
+          } else {
+            this.logger.error(`Codex worker ${sessionId} (resumed) failed: ${message}`);
+            this.maybeRecordRateLimit(handle, sessionId, message);
+            this.recordEvent(handle, { type: "session_failed", sessionId, error: message });
+            await this.updateSessionStatus(sessionId, "failed", message);
+            // Skip if the orchestrator already recorded this failure (terminatedByOrchestrator flag)
+            // to avoid double-counting which can prematurely exhaust retries.
+            if (!handle.terminatedByOrchestrator) {
+              this.retryTracker.recordFailure(taskId, message);
+              this.logger.debug(`Recorded failure for task ${taskId} (session ${sessionId}, resumed)`);
+            } else {
+              this.logger.debug(
+                `Skipping failure recording for task ${taskId} (session ${sessionId}, resumed) - already recorded by orchestrator`,
+              );
+            }
+
+            // Update preserved thread ID if we got a new one
+            if (handle.threadId && handle.threadId.length > 0) {
+              this.taskThreadIds.set(taskId, handle.threadId);
+              this.logger.debug(`Updated preserved thread ID for task ${taskId}: ${handle.threadId}`);
+            }
+          }
+
+          this.timeoutTracker.stopTracking(sessionId);
+          this.heartbeatTracker.cleanup(sessionId);
+          this.sessionToTaskMap.delete(sessionId);
 
           handle.child = null;
           this.activeWorkers.delete(sessionId);
@@ -448,7 +865,17 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       return;
     }
 
+    // H-9 FIX: Every valid JSONL line serves as a heartbeat — update monotonic timestamp
+    handle.lastEventAt = process.hrtime.bigint();
+    this.heartbeatTracker.recordHeartbeat(sessionId);
+
     const eventType = typeof parsed.type === "string" ? parsed.type : "unknown";
+
+    // H-9: Capture thread ID from thread.started events for session resumption (H-10)
+    if (eventType === "thread.started" && typeof parsed.thread_id === "string" && parsed.thread_id.length > 0) {
+      handle.threadId = parsed.thread_id;
+      this.logger.debug(`Codex worker ${sessionId} thread started: ${handle.threadId}`);
+    }
 
     if (eventType === "error") {
       const message = coerceLogText(parsed.message ?? parsed);
@@ -527,8 +954,13 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     sandbox: CodexSandboxMode,
     outputPath: string,
   ): string[] {
+    // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
+    const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];
+
     return [
       "exec",
+      "--model",
+      codexModel,
       "--json",
       "--full-auto",
       "--sandbox",
@@ -558,6 +990,82 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       "-c",
       "mcp_servers.coordinator.required=false",
       prompt,
+    ];
+  }
+
+  /**
+   * H-10 FIX: Build resume args for retrying a failed Codex session.
+   * Uses `codex exec resume --last` when a thread ID is available from the
+   * previous session, which is more powerful than a fresh start because
+   * Codex can resume from its SQLite-persisted session state.
+   *
+   * Returns null if no thread ID is available (caller should fall back to fresh start).
+   *
+   * @param sessionId - The new session ID for the retry worker (for MCP server config)
+   * @param taskId - The task ID being retried (used to look up preserved thread ID)
+   * @param correctivePrompt - Prompt explaining what to fix
+   * @param sandbox - Sandbox mode for the Codex session
+   * @param outputPath - Path for Codex output
+   */
+  private buildResumeArgs(
+    sessionId: string,
+    taskId: string,
+    correctivePrompt: string,
+    sandbox: CodexSandboxMode,
+    outputPath: string,
+  ): string[] | null {
+    // H-10 FIX: Look up thread ID by TASK ID (not session ID)
+    // The thread ID was preserved when the previous worker failed on this task
+    const threadId = this.taskThreadIds.get(taskId);
+    if (!threadId || threadId.length === 0) {
+      return null; // No session to resume — caller falls back to fresh start
+    }
+
+    // KNOWN LIMITATION: The Codex CLI `exec resume` does not support targeting a
+    // specific thread/session by ID. `--last` resumes the most recent session,
+    // which may not correspond to the intended task when multiple workers run
+    // concurrently. The threadId is validated for existence above to gate whether
+    // resume is attempted, but the actual resume target is best-effort.
+    // If the Codex CLI adds `--thread-id <id>` support in the future, use it here.
+
+    // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
+    const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];
+
+    return [
+      "exec",
+      "resume",
+      "--last",
+      "--model",
+      codexModel,
+      "--json",
+      "--full-auto",
+      "--sandbox",
+      sandbox,
+      "--skip-git-repo-check",
+      "--ephemeral",
+      "--color",
+      "never",
+      "-o",
+      outputPath,
+      "-C",
+      this.projectDir,
+      "-c",
+      'mcp_servers.coordinator.command="node"',
+      "-c",
+      `mcp_servers.coordinator.args=[${JSON.stringify(this.mcpServerPath)}]`,
+      "-c",
+      `mcp_servers.coordinator.env.CONDUCTOR_DIR=${JSON.stringify(this.orchestratorDir)}`,
+      "-c",
+      `mcp_servers.coordinator.env.SESSION_ID=${JSON.stringify(sessionId)}`,
+      "-c",
+      "mcp_servers.coordinator.startup_timeout_sec=10",
+      "-c",
+      "mcp_servers.coordinator.tool_timeout_sec=30",
+      "-c",
+      "mcp_servers.coordinator.enabled=true",
+      "-c",
+      "mcp_servers.coordinator.required=false",
+      correctivePrompt,
     ];
   }
 
@@ -600,9 +1108,11 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   private buildWorkerPrompt(sessionId: string): string {
+    // M-19: Pass subagentModel so the worker prompt includes a model hint for spawned subagents
     return getWorkerPrompt({
       sessionId,
       runtime: "codex",
+      subagentModel: this.modelConfig.subagent,
       ...this.workerContext,
     });
   }
