@@ -363,7 +363,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.4.3");
+  .version("0.4.4");
 
 // ============================================================
 // start command

@@ -38,6 +38,7 @@ export function getWorkerPrompt(context: WorkerPromptContext): string {
     runtime === "claude"
       ? [
           `- **Use agent teams for complex tasks.** If a task is large enough to benefit from parallelism (e.g., multiple independent files to create), you can spawn an agent team. You are a full Claude Code session with this capability. Your internal team works on your claimed task only.${subagentModelNote}`,
+          `- **Write before you spawn.** When delegating to a subagent, never pass all context inline in the prompt string. Instead, write your findings and context to a file first (e.g., \`_context_<subtask>.md\`), then tell the subagent to read that file. Subagents start with an empty context window — inline text cannot be referenced later during execution, leading to hallucinated context. The file is the handoff.`,
         ]
       : [];
   const windDownExtraSteps =
@@ -114,6 +115,14 @@ These rules are mandatory for every task. Violations will be caught during code 
 - Avoid N+1 query patterns. Use batch fetches, joins, or includes instead of loops that issue individual queries.
 - When adding a query that filters on a column, verify an index exists for that column. If not, add a migration to create one.
 - Avoid synchronous blocking operations in async request handlers. Use async/await or non-blocking alternatives.`);
+
+  // ------------------------------------------------------------------
+  // 3.5. Execution Discipline (always included)
+  // ------------------------------------------------------------------
+  lines.push(`## Execution Discipline
+
+- **Use code for computation.** For any numerical calculation, data transformation, or quantitative analysis, use code execution (scripts, shell commands). Do not perform arithmetic, data parsing, or layout math in prose — it is slower and less reliable.
+- **Stay in your lane.** Implement only the work described in your claimed task. Do not implement functionality that belongs to another task. However, DO consider how your work interfaces with adjacent tasks — use \`get_contracts\` and \`get_decisions\` to coordinate shared boundaries.`);
 
   // ------------------------------------------------------------------
   // 4. Definition of Done Checklist (always included)
