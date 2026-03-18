@@ -14,6 +14,7 @@ import {
 import { detectProjectWithCache } from "./project-detector.js";
 import { analyzeDesignSystem } from "../utils/design-spec-analyzer.js";
 import { generateFlowConfig } from "../utils/flow-config-generator.js";
+import { extractProjectRules } from "../utils/rules-extractor.js";
 import { ensureGitignore } from "../utils/gitignore.js";
 import { Logger } from "../utils/logger.js";
 
@@ -22,27 +23,6 @@ export interface InitOptions {
   model?: string;
   verbose?: boolean;
 }
-
-const RULES_TEMPLATE = `# Conductor Worker Rules
-# These rules are injected into every worker prompt.
-# Add project-specific guidance below.
-
-## Architecture Rules
-# e.g., "All API routes must go through the auth middleware"
-# e.g., "Use server actions for mutations, not API routes"
-
-## Coding Standards
-# e.g., "Use zod for all input validation"
-# e.g., "Use the cn() utility for conditional classNames"
-
-## Off-Limits
-# e.g., "Do not modify shared component base styles — add variants instead"
-# e.g., "Do not add new dependencies without approval"
-
-## Component Guidelines
-# e.g., "All new UI components must support the project's variant system"
-# e.g., "Shared primitives live in components/ui/ — do not create duplicates"
-`;
 
 /** Frameworks that indicate a frontend is present. */
 const FRONTEND_FRAMEWORKS = new Set([
@@ -97,10 +77,11 @@ export async function runInit(
   const flowConfigPath = getFlowConfigPath(projectDir);
   await writeConfigFile(flowConfigPath, JSON.stringify(flowConfig, null, 2), options.force, result, projectDir);
 
-  // 5. Scaffold rules.md
-  console.log(chalk.cyan("  Scaffolding worker rules..."));
+  // 5. Extract rules from project guidance files (CLAUDE.md, .claude/rules/, etc.)
+  console.log(chalk.cyan("  Extracting worker rules from project guidance..."));
+  const rulesContent = await extractProjectRules(projectDir, options.model, logger);
   const rulesPath = getRulesPath(projectDir);
-  await writeConfigFile(rulesPath, RULES_TEMPLATE, options.force, result, projectDir);
+  await writeConfigFile(rulesPath, rulesContent, options.force, result, projectDir);
 
   // 6. Analyze design system (only if frontend detected)
   if (hasFrontend) {
