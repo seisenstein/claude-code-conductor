@@ -56,6 +56,7 @@ import {
   getDesignSpecPath,
   getFlowConfigPath,
   getRulesPath,
+  SENTINEL_SESSION_ID,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -1527,6 +1528,11 @@ export class Orchestrator {
         const activeWorkers = this.workers.getActiveWorkers();
         await this.syncTrackedActiveSessions(activeWorkers);
 
+        // Separate execution workers from the sentinel for respawn decisions.
+        // The sentinel is read-only and cannot claim/execute tasks, so it must
+        // not count toward the "active workers" that gate respawning.
+        const activeExecutionWorkers = activeWorkers.filter((id) => id !== SENTINEL_SESSION_ID);
+
         // V2: Filter out timed-out and stale workers from healthy list
         const deadWorkers = [...timedOut, ...stale];
         const healthyWorkers = activeWorkers.filter((id) => !deadWorkers.includes(id));
@@ -1548,8 +1554,8 @@ export class Orchestrator {
         const refreshedTasks = resetCount > 0 || exhaustedCount > 0 ? await this.state.getAllTasks() : allTasks;
         const pendingNow = refreshedTasks.filter((t) => t.status === "pending");
 
-        if (activeWorkers.length === 0 && pendingNow.length > 0) {
-          // All workers finished but tasks remain — respawn
+        if (activeExecutionWorkers.length === 0 && pendingNow.length > 0) {
+          // All execution workers finished but tasks remain — respawn
           const respawnCount = Math.min(this.options.concurrency, pendingNow.length);
           this.logger.info(
             `All workers done but ${pendingNow.length} task(s) remain. Respawning ${respawnCount} worker(s)...`,
@@ -1573,17 +1579,17 @@ export class Orchestrator {
             recordWorkerSpawn(this.eventLog, sessionId);
           }
           await this.syncTrackedActiveSessions();
-        } else if (activeWorkers.length === 0 && pendingNow.length === 0) {
-          // No active workers, no pending tasks — execution is done
+        } else if (activeExecutionWorkers.length === 0 && pendingNow.length === 0) {
+          // No execution workers, no pending tasks — execution is done
           break;
         }
 
-        // Print progress
+        // Print progress (show execution worker count, not sentinel)
         if (iteration % 3 === 0) {
-          const progressDetail = `Executing: ${completed.length}/${allTasks.length} tasks complete, ${remaining.length} remaining (${activeWorkers.length} workers active)`;
+          const progressDetail = `Executing: ${completed.length}/${allTasks.length} tasks complete, ${remaining.length} remaining (${activeExecutionWorkers.length} worker(s) active)`;
           await this.state.setProgress(progressDetail);
           await logProgress(this.options.project, "executing", progressDetail);
-          this.printProgress(completed.length, failed.length, remaining.length, activeWorkers.length);
+          this.printProgress(completed.length, failed.length, remaining.length, activeExecutionWorkers.length);
         }
 
         // Sleep between checks
@@ -2565,7 +2571,7 @@ export class Orchestrator {
 
   private async syncTrackedActiveSessions(activeWorkers?: string[]): Promise<void> {
     const workers = activeWorkers ?? this.workers.getActiveWorkers();
-    const trackedSessions = workers.filter((id) => id !== "sentinel-security");
+    const trackedSessions = workers.filter((id) => id !== SENTINEL_SESSION_ID);
     await this.state.setActiveSessions(trackedSessions);
   }
 

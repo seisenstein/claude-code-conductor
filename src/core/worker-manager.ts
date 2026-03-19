@@ -24,6 +24,7 @@ import {
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
   SENTINEL_WORKER_MAX_TURNS,
+  SENTINEL_SESSION_ID,
   FLOW_TRACING_READ_ONLY_TOOLS,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
@@ -149,7 +150,7 @@ export class WorkerManager implements ExecutionWorkerManager {
    * and scans for security issues in real-time during execution.
    */
   async spawnSentinelWorker(): Promise<void> {
-    const sentinelId = "sentinel-security";
+    const sentinelId = SENTINEL_SESSION_ID;
 
     if (this.activeWorkers.has(sentinelId)) {
       this.logger.warn("Security sentinel is already running");

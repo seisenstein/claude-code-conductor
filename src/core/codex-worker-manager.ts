@@ -15,6 +15,7 @@ import {
   MESSAGES_DIR,
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
+  SENTINEL_SESSION_ID,
   MAX_BUFFER_SIZE_BYTES,
   getCodexModel,
 } from "../utils/constants.js";
@@ -122,7 +123,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   async spawnSentinelWorker(): Promise<void> {
-    const sentinelId = "sentinel-security";
+    const sentinelId = SENTINEL_SESSION_ID;
 
     if (this.activeWorkers.has(sentinelId)) {
       this.logger.warn("Security sentinel is already running");

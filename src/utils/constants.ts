@@ -49,6 +49,7 @@ export const MAX_FLOW_TRACING_WORKERS = 3;
 export const FLOW_TRACING_OVERALL_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes overall deadline (#12)
 export const SENTINEL_POLL_INTERVAL_MS = 15_000; // 15 seconds
 export const SENTINEL_WORKER_MAX_TURNS = 200;
+export const SENTINEL_SESSION_ID = "sentinel-security";
 export const CONVENTIONS_EXTRACTION_MAX_TURNS = 20;
 export const RULES_EXTRACTOR_MAX_TURNS = 25;
 export const RULES_EXTRACTOR_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
