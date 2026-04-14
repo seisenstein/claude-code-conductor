@@ -260,6 +260,8 @@ export type TaskType =
   | "security"
   | "testing"
   | "infrastructure"
+  | "reverse_engineering"
+  | "integration"
   | "general";
 
 export interface PlannerOutput {

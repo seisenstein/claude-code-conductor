@@ -435,7 +435,7 @@ export class Planner {
       '     "description": "Detailed description including exact files, function signatures, API contracts...",',
       '     "depends_on_subjects": ["Subject of dependency 1", "Subject of dependency 2"],',
       '     "estimated_complexity": "small|medium|large",',
-      '     "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|general",',
+      '     "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|reverse_engineering|integration|general",',
       '     "security_requirements": ["Must use auth middleware", "Must validate input with Zod schema"],',
       '     "performance_requirements": ["Must paginate results", "Must use batch fetch"],',
       '     "acceptance_criteria": ["Type check passes", "All new endpoints have auth", "Tests added"]',

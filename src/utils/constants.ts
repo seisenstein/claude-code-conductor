@@ -164,10 +164,12 @@ export const PROJECT_PROFILE_FILE = "project-profile.json";
 
 export const TASK_TYPE_PRIORITY: Record<TaskType, number> = {
   security: 60,
+  reverse_engineering: 55,
   database: 50,
   backend_api: 40,
   infrastructure: 30,
   frontend_ui: 20,
+  integration: 15,
   testing: 10,
   general: 0,
 };

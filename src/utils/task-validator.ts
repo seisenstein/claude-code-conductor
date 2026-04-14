@@ -9,7 +9,8 @@ type Complexity = (typeof VALID_COMPLEXITIES)[number];
 
 const VALID_TASK_TYPES: TaskType[] = [
   "backend_api", "frontend_ui", "database", "security",
-  "testing", "infrastructure", "general",
+  "testing", "infrastructure",
+  "reverse_engineering", "integration", "general",
 ];
 
 const VALID_RISK_LEVELS = ["low", "medium", "high"] as const;

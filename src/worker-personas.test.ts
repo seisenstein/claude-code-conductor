@@ -9,6 +9,8 @@ const ALL_TASK_TYPES: TaskType[] = [
   "database",
   "testing",
   "infrastructure",
+  "reverse_engineering",
+  "integration",
   "general",
 ];
 
@@ -20,6 +22,8 @@ describe("getPersona", () => {
     ["frontend_ui", "Frontend Specialist"],
     ["testing", "Test Engineer"],
     ["infrastructure", "Infrastructure Engineer"],
+    ["reverse_engineering", "Reverse Engineering Analyst"],
+    ["integration", "Integration Engineer"],
     ["general", "Software Engineer"],
   ] as const)("getPersona(%s) returns role %s", (taskType, expectedRole) => {
     const persona = getPersona(taskType);
