@@ -68,7 +68,10 @@ const RegisterContractInputSchema = z.object({
 });
 
 // M-26: Valid ArchitecturalDecision categories matching the type in types.ts
-const VALID_DECISION_CATEGORIES = [
+// H-18: exported so the MCP tool schema in coordination-server.ts can use
+// the same enum for validation (previously used z.string(), producing a
+// less informative error when invalid categories got past the MCP boundary).
+export const VALID_DECISION_CATEGORIES = [
   "naming", "auth", "data_model", "error_handling",
   "api_design", "testing", "performance", "other",
 ] as const;

@@ -16,6 +16,7 @@ import {
   handleRecordDecision,
   handleGetDecisions,
   handleRunTests,
+  VALID_DECISION_CATEGORIES,
 } from "./tools.js";
 
 // ============================================================
@@ -346,7 +347,10 @@ async function main(): Promise<void> {
     "record_decision",
     "Record an architectural decision so other workers can stay consistent. Decisions are append-only and shared across all sessions.",
     {
-      category: z.string().describe("Decision category (naming, auth, data_model, error_handling, api_design, testing, performance, other)"),
+      // H-18: align MCP-layer validation with handler validation. Previously
+      // z.string() accepted anything, letting invalid categories cross the
+      // MCP boundary and fail with a less-informative error inside the handler.
+      category: z.enum(VALID_DECISION_CATEGORIES).describe("Decision category (one of: naming, auth, data_model, error_handling, api_design, testing, performance, other)"),
       decision: z.string().describe("The decision that was made"),
       rationale: z.string().describe("Why this decision was made"),
       task_id: z.string().optional().describe("The task that prompted this decision"),
