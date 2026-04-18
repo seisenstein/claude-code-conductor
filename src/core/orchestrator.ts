@@ -31,7 +31,7 @@ import type {
   DesignSpecUpdateResult,
 } from "../utils/types.js";
 import { ConductorExitError } from "../utils/types.js";
-import { resolveRoleSpec, describeResolvedRoles } from "../utils/models-config.js";
+import { resolveRoleSpec, resolveSdkArgs, describeResolvedRoles } from "../utils/models-config.js";
 
 import {
   BRANCH_PREFIX,
@@ -1199,9 +1199,19 @@ export class Orchestrator {
             "4. Provide a clear, structured response addressing each point.",
           ].join("\n");
 
+          // H-9: investigator participates in security-gate plan review —
+          // use planner's resolved model + effort instead of SDK defaults.
+          const planInvSpec = resolveSdkArgs(this.options.modelConfig, "planner");
           let responseText = await queryWithTimeout(
             investigatorPrompt,
-            { allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "LSP"], cwd: this.options.project, maxTurns: 20, settingSources: ["project"] },
+            {
+              allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "LSP"],
+              cwd: this.options.project,
+              maxTurns: 20,
+              model: planInvSpec.model,
+              ...(planInvSpec.effort ? { effort: planInvSpec.effort } : {}),
+              settingSources: ["project"],
+            },
             10 * 60 * 1000, // 10 min
             `plan-investigator-round-${discussionRound}`,
             this.logger,
@@ -1842,9 +1852,18 @@ export class Orchestrator {
         "4. Provide a summary of what you fixed and what you left unchanged.",
       ].join("\n");
 
+      // H-9: code-review investigator also uses planner's model + effort.
+      const codeInvSpec = resolveSdkArgs(this.options.modelConfig, "planner");
       let responseText = await queryWithTimeout(
         reviewerPrompt,
-        { allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"], cwd: this.options.project, maxTurns: 30, settingSources: ["project"] },
+        {
+          allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"],
+          cwd: this.options.project,
+          maxTurns: 30,
+          model: codeInvSpec.model,
+          ...(codeInvSpec.effort ? { effort: codeInvSpec.effort } : {}),
+          settingSources: ["project"],
+        },
         10 * 60 * 1000, // 10 min
         `code-review-investigator-round-${reviewRound}`,
         this.logger,
