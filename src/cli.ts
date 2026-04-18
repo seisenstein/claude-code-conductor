@@ -24,6 +24,7 @@ import {
 } from "./utils/constants.js";
 import { validateBounds } from "./utils/validation.js";
 import { validateStateJsonLenient } from "./utils/state-schema.js";
+import { mkdirSecure } from "./utils/secure-fs.js";
 
 // ============================================================
 // Module-level state
@@ -418,7 +419,7 @@ async function acquireProcessLock(projectDir: string): Promise<() => Promise<voi
   const orchestratorDir = getOrchestratorDir(projectDir);
 
   // Ensure .conductor directory exists
-  await fs.mkdir(orchestratorDir, { recursive: true, mode: 0o700 });
+  await mkdirSecure(orchestratorDir, { recursive: true }); // H-2
 
   // Create lock file if it doesn't exist (required by proper-lockfile)
   try {

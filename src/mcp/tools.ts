@@ -24,7 +24,7 @@ import {
 } from "../utils/constants.js";
 import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
 import { validateFileName, validateFileNames } from "../utils/validation.js";
-import { appendJsonlLocked } from "../utils/secure-fs.js";
+import { appendJsonlLocked, mkdirSecure } from "../utils/secure-fs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -157,7 +157,7 @@ function getProjectDir(): string {
  * Ensure a directory exists, creating it and parents if necessary.
  */
 async function ensureDir(dir: string): Promise<void> {
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await mkdirSecure(dir, { recursive: true }); // H-2
 }
 
 /**

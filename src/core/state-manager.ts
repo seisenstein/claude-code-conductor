@@ -28,6 +28,7 @@ import {
   getStatePath,
   getTaskPath,
 } from "../utils/constants.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 
 export class StateManager {
   private projectDir: string;
@@ -134,8 +135,8 @@ export class StateManager {
     const tmpPath = statePath + ".tmp";
     const content = JSON.stringify(this.state, null, 2) + "\n";
 
-    // Ensure the directory exists before writing
-    await fs.mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    // Ensure the directory exists before writing (H-2: mkdirSecure enforces 0o700)
+    await mkdirSecure(path.dirname(statePath), { recursive: true });
 
     // Ensure state.json exists before locking (proper-lockfile requires file to exist).
     // Use fs.open() with "a" flag for atomic create-or-noop, preventing the TOCTOU race
@@ -230,7 +231,7 @@ export class StateManager {
     ];
 
     for (const dir of dirs) {
-      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+      await mkdirSecure(dir, { recursive: true }); // H-2
     }
   }
 

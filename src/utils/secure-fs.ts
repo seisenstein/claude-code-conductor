@@ -14,6 +14,7 @@
  */
 
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import { lock } from "proper-lockfile";
 
 /**
@@ -69,7 +70,8 @@ export async function mkdirSecure(
   const recursive = options?.recursive ?? false;
   const mode = options?.mode ?? SECURE_DIR_MODE;
 
-  // Create the directory (mode may not apply to existing directories)
+  // Create the directory (mode may not apply to existing directories,
+  // and is filtered by umask even for new ones — defeated by the chmod below)
   await fs.mkdir(dirPath, { recursive, mode });
 
   // Explicitly chmod the target directory to enforce permissions
@@ -80,6 +82,27 @@ export async function mkdirSecure(
   } catch {
     // If chmod fails (e.g., we don't own the directory), ignore
     // This can happen with system directories in the path
+  }
+}
+
+/**
+ * Synchronous variant of mkdirSecure for init paths that cannot await
+ * (currently: Logger constructor, setup.ts).
+ *
+ * Same semantics: fs.mkdir with mode is filtered by umask, so chmodSync
+ * after creation guarantees the final directory has the requested mode.
+ */
+export function mkdirSecureSync(
+  dirPath: string,
+  options?: { recursive?: boolean; mode?: number },
+): void {
+  const recursive = options?.recursive ?? false;
+  const mode = options?.mode ?? SECURE_DIR_MODE;
+  fsSync.mkdirSync(dirPath, { recursive, mode });
+  try {
+    fsSync.chmodSync(dirPath, mode);
+  } catch {
+    // ignore — may not own dir
   }
 }
 

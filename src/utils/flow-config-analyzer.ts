@@ -24,6 +24,7 @@ import {
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
+import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
 import type {
   FlowConfig,
@@ -353,7 +354,7 @@ export async function analyzeFlowConfig(
   // re-analysis for the next hour. Only persist genuine tailored output.
   if (!usedSeed && !opts.skipCache) {
     try {
-      await fs.mkdir(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+      await mkdirSecure(path.dirname(cachePath), { recursive: true }); // H-2
       await fs.writeFile(cachePath, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
     } catch (error) {
       warn(`Failed to cache flow-config: ${error instanceof Error ? error.message : String(error)}`);

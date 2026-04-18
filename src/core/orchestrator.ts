@@ -76,6 +76,7 @@ import { updateDesignSpec } from "../utils/design-spec-updater.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 import { ensureGitignore } from "../utils/gitignore.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 import {
   detectProject,
   loadCachedProfile,
@@ -793,7 +794,7 @@ export class Orchestrator {
     const conductorDir = path.resolve(getOrchestratorDir(this.options.project));
 
     const configDir = path.join(this.options.project, ".codex");
-    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
+    await mkdirSecure(configDir, { recursive: true }); // H-2
 
     // M-19: Include agents.job_max_runtime_seconds for belt-and-suspenders timeout
     const toml = [

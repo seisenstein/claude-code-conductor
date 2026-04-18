@@ -6,6 +6,7 @@ import path from "node:path";
 import type { CodexReviewResult, CodexVerdict, CodexUsageMetrics } from "../utils/types.js";
 import { getCodexReviewsDir } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -580,7 +581,7 @@ export class CodexReviewer {
     const reviewsDir = getCodexReviewsDir(this.projectDir);
 
     // Ensure directory exists
-    await fs.mkdir(reviewsDir, { recursive: true });
+    await mkdirSecure(reviewsDir, { recursive: true }); // H-2
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `${prefix}-${timestamp}.md`;

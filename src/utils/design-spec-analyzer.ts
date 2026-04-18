@@ -10,6 +10,7 @@ import {
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
+import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
 
 const DEFAULT_DESIGN_SPEC: DesignSpec = {
@@ -193,7 +194,7 @@ export async function analyzeDesignSystem(
 
   // Cache to disk
   try {
-    await fs.mkdir(path.dirname(specPath), { recursive: true, mode: 0o700 });
+    await mkdirSecure(path.dirname(specPath), { recursive: true }); // H-2
     await fs.writeFile(specPath, JSON.stringify(spec, null, 2), { encoding: "utf-8", mode: 0o600 });
   } catch (error) {
     warn(`Failed to cache design spec: ${error instanceof Error ? error.message : String(error)}`);

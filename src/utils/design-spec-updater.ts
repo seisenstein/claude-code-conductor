@@ -10,6 +10,7 @@ import {
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
+import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
 
 /** Frontend file extensions to watch for design spec changes. */
@@ -199,7 +200,7 @@ async function parseUpdateResult(
     const specPath = getDesignSpecPath(projectDir);
     const tmpPath = specPath + ".tmp";
     try {
-      await fs.mkdir(path.dirname(specPath), { recursive: true, mode: 0o700 });
+      await mkdirSecure(path.dirname(specPath), { recursive: true }); // H-2
       await fs.writeFile(tmpPath, JSON.stringify(updatedSpec, null, 2), { encoding: "utf-8", mode: 0o600 });
       await fs.rename(tmpPath, specPath);
     } catch (err) {

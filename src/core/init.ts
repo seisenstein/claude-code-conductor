@@ -20,6 +20,7 @@ import { analyzeFlowConfig } from "../utils/flow-config-analyzer.js";
 import { extractProjectRules } from "../utils/rules-extractor.js";
 import { ensureGitignore } from "../utils/gitignore.js";
 import { Logger } from "../utils/logger.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 
 export interface InitOptions {
   force?: boolean;
@@ -56,7 +57,7 @@ export async function runInit(
   };
 
   // 1. Ensure .conductor/ exists and is gitignored
-  await fs.mkdir(orchestratorDir, { recursive: true, mode: 0o700 });
+  await mkdirSecure(orchestratorDir, { recursive: true }); // H-2
   await ensureGitignore(projectDir);
 
   // 2. Detect project
@@ -172,7 +173,7 @@ export async function runInit(
         // Analyzer wrote to specPath (cache), but user had a pre-existing one.
         // Move the analyzer output to recommended-configs.
         const recDir = getRecommendedConfigsDir(projectDir);
-        await fs.mkdir(recDir, { recursive: true, mode: 0o700 });
+        await mkdirSecure(recDir, { recursive: true }); // H-2
         const recPath = path.join(recDir, "design-spec.json");
         // Re-write to recommended path
         await fs.writeFile(recPath, JSON.stringify(spec, null, 2), { encoding: "utf-8", mode: 0o600 });
@@ -212,13 +213,13 @@ async function writeConfigFile(
   if (exists && !force) {
     // Write to recommended-configs/ instead
     const recDir = getRecommendedConfigsDir(projectDir);
-    await fs.mkdir(recDir, { recursive: true, mode: 0o700 });
+    await mkdirSecure(recDir, { recursive: true }); // H-2
     const fileName = path.basename(targetPath);
     const recPath = path.join(recDir, fileName);
     await fs.writeFile(recPath, content, { encoding: "utf-8", mode: 0o600 });
     result.files.recommended.push(relPath(recPath, projectDir));
   } else {
-    await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+    await mkdirSecure(path.dirname(targetPath), { recursive: true }); // H-2
     await fs.writeFile(targetPath, content, { encoding: "utf-8", mode: 0o600 });
     result.files.created.push(relPath(targetPath, projectDir));
   }

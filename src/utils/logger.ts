@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import chalk from "chalk";
+import { mkdirSecureSync } from "./secure-fs.js";
 
 export class Logger {
   private name: string;
@@ -12,8 +13,8 @@ export class Logger {
   constructor(logDir: string, name: string) {
     this.name = name;
 
-    // Ensure the log directory exists with secure permissions (owner-only)
-    fs.mkdirSync(logDir, { recursive: true, mode: 0o700 });
+    // Ensure the log directory exists with secure permissions (H-2: chmod-enforced 0o700)
+    mkdirSecureSync(logDir, { recursive: true });
 
     this.logFilePath = path.join(logDir, `${name}.log`);
     // Use mode 0o600 for owner-only read/write access (security requirement #15)
