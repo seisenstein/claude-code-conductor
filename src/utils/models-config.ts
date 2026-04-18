@@ -196,7 +196,16 @@ export async function loadModelsConfig(projectDir: string): Promise<LoadModelsCo
  */
 export function resolveRoleSpec(config: ModelConfig | undefined, role: AgentRole): RoleModelSpec {
   const override = config?.roles?.[role];
-  if (override) return { tier: override.tier, effort: override.effort };
+  if (override) {
+    // H-7: inherit default effort when override is tier-only. Previously the
+    // return was `{ tier: override.tier, effort: override.effort }` which
+    // silently dropped the role's default effort for a partial override
+    // like `{ "planner": { "tier": "sonnet-4-6" } }`.
+    return {
+      tier: override.tier,
+      effort: override.effort ?? DEFAULT_ROLE_CONFIG[role].effort,
+    };
+  }
   return { ...DEFAULT_ROLE_CONFIG[role] };
 }
 
