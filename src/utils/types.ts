@@ -271,6 +271,35 @@ export type TaskType =
   | "integration"
   | "general";
 
+/**
+ * H-12: Runtime-accessible tuple of every TaskType literal. Used by
+ * rules-extractor host-side verification — which grep-checks that the
+ * LLM-produced rules document lists every task type if it mentions the
+ * concept at all. Keep this in sync with the TaskType union above; the
+ * exhaustiveness assertion below errors at compile time if they drift.
+ */
+export const TASK_TYPE_LITERALS = [
+  "backend_api",
+  "frontend_ui",
+  "database",
+  "security",
+  "testing",
+  "infrastructure",
+  "reverse_engineering",
+  "integration",
+  "general",
+] as const satisfies readonly TaskType[];
+
+// Compile-time exhaustiveness: fails if a TaskType is not listed.
+type _ExhaustiveTaskTypes =
+  TaskType extends (typeof TASK_TYPE_LITERALS)[number]
+    ? true
+    : ["Missing from TASK_TYPE_LITERALS:", Exclude<TaskType, (typeof TASK_TYPE_LITERALS)[number]>];
+// Retained for type-side enforcement only — no runtime use.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _TASK_TYPE_LITERALS_EXHAUSTIVE: _ExhaustiveTaskTypes = true;
+void _TASK_TYPE_LITERALS_EXHAUSTIVE;
+
 export interface PlannerOutput {
   plan_markdown: string;
   tasks: TaskDefinition[];

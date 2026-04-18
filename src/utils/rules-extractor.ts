@@ -14,11 +14,12 @@ import {
   RULES_EXTRACTOR_MAX_TURNS,
   RULES_EXTRACTOR_TIMEOUT_MS,
   READ_ONLY_DISALLOWED_TOOLS,
+  WORKER_ALLOWED_TOOLS,
 } from "./constants.js";
 import { resolveLooseModelArg } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
-import type { RoleModelSpec } from "./types.js";
+import { TASK_TYPE_LITERALS, type RoleModelSpec } from "./types.js";
 
 /** Well-known guidance file locations to search for. */
 const GUIDANCE_FILE_PATTERNS = [
@@ -181,7 +182,53 @@ export async function extractProjectRules(
   }
 
   const rules = parseRulesOutput(resultText, logger);
+  if (rules === FALLBACK_TEMPLATE) return rules;
+  // H-12: host-side verification of LLM-produced rules. If the document
+  // mentions task types or allowed-tools but drifts from reality, discard
+  // and fall back to template rather than injecting wrong facts into every
+  // worker prompt.
+  if (!verifyExtractedRules(rules, warn)) return FALLBACK_TEMPLATE;
   return rules;
+}
+
+/**
+ * H-12: Host-side verification of LLM-extracted rules.
+ *
+ * Strict-when-triggered policy: if the document mentions the concept, every
+ * concrete value must appear. Silent omission → discard. Tolerating some
+ * missing literals defeats the whole point of host-side verification.
+ *
+ * Returns true if the rules document passes sanity checks, false if drift
+ * was detected. Caller falls back to FALLBACK_TEMPLATE on false.
+ */
+export function verifyExtractedRules(rules: string, warn: (msg: string) => void): boolean {
+  const mentionsTaskTypes = /task[_\s-]?type/i.test(rules);
+  if (mentionsTaskTypes) {
+    const missing = TASK_TYPE_LITERALS.filter((t) => !rules.includes(t));
+    if (missing.length > 0) {
+      warn(
+        `Rules document mentions task types but omits: ${missing.join(", ")}. ` +
+        `Discarding extracted rules and falling back to template.`,
+      );
+      return false;
+    }
+  }
+
+  const mentionsAllowedTools = /allowed[_\s-]?tools?|WORKER_ALLOWED_TOOLS/i.test(rules);
+  if (mentionsAllowedTools) {
+    // Exclude MCP tools — they're often referenced by purpose not name.
+    const expected = WORKER_ALLOWED_TOOLS.filter((t) => !t.startsWith("mcp__"));
+    const missing = expected.filter((t) => !rules.includes(t));
+    if (missing.length > 0) {
+      warn(
+        `Rules document mentions allowed-tools but omits: ${missing.join(", ")}. ` +
+        `Discarding extracted rules and falling back to template.`,
+      );
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
