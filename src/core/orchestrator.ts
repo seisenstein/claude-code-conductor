@@ -77,7 +77,7 @@ import { updateDesignSpec } from "../utils/design-spec-updater.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 import { ensureGitignore } from "../utils/gitignore.js";
-import { mkdirSecure } from "../utils/secure-fs.js";
+import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
 import {
   detectProject,
   loadCachedProfile,
@@ -2489,11 +2489,8 @@ export class Orchestrator {
           options: ["resume", "stop"],
         };
         const escalationPath = getEscalationPath(this.options.project);
-        await fs.writeFile(
-          escalationPath,
-          JSON.stringify(escalation, null, 2) + "\n",
-          { encoding: "utf-8", mode: 0o600 },
-        );
+        // H-14: atomic write to prevent torn JSON on crash mid-write.
+        await writeJsonAtomic(escalationPath, JSON.stringify(escalation, null, 2) + "\n");
         throw new ConductorExitError(2, "User requested pause");
       }
 
@@ -2559,11 +2556,8 @@ export class Orchestrator {
       };
 
       const escalationPath = getEscalationPath(this.options.project);
-      await fs.writeFile(
-        escalationPath,
-        JSON.stringify(escalation, null, 2) + "\n",
-        { encoding: "utf-8", mode: 0o600 },
-      );
+      // H-14: atomic write to prevent torn JSON on crash mid-write.
+      await writeJsonAtomic(escalationPath, JSON.stringify(escalation, null, 2) + "\n");
 
       this.logger.info(`Escalation written to ${escalationPath} — exiting for external handler`);
 

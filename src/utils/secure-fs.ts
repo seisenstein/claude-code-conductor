@@ -186,3 +186,39 @@ export async function appendJsonlLocked(filePath: string, data: unknown): Promis
     }
   }
 }
+
+/**
+ * H-14: Atomically write content to `destPath` via tmp + fsync + rename.
+ *
+ * Writes to `destPath + ".tmp"`, fsyncs the file, then renames. Rename is
+ * atomic on POSIX within a filesystem. On power-loss, either the old file
+ * is intact or the new file is intact — never a torn write.
+ *
+ * `options.fsync: false` skips the durability flush. Rarely correct; allowed
+ * for non-critical files where the perf win matters and durability doesn't.
+ */
+export async function writeJsonAtomic(
+  destPath: string,
+  content: string,
+  options?: { mode?: number; fsync?: boolean },
+): Promise<void> {
+  const mode = options?.mode ?? SECURE_FILE_MODE;
+  const wantFsync = options?.fsync !== false;
+  const tmpPath = destPath + ".tmp";
+  const fh = await fs.open(tmpPath, "w", mode);
+  try {
+    await fh.writeFile(content, { encoding: "utf-8" });
+    if (wantFsync) await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await fs.rename(tmpPath, destPath);
+  // Enforce secure permissions if the destination already existed with looser
+  // perms (fs.open's mode only applies on creation).
+  try {
+    await fs.chmod(destPath, mode);
+  } catch {
+    // Non-fatal — rename succeeded, file exists at destPath; chmod failure
+    // is typically a permissions issue not worth failing the write over.
+  }
+}
