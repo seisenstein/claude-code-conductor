@@ -301,6 +301,32 @@ export const FLOW_TRACING_READ_ONLY_TOOLS = [
 ];
 
 // ============================================================
+// Read-only worker enforcement (CR-1)
+// ============================================================
+
+/**
+ * Tools that MUST NOT be available to read-only workers (sentinel, flow-tracer,
+ * planner question-gen, prompt-compactor, rules-extractor, design-spec
+ * analyzer/updater, conventions-extractor, flow-config-analyzer). Passed to the
+ * SDK via `disallowedTools` to remove these tools from the model's context
+ * entirely — unlike `allowedTools`, which only controls permission-prompt
+ * auto-approval and is ineffective under `permissionMode: "bypassPermissions"`.
+ *
+ * NotebookEdit is the .ipynb write tool. Task spawns subagents which can
+ * themselves have write tools, so it is also excluded.
+ *
+ * Note: `Bash` is NOT in this list — read-only workers need Bash for `git diff`,
+ * `rg`, `find`, etc. A residual write-via-shell risk remains at 7 Bash-present
+ * callsites; see .claude/specs/v0.7.2-critical-fixes.md for the enumeration.
+ */
+export const READ_ONLY_DISALLOWED_TOOLS = [
+  "Write",
+  "Edit",
+  "NotebookEdit",
+  "Task",
+];
+
+// ============================================================
 // Git
 // ============================================================
 

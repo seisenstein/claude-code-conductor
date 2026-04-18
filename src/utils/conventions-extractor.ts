@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ProjectConventions, RoleModelSpec } from "./types.js";
-import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, DEFAULT_ROLE_CONFIG } from "./constants.js";
+import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, DEFAULT_ROLE_CONFIG, READ_ONLY_DISALLOWED_TOOLS } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
@@ -133,6 +133,7 @@ export async function extractConventions(
       EXTRACTION_PROMPT,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS,
         model: sdkArgs.model,

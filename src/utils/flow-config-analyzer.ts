@@ -19,6 +19,7 @@ import {
   FLOW_CONFIG_ANALYZER_MAX_TURNS,
   FLOW_CONFIG_ANALYZER_TIMEOUT_MS,
   DEFAULT_ROLE_CONFIG,
+  READ_ONLY_DISALLOWED_TOOLS,
   getFlowConfigPath,
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
@@ -306,6 +307,7 @@ export async function analyzeFlowConfig(
       prompt,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: FLOW_CONFIG_ANALYZER_MAX_TURNS,
         model: sdkArgs.model,

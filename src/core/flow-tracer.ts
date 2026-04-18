@@ -18,6 +18,7 @@ import {
   MAX_FLOW_TRACING_WORKERS,
   FLOW_TRACING_OVERALL_TIMEOUT_MS,
   DEFAULT_ROLE_CONFIG,
+  READ_ONLY_DISALLOWED_TOOLS,
   getFlowTracingDir,
   getFlowTracingReportPath,
   getFlowTracingSummaryPath,
@@ -264,6 +265,7 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
       prompt,
       {
         allowedTools: ["Read", "Glob", "Grep", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: this.projectDir,
         maxTurns: 15,
         model: this.model,
@@ -376,6 +378,7 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
         prompt,
         {
           allowedTools: FLOW_TRACING_READ_ONLY_TOOLS,
+          disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
           cwd: this.projectDir,
           maxTurns: FLOW_TRACING_WORKER_MAX_TURNS,
           model: this.model,

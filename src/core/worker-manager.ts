@@ -30,6 +30,7 @@ import {
   SENTINEL_WORKER_MAX_TURNS,
   SENTINEL_SESSION_ID,
   FLOW_TRACING_READ_ONLY_TOOLS,
+  READ_ONLY_DISALLOWED_TOOLS,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
@@ -633,6 +634,9 @@ export class WorkerManager implements ExecutionWorkerManager {
             "mcp__coordinator__post_update",
             "mcp__coordinator__get_tasks",
           ],
+          // CR-1: enforce read-only — allowedTools alone is insufficient under
+          // bypassPermissions. See constants.ts:READ_ONLY_DISALLOWED_TOOLS.
+          disallowedTools: READ_ONLY_DISALLOWED_TOOLS,
           mcpServers: {
             coordinator: {
               command: "node",

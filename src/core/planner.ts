@@ -6,7 +6,7 @@ import { z } from "zod";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 
 import type { PlannerOutput, TaskDefinition, Task, ThreatModel, RoleModelSpec } from "../utils/types.js";
-import { getPlanPath, getTasksDraftPath, getTasksDir, getOrchestratorDir, PLANNER_ALLOWED_TOOLS, DEFAULT_ROLE_CONFIG } from "../utils/constants.js";
+import { getPlanPath, getTasksDraftPath, getTasksDir, getOrchestratorDir, PLANNER_ALLOWED_TOOLS, DEFAULT_ROLE_CONFIG, READ_ONLY_DISALLOWED_TOOLS } from "../utils/constants.js";
 import { specToSdkArgs } from "../utils/models-config.js";
 import type { Logger } from "../utils/logger.js";
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
@@ -81,6 +81,7 @@ export class Planner {
       questionPrompt,
       {
         allowedTools: ["Read", "Glob", "Grep", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: this.projectDir,
         maxTurns: 20,
         model: this.model,

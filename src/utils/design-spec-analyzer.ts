@@ -6,6 +6,7 @@ import {
   DESIGN_SPEC_ANALYZER_MAX_TURNS,
   DESIGN_SPEC_ANALYZER_TIMEOUT_MS,
   DEFAULT_ROLE_CONFIG,
+  READ_ONLY_DISALLOWED_TOOLS,
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
@@ -162,6 +163,7 @@ export async function analyzeDesignSystem(
       ANALYSIS_PROMPT,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: DESIGN_SPEC_ANALYZER_MAX_TURNS,
         model: sdkArgs.model,

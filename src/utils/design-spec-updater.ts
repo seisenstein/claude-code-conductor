@@ -6,6 +6,7 @@ import {
   DESIGN_SPEC_UPDATER_MAX_TURNS,
   DESIGN_SPEC_UPDATER_TIMEOUT_MS,
   DEFAULT_ROLE_CONFIG,
+  READ_ONLY_DISALLOWED_TOOLS,
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
@@ -64,6 +65,7 @@ export async function updateDesignSpec(
       prompt,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: DESIGN_SPEC_UPDATER_MAX_TURNS,
         model: sdkArgs.model,
