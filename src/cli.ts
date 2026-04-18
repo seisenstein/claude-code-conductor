@@ -562,17 +562,15 @@ program
       // Dynamic import to avoid loading init module on every CLI invocation
       const { runInit } = await import("./core/init.js");
 
+      // H-11: pass the tier shorthand (e.g. "opus-4-7") directly. Analyzers
+      // route it through resolveLooseModelArg which expects a tier key, not
+      // a fully-resolved SDK model ID. Converting to full ID here would be
+      // treated as "unknown tier" downstream and fall back to defaults.
       const modelTier = opts.workerModel as string | undefined;
-      // Map tier to model ID if provided
-      let model: string | undefined;
-      if (modelTier) {
-        const { MODEL_TIER_TO_ID } = await import("./utils/types.js");
-        model = MODEL_TIER_TO_ID[modelTier as keyof typeof MODEL_TIER_TO_ID];
-      }
 
       await runInit(projectDir, {
         force: Boolean(opts.force),
-        model,
+        model: modelTier,
         verbose: Boolean(opts.verbose),
       });
     } catch (err) {

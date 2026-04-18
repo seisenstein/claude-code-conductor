@@ -100,8 +100,12 @@ async function main(): Promise<void> {
         "ISO 8601 timestamp. Only return messages newer than this. If omitted, returns all messages."
       ),
       // H-19: optional cap on returned messages. Clamped at handler level.
+      // Results are returned ascending by timestamp, so "limit" keeps the
+      // `limit` MOST RECENT messages within that ascending window.
       limit: z.number().int().positive().max(MAX_READ_UPDATES_HARD_CAP).optional().describe(
-        `Maximum number of messages to return (most recent first by timestamp). Omit to get all matching messages. Max ${MAX_READ_UPDATES_HARD_CAP}.`,
+        `Maximum number of messages to return. Keeps the `+
+        `most recent ${"`limit`"} messages (by timestamp), returned ascending. `+
+        `Omit to get all matching messages. Max ${MAX_READ_UPDATES_HARD_CAP}.`,
       ),
     },
     wrapToolHandler("read_updates", async (args: { since?: string; limit?: number }) => {

@@ -214,7 +214,10 @@ export function verifyExtractedRules(rules: string, warn: (msg: string) => void)
     }
   }
 
-  const mentionsAllowedTools = /allowed[_\s-]?tools?|WORKER_ALLOWED_TOOLS/i.test(rules);
+  // Negative lookbehind for "dis" to avoid false-triggering on "disallowed
+  // tools" (which is a legitimate concept the document may discuss without
+  // needing to enumerate every WORKER_ALLOWED_TOOLS member).
+  const mentionsAllowedTools = /(?<!dis)allowed[_\s-]?tools?|WORKER_ALLOWED_TOOLS/i.test(rules);
   if (mentionsAllowedTools) {
     // Exclude MCP tools — they're often referenced by purpose not name.
     const expected = WORKER_ALLOWED_TOOLS.filter((t) => !t.startsWith("mcp__"));
