@@ -209,6 +209,41 @@ export function resolveRoleSpec(config: ModelConfig | undefined, role: AgentRole
   return { ...DEFAULT_ROLE_CONFIG[role] };
 }
 
+/**
+ * H-8: Field-level merge of per-role spec maps. For each role, the patch's
+ * fields are spread over the base's fields — so a tier-only patch does NOT
+ * wipe the base's effort. This is the intended behavior for every layer of
+ * composeRoleConfig (state seed → file → legacy expansion → CLI patches).
+ *
+ * Before this helper, the CLI used shallow spreads (`{ ...merged, ...patch }`)
+ * which silently lost fields when a later layer supplied a partial spec.
+ */
+export function mergeRoleMaps(
+  base: Partial<Record<AgentRole, RoleModelSpec>>,
+  patch: Partial<Record<AgentRole, Partial<RoleModelSpec>>> | undefined,
+): Partial<Record<AgentRole, RoleModelSpec>> {
+  if (!patch) return { ...base };
+  const result: Partial<Record<AgentRole, RoleModelSpec>> = { ...base };
+  for (const role of Object.keys(patch) as AgentRole[]) {
+    const p = patch[role];
+    if (!p) continue;
+    const b = result[role];
+    if (!b) {
+      // New entry — fill any missing field from DEFAULT_ROLE_CONFIG (H-7 parity).
+      result[role] = {
+        tier: p.tier ?? DEFAULT_ROLE_CONFIG[role].tier,
+        effort: p.effort ?? DEFAULT_ROLE_CONFIG[role].effort,
+      };
+    } else {
+      result[role] = {
+        tier: p.tier ?? b.tier,
+        effort: p.effort ?? b.effort,
+      };
+    }
+  }
+  return result;
+}
+
 // ============================================================
 // SDK conversion
 // ============================================================

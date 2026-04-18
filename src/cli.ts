@@ -10,7 +10,7 @@ import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
 import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig, EffortLevel, AgentRole, RoleModelSpec } from "./utils/types.js";
 import { DEFAULT_MODEL_CONFIG, ConductorExitError } from "./utils/types.js";
-import { loadModelsConfig, expandLegacyTiers } from "./utils/models-config.js";
+import { loadModelsConfig, expandLegacyTiers, mergeRoleMaps } from "./utils/models-config.js";
 import { ALL_AGENT_ROLES, DEFAULT_ROLE_CONFIG } from "./utils/constants.js";
 import {
   getStatePath,
@@ -269,13 +269,15 @@ async function composeRoleConfig(
   seedRoles?: Partial<Record<AgentRole, RoleModelSpec>>,
 ): Promise<{ roles?: Partial<Record<AgentRole, RoleModelSpec>>; warnings: string[] }> {
   const fileResult = await loadModelsConfig(projectDir);
+  // H-8: field-level merge at every composition layer. Shallow spreads
+  // dropped effort when a later layer supplied a tier-only partial.
   let merged: Partial<Record<AgentRole, RoleModelSpec>> = { ...(seedRoles ?? {}) };
   if (fileResult.roles) {
-    merged = { ...merged, ...fileResult.roles };
+    merged = mergeRoleMaps(merged, fileResult.roles);
   }
   if (legacy.explicit) {
     const legacyExpanded = expandLegacyTiers(legacy.workerTier, legacy.subagentTier);
-    merged = { ...merged, ...legacyExpanded };
+    merged = mergeRoleMaps(merged, legacyExpanded);
   }
   const patches = collectRoleOverridesFromFlags(opts);
   merged = applyRolePatches(merged, patches);
