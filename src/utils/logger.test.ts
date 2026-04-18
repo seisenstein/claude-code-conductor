@@ -8,11 +8,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { Logger } from "./logger.js";
+import { Logger, redactSecrets } from "./logger.js";
 
 describe("Logger", () => {
   let tempDir: string;
@@ -171,5 +170,91 @@ describe("Logger", () => {
       // Clean up
       logger.close();
     });
+  });
+
+  describe("H-1: secret redaction on disk", () => {
+    it("redacts sk-ant- keys written to disk but not console", async () => {
+      const logDir = path.join(tempDir, "redaction-logs");
+      const logger = new Logger(logDir, "test");
+
+      // Capture console.log
+      const originalLog = console.log;
+      const consoleCalls: string[] = [];
+      console.log = (msg: string) => {
+        consoleCalls.push(msg);
+      };
+
+      try {
+        logger.info("request key sk-ant-abcdef1234567890zzzzz failed");
+      } finally {
+        console.log = originalLog;
+      }
+
+      logger.close();
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Disk must be redacted
+      const content = await fsPromises.readFile(path.join(logDir, "test.log"), "utf-8");
+      expect(content).not.toContain("sk-ant-abcdef1234567890zzzzz");
+      expect(content).toContain("sk-ant-***REDACTED***");
+
+      // Console stays unredacted for interactive debugging
+      expect(consoleCalls.some((m) => m.includes("sk-ant-abcdef1234567890zzzzz"))).toBe(
+        true,
+      );
+    });
+  });
+});
+
+describe("redactSecrets (H-1, unit)", () => {
+  it("redacts Anthropic API keys", () => {
+    const out = redactSecrets("key sk-ant-abc123_DEF456-xyz789abcd here");
+    expect(out).not.toContain("sk-ant-abc123");
+    expect(out).toContain("sk-ant-***REDACTED***");
+  });
+
+  it("redacts Bearer tokens", () => {
+    const out = redactSecrets("header Bearer abc.def.ghi_jkl-mno done");
+    expect(out).not.toContain("abc.def.ghi");
+    expect(out).toMatch(/Bearer \*\*\*REDACTED\*\*\*/);
+  });
+
+  it("redacts Authorization: headers", () => {
+    const out = redactSecrets("Authorization: Basic dXNlcjpwYXNzd29yZA==");
+    expect(out).not.toContain("dXNlcjpwYXNzd29yZA");
+    expect(out).toContain("Authorization: ***REDACTED***");
+  });
+
+  it('redacts JSON-style secret fields', () => {
+    const out = redactSecrets('{"api_key":"xyz_secret_123","password":"hunter2ishard"}');
+    expect(out).not.toContain("xyz_secret_123");
+    expect(out).not.toContain("hunter2ishard");
+    expect(out).toContain('"api_key": "***REDACTED***"');
+    expect(out).toContain('"password": "***REDACTED***"');
+  });
+
+  it("redacts URL/config-style token=... pairs", () => {
+    const out = redactSecrets("token=abc123xyzDEF456 api_key=shhhhhhhh");
+    expect(out).not.toContain("abc123xyzDEF456");
+    expect(out).not.toContain("shhhhhhhh");
+    expect(out).toContain("token=***REDACTED***");
+    expect(out).toContain("api_key=***REDACTED***");
+  });
+
+  it("redacts long hex strings (>=40 chars)", () => {
+    const hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const out = redactSecrets(`session: ${hex} end`);
+    expect(out).not.toContain(hex);
+    expect(out).toContain("***HEX_REDACTED***");
+  });
+
+  it("leaves short hex (<40 chars) alone", () => {
+    const text = "color #a1b2c3 and 0123abcdef short";
+    expect(redactSecrets(text)).toBe(text);
+  });
+
+  it("does not mangle benign text", () => {
+    const text = "Worker worker-123 completed task task-456 in 2.3s";
+    expect(redactSecrets(text)).toBe(text);
   });
 });

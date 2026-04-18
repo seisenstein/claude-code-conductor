@@ -3,6 +3,51 @@ import path from "path";
 import chalk from "chalk";
 import { mkdirSecureSync } from "./secure-fs.js";
 
+/**
+ * Redact likely secrets from a log line before writing to disk.
+ * Defense in depth — not a substitute for not logging secrets in the first place.
+ *
+ * Patterns cover:
+ *  - Anthropic API keys (sk-ant-*)
+ *  - Authorization header values (Authorization: ..., Bearer ...)
+ *  - JSON-style secret fields ("token":"...", "api_key":"...", "password":"...")
+ *  - URL/config-style secret fields (token=..., api_key=..., password=...)
+ *  - Long hex strings (40+ chars — likely session tokens / HMACs / SHAs)
+ *
+ * Note: the hex pattern may also match commit SHAs or long checksums. Those
+ * aren't secret, so the collateral damage is acceptable for a log file.
+ */
+const SECRET_PATTERNS: Array<[RegExp, string | ((m: string) => string)]> = [
+  [/sk-ant-[A-Za-z0-9_-]{20,}/g, "sk-ant-***REDACTED***"],
+  [/Authorization\s*[:=]\s*[A-Za-z0-9._~+/=\s-]+/gi, "Authorization: ***REDACTED***"],
+  [/Bearer\s+[A-Za-z0-9._~+/=-]{10,}/gi, "Bearer ***REDACTED***"],
+  // JSON-style: "token": "abc123", "api_key":"...", "password":"..."
+  [
+    /"(api[_-]?key|token|secret|password|passwd|auth)"\s*:\s*"[^"]{6,}"/gi,
+    (m: string) => m.replace(/:\s*"[^"]+"/, ': "***REDACTED***"'),
+  ],
+  // URL/config-style: token=abc123, api_key=..., password=...
+  [
+    /\b(api[_-]?key|token|secret|password|passwd)\s*[:=]\s*[A-Za-z0-9._~+/=-]{8,}/gi,
+    (m: string) =>
+      m.replace(/([:=]\s*)[A-Za-z0-9._~+/=-]{8,}/, "$1***REDACTED***"),
+  ],
+  // Long hex (40+ chars)
+  [/\b[a-f0-9]{40,}\b/g, "***HEX_REDACTED***"],
+];
+
+export function redactSecrets(line: string): string {
+  let out = line;
+  for (const [re, replacement] of SECRET_PATTERNS) {
+    if (typeof replacement === "string") {
+      out = out.replace(re, replacement);
+    } else {
+      out = out.replace(re, replacement);
+    }
+  }
+  return out;
+}
+
 export class Logger {
   private name: string;
   private logFilePath: string;
@@ -94,6 +139,8 @@ export class Logger {
   private writeToFile(line: string): void {
     // Don't write to closed stream
     if (this.closed) return;
-    this.logStream.write(line + "\n");
+    // H-1: redact likely secrets before persisting to disk. Console output
+    // stays unredacted so interactive debugging isn't hindered.
+    this.logStream.write(redactSecrets(line) + "\n");
   }
 }
