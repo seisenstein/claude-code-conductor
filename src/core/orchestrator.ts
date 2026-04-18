@@ -243,6 +243,7 @@ export class Orchestrator {
           mcpServerPath,
           this.logger,
           options.modelConfig, // M-19: Pass model config for Codex model selection
+          options.concurrency, // H-15: needed to gate --last resume
         )
       : new WorkerManager(
           options.project,

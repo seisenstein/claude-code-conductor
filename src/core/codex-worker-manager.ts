@@ -70,12 +70,16 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   private sessionToTaskMap: Map<string, string> = new Map();
 
   // M-19: Accept ModelConfig for Codex model selection and subagent model hints
+  // H-15: concurrency is used to gate `codex exec resume --last` — it can
+  // only target a specific thread when we're the only worker, otherwise
+  // --last may resume the wrong session.
   constructor(
     private projectDir: string,
     private orchestratorDir: string,
     private mcpServerPath: string,
     private logger: Logger,
     private modelConfig: ModelConfig = DEFAULT_MODEL_CONFIG,
+    private concurrency: number = 1,
   ) {
     this.heartbeatTracker = new HeartbeatTracker();
     this.timeoutTracker = new WorkerTimeoutTracker();
@@ -485,7 +489,14 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     // Use resume if we have a preserved thread ID, otherwise fresh start.
     // A default corrective prompt is used when none is provided, so resume
     // is not skipped just because the caller omitted a prompt.
-    if (hasResumeCapability) {
+    //
+    // H-15: `codex exec resume --last` cannot target a specific thread.
+    // When concurrency > 1, --last may resume the wrong session (whichever
+    // ran most recently), silently cross-contaminating task contexts. Only
+    // use resume when we're the only worker.
+    const canUseResume = hasResumeCapability && this.concurrency === 1;
+
+    if (canUseResume) {
       const resumePrompt = correctivePrompt ?? "Continue working on this task. The previous attempt did not complete successfully.";
       handle.promise = this.runCodexSessionWithResume(
         sessionId,
@@ -496,6 +507,12 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
         "Codex worker running (resumed session)...",
       );
     } else {
+      if (hasResumeCapability && this.concurrency !== 1) {
+        this.logger.warn(
+          `Worker ${sessionId}: preserved thread ID available for task ${taskId} but concurrency=${this.concurrency} > 1. ` +
+          `Skipping session resume to avoid cross-task contamination. Falling back to fresh worker.`,
+        );
+      }
       // Fall back to regular spawn - worker will claim the task via MCP
       handle.promise = this.runCodexSession(
         sessionId,
