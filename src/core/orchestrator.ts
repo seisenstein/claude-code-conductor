@@ -1149,7 +1149,10 @@ export class Orchestrator {
           // Guard against empty investigator response
           if (!responseText || responseText.trim().length === 0) {
             this.logger.warn("Investigator agent produced empty response. Writing fallback.");
-            responseText = "The plan has been updated to address all feedback. Please re-review the plan file directly for the latest changes.";
+            // H-17: honest fallback — the investigator produced nothing, so
+            // the plan was NOT modified. Previous text ("has been updated")
+            // misled Codex into approving unchanged plans.
+            responseText = "The investigator was unable to produce a response. The plan was not modified. Please re-review based on the original plan and maintain prior findings if they still apply.";
           }
 
           // Save the response
@@ -1789,7 +1792,10 @@ export class Orchestrator {
       // Guard against empty reviewer response
       if (!responseText || responseText.trim().length === 0) {
         this.logger.warn("Code review investigator produced empty response. Writing fallback.");
-        responseText = "All code review feedback has been addressed. Please re-review the changed files directly for the latest state.";
+        // H-17: honest fallback — the investigator produced nothing, so no
+        // code was modified. Previous text ("has been addressed") misled
+        // Codex into approving unchanged code.
+        responseText = "The code-review investigator was unable to produce a response. No code changes were applied. Please re-review based on the current state of the changed files and maintain prior findings if they still apply.";
       }
 
       await fs.writeFile(responsePath, responseText, { encoding: "utf-8", mode: 0o600 });
