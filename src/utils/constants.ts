@@ -327,6 +327,26 @@ export const READ_ONLY_DISALLOWED_TOOLS = [
 ];
 
 // ============================================================
+// CodexReviewer prompt size guards (CR-2)
+// ============================================================
+
+/** Per-file cap: 100K UTF-16 code units. Large enough for most files but
+ *  prevents one giant file from dominating the prompt. */
+export const MAX_CODEX_PROMPT_FILE_CHARS = 100_000;
+
+/** Aggregate file-content cap: 2 million UTF-16 code units (~2-4MB).
+ *  Applies only to the concatenated file chunks appended to the prompt —
+ *  NOT the base prompt prefix or summary marker (typical overhead <5KB).
+ *  Bounds Node heap pressure and Codex token cost. Prompt is delivered via
+ *  stdin (not argv), so OS ARG_MAX is not a factor. */
+export const MAX_CODEX_PROMPT_AGGREGATE_CHARS = 2_000_000;
+
+/** spawn stdout byte cap — parity with the 10MB execFile maxBuffer the
+ *  previous implementation used. On overflow, child is killed and
+ *  CodexExecutionError("output_too_large") is thrown. */
+export const MAX_CODEX_STDOUT_BYTES = 10 * 1024 * 1024;
+
+// ============================================================
 // Git
 // ============================================================
 

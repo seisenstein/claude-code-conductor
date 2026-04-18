@@ -228,6 +228,13 @@ export interface CodexUsageMetrics {
   invalid_responses: number;
   presumed_rate_limits: number;
   last_presumed_rate_limit_at: string | null;
+  /**
+   * CR-2: terminal failures from spawned codex exec where stdout exceeded
+   * MAX_CODEX_STDOUT_BYTES. Tracked separately from presumed_rate_limits
+   * because retry is pointless for overflow and the orchestrator should
+   * see it distinctly in ops dashboards.
+   */
+  output_too_large_failures: number;
 }
 
 export interface CodexReviewResult {

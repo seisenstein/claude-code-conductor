@@ -35,6 +35,9 @@ export const CodexUsageMetricsSchema = z.object({
   invalid_responses: z.number().int().nonnegative(),
   presumed_rate_limits: z.number().int().nonnegative(),
   last_presumed_rate_limit_at: z.string().nullable(),
+  // CR-2: v0.7.2 addition. .default(0) keeps older state.json valid
+  // on resume — field backfills to 0 if missing.
+  output_too_large_failures: z.number().int().nonnegative().default(0),
 });
 
 // ============================================================

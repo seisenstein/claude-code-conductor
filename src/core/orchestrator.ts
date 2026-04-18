@@ -188,7 +188,13 @@ export class Orchestrator {
     const __dirname = path.dirname(__filename);
     const mcpServerPath = path.join(__dirname, "..", "mcp", "coordination-server.js");
 
-    this.codex = new CodexReviewer(options.project, orchestratorDir, mcpServerPath, this.logger);
+    this.codex = new CodexReviewer(
+      options.project,
+      orchestratorDir,
+      mcpServerPath,
+      this.logger,
+      options.modelConfig, // CR-3: thread model through to codex exec --model
+    );
     this.planner = new Planner(
       options.project,
       this.logger,
