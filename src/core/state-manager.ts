@@ -30,6 +30,13 @@ import {
 } from "../utils/constants.js";
 import { mkdirSecure } from "../utils/secure-fs.js";
 
+// Local warn sink — StateManager has no logger dependency and we don't want
+// to add one for a narrow fix (H-5, H-6). Writes to stderr so CLI output
+// stays visible.
+function warnStateManager(msg: string): void {
+  process.stderr.write(`[state-manager] ${msg}\n`);
+}
+
 export class StateManager {
   private projectDir: string;
   private state: OrchestratorState | null = null;
@@ -109,18 +116,69 @@ export class StateManager {
    */
   async load(): Promise<OrchestratorState> {
     const statePath = getStatePath(this.projectDir);
-    const raw = await fs.readFile(statePath, "utf-8");
+    try {
+      const raw = await fs.readFile(statePath, "utf-8");
+      const result = validateStateJsonLenient(raw);
+      if (!result.valid) {
+        throw new Error(
+          `State file validation failed (${statePath}):\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+        );
+      }
+      this.state = result.state as OrchestratorState;
+      return this.state;
+    } catch (primaryErr) {
+      // H-5: try to recover from state.json.bak before giving up.
+      const backupPath = statePath + ".bak";
+      let backupState: OrchestratorState;
+      try {
+        const backupRaw = await fs.readFile(backupPath, "utf-8");
+        const backupResult = validateStateJsonLenient(backupRaw);
+        if (!backupResult.valid) {
+          throw new Error(
+            `state.json.bak also failed validation:\n${backupResult.errors.map((e) => `  - ${e}`).join("\n")}`,
+          );
+        }
+        backupState = backupResult.state as OrchestratorState;
+      } catch (backupErr) {
+        throw new Error(
+          `State load failed and backup recovery also failed.\n` +
+          `Primary (${statePath}): ${String(primaryErr)}\n` +
+          `Backup (${backupPath}): ${String(backupErr)}`,
+        );
+      }
 
-    // Validate with Zod schema (CRITICAL - state.json validation)
-    const result = validateStateJsonLenient(raw);
-    if (!result.valid) {
-      throw new Error(
-        `State file validation failed (${statePath}):\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+      // Preserve the corrupt primary for forensics. Only claim preservation
+      // if the rename actually succeeded — otherwise the operator gets a
+      // misleading path that doesn't exist.
+      const corruptTs = Date.now();
+      const corruptPath = `${statePath}.corrupt-${corruptTs}`;
+      let preserved = false;
+      try {
+        await fs.rename(statePath, corruptPath);
+        preserved = true;
+      } catch (renameErr) {
+        warnStateManager(
+          `Could not preserve corrupt state.json for forensics: ${String(renameErr)}`,
+        );
+      }
+      warnStateManager(
+        `state.json corrupt (${String(primaryErr)}); recovered from ${backupPath}.` +
+          (preserved ? ` Original preserved at ${corruptPath}.` : ""),
       );
-    }
 
-    this.state = result.state as OrchestratorState;
-    return this.state;
+      this.state = backupState;
+      // Best-effort: persist recovered state so next load finds a valid primary.
+      // Non-fatal if save fails — state is valid in memory.
+      try {
+        await this.save();
+      } catch (saveErr) {
+        warnStateManager(
+          `Recovered state loaded from .bak but post-recovery save failed: ${String(saveErr)}. ` +
+          `State is valid in memory; next successful save will re-establish state.json.`,
+        );
+      }
+      return this.state;
+    }
   }
 
   /**
@@ -158,6 +216,18 @@ export class StateManager {
 
       // Atomic rename (prevents partial writes from being read)
       await fs.rename(tmpPath, statePath);
+
+      // H-5: update .bak AFTER successful main rename. Crash-mid-bak is
+      // safe because the main state.json is already good — we'd just have
+      // a stale but valid .bak. fsync not required on .bak (redundant copy).
+      try {
+        const backupPath = statePath + ".bak";
+        const backupTmp = backupPath + ".tmp";
+        await fs.writeFile(backupTmp, content, { encoding: "utf-8", mode: 0o600 });
+        await fs.rename(backupTmp, backupPath);
+      } catch (err) {
+        warnStateManager(`Failed to update state.json.bak: ${String(err)}`);
+      }
     } finally {
       // Always release the lock, even if writing fails
       if (release) {
