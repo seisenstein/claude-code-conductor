@@ -53,6 +53,11 @@ interface WorkerHandle {
   effort?: EffortLevel;
   /** The task_type hint used to pick the role, or null for sentinel/general. */
   taskTypeHint: TaskType | null;
+  /**
+   * H-10: non-null when this worker was spawned for a task retry.
+   * buildWorkerPrompt prepends a corrective preamble when set.
+   */
+  retryContext?: { taskId: string; correctivePrompt: string | null } | null;
 }
 
 /** Map a Task.task_type into the matching execution-worker AgentRole. */
@@ -183,6 +188,72 @@ export class WorkerManager implements ExecutionWorkerManager {
     // Launch the worker as a background async task
     handle.promise = this.runWorker(sessionId, handle);
 
+    this.activeWorkers.set(sessionId, handle);
+  }
+
+  /**
+   * H-10: spawn a Claude worker for retrying a failed task.
+   *
+   * The Claude Agent SDK does not support session resumption (no thread-id),
+   * so this re-runs a fresh session with a corrective preamble that tells
+   * the worker what task is being retried and what went wrong. The worker
+   * still claims the task via MCP using the existing claim_task flow.
+   *
+   * @param sessionId        New session ID for the retry worker.
+   * @param taskId           Task being retried — used in the corrective preamble.
+   * @param correctivePrompt Optional explanation of what went wrong last time.
+   * @param taskTypeHint     Task type for role-based model selection.
+   */
+  async spawnWorkerForRetry(
+    sessionId: string,
+    taskId: string,
+    correctivePrompt?: string,
+    taskTypeHint?: TaskType | null,
+  ): Promise<void> {
+    if (this.activeWorkers.has(sessionId)) {
+      this.logger.warn(`Worker ${sessionId} is already active; skipping spawn`);
+      return;
+    }
+
+    const role = taskTypeToRole(taskTypeHint ?? null);
+    const sdkArgs = resolveSdkArgs(this.modelConfig, role);
+
+    this.logger.info(
+      `Spawning Claude worker for retry: ${sessionId} (task=${taskId}, role=${role}, model=${sdkArgs.model}, effort=${sdkArgs.effort ?? "sdk-default"})`,
+    );
+
+    const sessionDir = path.join(this.orchestratorDir, SESSIONS_DIR, sessionId);
+    await mkdirSecure(sessionDir, { recursive: true });
+
+    const initialStatus: SessionStatus = {
+      session_id: sessionId,
+      state: "starting",
+      current_task: taskId,
+      tasks_completed: [],
+      progress: "Worker session starting (retry)...",
+      updated_at: new Date().toISOString(),
+    };
+    await writeFileSecure(
+      path.join(sessionDir, SESSION_STATUS_FILE),
+      JSON.stringify(initialStatus, null, 2) + "\n",
+    );
+
+    const handle: WorkerHandle = {
+      sessionId,
+      promise: Promise.resolve(),
+      events: [],
+      startedAt: new Date().toISOString(),
+      rateLimitReported: false,
+      model: sdkArgs.model,
+      effort: sdkArgs.effort,
+      taskTypeHint: taskTypeHint ?? null,
+      retryContext: { taskId, correctivePrompt: correctivePrompt ?? null },
+    };
+
+    this.timeoutTracker.startTracking(sessionId);
+    this.heartbeatTracker.recordHeartbeat(sessionId);
+
+    handle.promise = this.runWorker(sessionId, handle);
     this.activeWorkers.set(sessionId, handle);
   }
 
@@ -509,7 +580,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     sessionId: string,
     handle: WorkerHandle,
   ): Promise<void> {
-    const workerPrompt = this.buildWorkerPrompt(sessionId);
+    const workerPrompt = this.buildWorkerPrompt(sessionId, handle.retryContext);
 
     try {
       const asyncIterable = query({
@@ -837,14 +908,38 @@ export class WorkerManager implements ExecutionWorkerManager {
   /**
    * Build the system prompt for a worker session.
    * Delegates to the shared getWorkerPrompt function with full context.
+   * H-10: if retryContext is set, prepends a corrective preamble so the
+   * worker knows why it's being re-run before it claims the task.
    */
-  private buildWorkerPrompt(sessionId: string): string {
-    return getWorkerPrompt({
+  private buildWorkerPrompt(
+    sessionId: string,
+    retryContext?: { taskId: string; correctivePrompt: string | null } | null,
+  ): string {
+    const base = getWorkerPrompt({
       sessionId,
       runtime: "claude",
       subagentModel: this.modelConfig.subagent,
       ...this.workerContext,
     });
+
+    if (!retryContext) return base;
+
+    const preamble = [
+      "## Retry Context",
+      "",
+      `You are retrying task **${retryContext.taskId}**.`,
+      "",
+      retryContext.correctivePrompt
+        ? `### What went wrong last time\n\n${retryContext.correctivePrompt}\n`
+        : "The previous attempt did not complete successfully. Investigate before re-doing any work.",
+      "",
+      "When you claim this task, read its full history (in-progress artifacts, prior commits, `known-issues.json`) before making changes.",
+      "",
+      "---",
+      "",
+    ].join("\n");
+
+    return preamble + base;
   }
 
 

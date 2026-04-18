@@ -10,7 +10,7 @@ import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
 import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig, EffortLevel, AgentRole, RoleModelSpec } from "./utils/types.js";
 import { DEFAULT_MODEL_CONFIG, ConductorExitError } from "./utils/types.js";
-import { loadModelsConfig, expandLegacyTiers } from "./utils/models-config.js";
+import { loadModelsConfig, expandLegacyTiers, mergeRoleMaps } from "./utils/models-config.js";
 import { ALL_AGENT_ROLES, DEFAULT_ROLE_CONFIG } from "./utils/constants.js";
 import {
   getStatePath,
@@ -269,13 +269,15 @@ async function composeRoleConfig(
   seedRoles?: Partial<Record<AgentRole, RoleModelSpec>>,
 ): Promise<{ roles?: Partial<Record<AgentRole, RoleModelSpec>>; warnings: string[] }> {
   const fileResult = await loadModelsConfig(projectDir);
+  // H-8: field-level merge at every composition layer. Shallow spreads
+  // dropped effort when a later layer supplied a tier-only partial.
   let merged: Partial<Record<AgentRole, RoleModelSpec>> = { ...(seedRoles ?? {}) };
   if (fileResult.roles) {
-    merged = { ...merged, ...fileResult.roles };
+    merged = mergeRoleMaps(merged, fileResult.roles);
   }
   if (legacy.explicit) {
     const legacyExpanded = expandLegacyTiers(legacy.workerTier, legacy.subagentTier);
-    merged = { ...merged, ...legacyExpanded };
+    merged = mergeRoleMaps(merged, legacyExpanded);
   }
   const patches = collectRoleOverridesFromFlags(opts);
   merged = applyRolePatches(merged, patches);
@@ -538,7 +540,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.7.2");
+  .version("0.7.3");
 
 // ============================================================
 // init command
@@ -560,17 +562,15 @@ program
       // Dynamic import to avoid loading init module on every CLI invocation
       const { runInit } = await import("./core/init.js");
 
+      // H-11: pass the tier shorthand (e.g. "opus-4-7") directly. Analyzers
+      // route it through resolveLooseModelArg which expects a tier key, not
+      // a fully-resolved SDK model ID. Converting to full ID here would be
+      // treated as "unknown tier" downstream and fall back to defaults.
       const modelTier = opts.workerModel as string | undefined;
-      // Map tier to model ID if provided
-      let model: string | undefined;
-      if (modelTier) {
-        const { MODEL_TIER_TO_ID } = await import("./utils/types.js");
-        model = MODEL_TIER_TO_ID[modelTier as keyof typeof MODEL_TIER_TO_ID];
-      }
 
       await runInit(projectDir, {
         force: Boolean(opts.force),
-        model,
+        model: modelTier,
         verbose: Boolean(opts.verbose),
       });
     } catch (err) {

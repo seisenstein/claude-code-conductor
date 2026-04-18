@@ -235,6 +235,14 @@ export interface CodexUsageMetrics {
    * see it distinctly in ops dashboards.
    */
   output_too_large_failures: number;
+  /**
+   * H-16: second-attempt execution errors with NO rate-limit signal
+   * (timeout/crash/no-output, but stderr doesn't match any provider
+   * rate-limit pattern). Previously these were blanket-classified as
+   * RATE_LIMITED and retried for up to 16 minutes. Now classified as
+   * ERROR so ops can distinguish them from real rate limits.
+   */
+  execution_errors: number;
 }
 
 export interface CodexReviewResult {
@@ -270,6 +278,35 @@ export type TaskType =
   | "reverse_engineering"
   | "integration"
   | "general";
+
+/**
+ * H-12: Runtime-accessible tuple of every TaskType literal. Used by
+ * rules-extractor host-side verification — which grep-checks that the
+ * LLM-produced rules document lists every task type if it mentions the
+ * concept at all. Keep this in sync with the TaskType union above; the
+ * exhaustiveness assertion below errors at compile time if they drift.
+ */
+export const TASK_TYPE_LITERALS = [
+  "backend_api",
+  "frontend_ui",
+  "database",
+  "security",
+  "testing",
+  "infrastructure",
+  "reverse_engineering",
+  "integration",
+  "general",
+] as const satisfies readonly TaskType[];
+
+// Compile-time exhaustiveness: fails if a TaskType is not listed.
+type _ExhaustiveTaskTypes =
+  TaskType extends (typeof TASK_TYPE_LITERALS)[number]
+    ? true
+    : ["Missing from TASK_TYPE_LITERALS:", Exclude<TaskType, (typeof TASK_TYPE_LITERALS)[number]>];
+// Retained for type-side enforcement only — no runtime use.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _TASK_TYPE_LITERALS_EXHAUSTIVE: _ExhaustiveTaskTypes = true;
+void _TASK_TYPE_LITERALS_EXHAUSTIVE;
 
 export interface PlannerOutput {
   plan_markdown: string;
@@ -559,8 +596,15 @@ export interface ExecutionWorkerManager {
    * @param sessionId - New session ID for the retry worker
    * @param taskId - The task ID being retried
    * @param correctivePrompt - Optional prompt explaining what went wrong
+   * @param taskTypeHint - Optional task type for role-based model selection
+   *                      on the retry worker (H-10).
    */
-  spawnWorkerForRetry?(sessionId: string, taskId: string, correctivePrompt?: string): Promise<void>;
+  spawnWorkerForRetry?(
+    sessionId: string,
+    taskId: string,
+    correctivePrompt?: string,
+    taskTypeHint?: TaskType | null,
+  ): Promise<void>;
 
   /**
    * Get a preserved thread ID for a task (for session resumption).

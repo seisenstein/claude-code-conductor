@@ -509,17 +509,22 @@ describe("updateDesignSpec", () => {
         wrapInFencedBlock({ updated: false, warnings: [], updated_spec: null }),
       );
 
+      // H-11: pass a tier shorthand instead of a raw SDK model ID. The old
+      // behavior pushed any string straight to `model`; resolveLooseModelArg
+      // now resolves tiers through MODEL_TIER_TO_ID and falls back for
+      // unknown values. Use "sonnet-4-6" (a valid tier) and assert the
+      // resolved SDK model ID.
       await updateDesignSpec(
         tempDir,
         ["src/app.tsx"],
         SAMPLE_SPEC,
-        "claude-sonnet-4-20250514",
+        "sonnet-4-6",
       );
 
       const options = mockQueryWithTimeout.mock.calls[0][1] as Record<string, unknown>;
       expect(options.allowedTools).toEqual(["Read", "Glob", "Grep", "Bash", "LSP"]);
       expect(options.cwd).toBe(tempDir);
-      expect(options.model).toBe("claude-sonnet-4-20250514");
+      expect(options.model).toBe("claude-sonnet-4-6");
       expect(options.settingSources).toEqual(["project"]);
     });
   });

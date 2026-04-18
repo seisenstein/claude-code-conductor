@@ -68,7 +68,10 @@ const RegisterContractInputSchema = z.object({
 });
 
 // M-26: Valid ArchitecturalDecision categories matching the type in types.ts
-const VALID_DECISION_CATEGORIES = [
+// H-18: exported so the MCP tool schema in coordination-server.ts can use
+// the same enum for validation (previously used z.string(), producing a
+// less informative error when invalid categories got past the MCP boundary).
+export const VALID_DECISION_CATEGORIES = [
   "naming", "auth", "data_model", "error_handling",
   "api_design", "testing", "performance", "other",
 ] as const;
@@ -225,7 +228,19 @@ export async function readJsonlFile<T>(filePath: string): Promise<T[]> {
 
 export interface ReadUpdatesInput {
   since?: string;
+  /**
+   * H-19: optional cap on returned messages. When omitted, returns all
+   * matching messages (preserves pre-H-19 contract). When supplied, returns
+   * the `limit` most recent messages by timestamp.
+   */
+  limit?: number;
 }
+
+/**
+ * H-19: safety rail clamping explicit `limit` requests. Not applied when
+ * `limit` is unspecified — that path intentionally returns all matches.
+ */
+export const MAX_READ_UPDATES_HARD_CAP = 10_000;
 
 export async function handleReadUpdates(
   input: ReadUpdatesInput
@@ -237,6 +252,10 @@ export async function handleReadUpdates(
   // M-27: Guard against invalid timestamps — NaN would cause all messages to pass the filter
   const rawSinceTs = input.since ? new Date(input.since).getTime() : 0;
   const sinceTs = Number.isNaN(rawSinceTs) ? 0 : rawSinceTs;
+  // H-19: cap is opt-in. No default cap preserves the existing contract.
+  const limit = typeof input.limit === "number"
+    ? Math.max(1, Math.min(input.limit, MAX_READ_UPDATES_HARD_CAP))
+    : null;
 
   let files: string[];
   try {
@@ -250,6 +269,17 @@ export async function handleReadUpdates(
 
   for (const file of jsonlFiles) {
     const filePath = path.join(dir, file);
+    // H-19: mtime pre-filter. If `since` is supplied and the file hasn't
+    // been modified since then, no message inside could be newer than
+    // `since`. Invisible optimization — output is identical to pre-H-19.
+    if (sinceTs > 0) {
+      try {
+        const stat = await fs.stat(filePath);
+        if (stat.mtimeMs <= sinceTs) continue;
+      } catch {
+        // Stat failure — fall through to regular read
+      }
+    }
     const messages = await readJsonlFile<Message>(filePath);
     allMessages.push(...messages);
   }
@@ -271,7 +301,10 @@ export async function handleReadUpdates(
     (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
   );
 
-  return filtered;
+  if (limit === null) return filtered;
+  // Return the `limit` MOST RECENT messages (trailing slice), preserving
+  // ascending order within the returned window.
+  return filtered.slice(Math.max(0, filtered.length - limit));
 }
 
 // ============================================================

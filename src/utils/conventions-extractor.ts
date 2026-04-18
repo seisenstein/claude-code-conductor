@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ProjectConventions, RoleModelSpec } from "./types.js";
-import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, DEFAULT_ROLE_CONFIG, READ_ONLY_DISALLOWED_TOOLS } from "./constants.js";
-import { specToSdkArgs } from "./models-config.js";
+import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, READ_ONLY_DISALLOWED_TOOLS } from "./constants.js";
+import { resolveLooseModelArg } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
@@ -109,10 +109,9 @@ export async function extractConventions(
   const conventionsPath = getConventionsPath(projectDir);
   const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
 
-  // Resolve model + effort from spec (RoleModelSpec preferred, bare string for legacy callers)
-  const sdkArgs = typeof spec === "string"
-    ? { model: spec, effort: DEFAULT_ROLE_CONFIG.conventions_extractor.effort }
-    : specToSdkArgs(spec ?? DEFAULT_ROLE_CONFIG.conventions_extractor);
+  // H-11: route tier shorthands through MODEL_TIER_TO_ID instead of passing
+  // them raw to the SDK as `model`.
+  const sdkArgs = resolveLooseModelArg(spec, "conventions_extractor", warn);
 
   // Check cache (< 1 hour old)
   try {

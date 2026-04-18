@@ -5,10 +5,9 @@ import {
   getDesignSpecPath,
   DESIGN_SPEC_ANALYZER_MAX_TURNS,
   DESIGN_SPEC_ANALYZER_TIMEOUT_MS,
-  DEFAULT_ROLE_CONFIG,
   READ_ONLY_DISALLOWED_TOOLS,
 } from "./constants.js";
-import { specToSdkArgs } from "./models-config.js";
+import { resolveLooseModelArg } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
@@ -142,9 +141,8 @@ export async function analyzeDesignSystem(
   const specPath = getDesignSpecPath(projectDir);
   const warn = (msg: string) => (logger ? logger.warn(msg) : process.stderr.write(msg + "\n"));
 
-  const sdkArgs = typeof modelSpec === "string"
-    ? { model: modelSpec, effort: DEFAULT_ROLE_CONFIG.design_spec_analyzer.effort }
-    : specToSdkArgs(modelSpec ?? DEFAULT_ROLE_CONFIG.design_spec_analyzer);
+  // H-11: route tier shorthands through MODEL_TIER_TO_ID.
+  const sdkArgs = resolveLooseModelArg(modelSpec, "design_spec_analyzer", warn);
 
   // Check cache (< 1 hour old)
   try {

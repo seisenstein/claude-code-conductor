@@ -16,6 +16,8 @@ import {
   handleRecordDecision,
   handleGetDecisions,
   handleRunTests,
+  VALID_DECISION_CATEGORIES,
+  MAX_READ_UPDATES_HARD_CAP,
 } from "./tools.js";
 
 // ============================================================
@@ -92,14 +94,22 @@ async function main(): Promise<void> {
   // ----------------------------------------------------------
   server.tool(
     "read_updates",
-    "Read messages from the orchestrator and other sessions. Returns messages addressed to this session or broadcast messages. Optionally filter by timestamp.",
+    "Read messages from the orchestrator and other sessions. Returns messages addressed to this session or broadcast messages. Optionally filter by timestamp or cap the number of returned messages.",
     {
       since: z.string().optional().describe(
         "ISO 8601 timestamp. Only return messages newer than this. If omitted, returns all messages."
       ),
+      // H-19: optional cap on returned messages. Clamped at handler level.
+      // Results are returned ascending by timestamp, so "limit" keeps the
+      // `limit` MOST RECENT messages within that ascending window.
+      limit: z.number().int().positive().max(MAX_READ_UPDATES_HARD_CAP).optional().describe(
+        `Maximum number of messages to return. Keeps the `+
+        `most recent ${"`limit`"} messages (by timestamp), returned ascending. `+
+        `Omit to get all matching messages. Max ${MAX_READ_UPDATES_HARD_CAP}.`,
+      ),
     },
-    wrapToolHandler("read_updates", async (args: { since?: string }) => {
-      const messages = await handleReadUpdates({ since: args.since });
+    wrapToolHandler("read_updates", async (args: { since?: string; limit?: number }) => {
+      const messages = await handleReadUpdates({ since: args.since, limit: args.limit });
       return {
         content: [
           {
@@ -346,7 +356,10 @@ async function main(): Promise<void> {
     "record_decision",
     "Record an architectural decision so other workers can stay consistent. Decisions are append-only and shared across all sessions.",
     {
-      category: z.string().describe("Decision category (naming, auth, data_model, error_handling, api_design, testing, performance, other)"),
+      // H-18: align MCP-layer validation with handler validation. Previously
+      // z.string() accepted anything, letting invalid categories cross the
+      // MCP boundary and fail with a less-informative error inside the handler.
+      category: z.enum(VALID_DECISION_CATEGORIES).describe("Decision category (one of: naming, auth, data_model, error_handling, api_design, testing, performance, other)"),
       decision: z.string().describe("The decision that was made"),
       rationale: z.string().describe("Why this decision was made"),
       task_id: z.string().optional().describe("The task that prompted this decision"),

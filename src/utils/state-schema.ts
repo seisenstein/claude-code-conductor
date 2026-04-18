@@ -38,6 +38,8 @@ export const CodexUsageMetricsSchema = z.object({
   // CR-2: v0.7.2 addition. .default(0) keeps older state.json valid
   // on resume — field backfills to 0 if missing.
   output_too_large_failures: z.number().int().nonnegative().default(0),
+  // H-16: v0.7.3 addition. Same backfill pattern.
+  execution_errors: z.number().int().nonnegative().default(0),
 });
 
 // ============================================================

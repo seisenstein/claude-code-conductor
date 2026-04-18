@@ -15,6 +15,7 @@ import type {
   CycleRecord,
   PhaseDurations,
   BlastRadius,
+  FlowFinding,
   FlowTracingReport,
   PlannerOutput,
   Task,
@@ -30,7 +31,7 @@ import type {
   DesignSpecUpdateResult,
 } from "../utils/types.js";
 import { ConductorExitError } from "../utils/types.js";
-import { resolveRoleSpec, describeResolvedRoles } from "../utils/models-config.js";
+import { resolveRoleSpec, resolveSdkArgs, describeResolvedRoles } from "../utils/models-config.js";
 
 import {
   BRANCH_PREFIX,
@@ -76,7 +77,7 @@ import { updateDesignSpec } from "../utils/design-spec-updater.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 import { ensureGitignore } from "../utils/gitignore.js";
-import { mkdirSecure } from "../utils/secure-fs.js";
+import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
 import {
   detectProject,
   loadCachedProfile,
@@ -242,6 +243,7 @@ export class Orchestrator {
           mcpServerPath,
           this.logger,
           options.modelConfig, // M-19: Pass model config for Codex model selection
+          options.concurrency, // H-15: needed to gate --last resume
         )
       : new WorkerManager(
           options.project,
@@ -430,14 +432,68 @@ export class Orchestrator {
         // NOT call setStatus — only setProgress (which is informational/idempotent).
         await this.state.setStatus("reviewing");
 
-        // Use separate start timestamps for accurate per-phase duration tracking
+        // Phase 3: H-4 — use Promise.allSettled so a failure in any leg does
+        // not silently drop sibling results. Preserve per-leg timing via
+        // chained then() handlers before the allSettled aggregation.
         const reviewStart = Date.now();
+        const reviewP = this.review().then(
+          (r) => { phaseDurations.code_review_ms = Date.now() - reviewStart; return r; },
+          (err) => { phaseDurations.code_review_ms = Date.now() - reviewStart; throw err; },
+        );
         const flowStart = Date.now();
-        const [approved, flowReport, _designSpecUpdate] = await Promise.all([
-          this.review().then((r) => { phaseDurations.code_review_ms = Date.now() - reviewStart; return r; }),
-          this.flowReview(cycleNum).then((r) => { phaseDurations.flow_tracing_ms = Date.now() - flowStart; return r; }),
-          this.updateDesignSpecIfNeeded(cycleNum),
-        ]);
+        const flowP = this.flowReview(cycleNum).then(
+          (r) => { phaseDurations.flow_tracing_ms = Date.now() - flowStart; return r; },
+          (err) => { phaseDurations.flow_tracing_ms = Date.now() - flowStart; throw err; },
+        );
+        const settled = await Promise.allSettled([reviewP, flowP, this.updateDesignSpecIfNeeded(cycleNum)]);
+
+        // Leg 0: code review (security gate). On rejection, treat as not-approved.
+        let approved: boolean;
+        if (settled[0].status === "fulfilled") {
+          approved = settled[0].value;
+        } else {
+          this.logger.error(
+            `Code review rejected: ${String(settled[0].reason)}. Treating cycle as not-approved to force re-review.`,
+          );
+          approved = false;
+        }
+
+        // Leg 1: flow tracing (security gate). flowReview() throws on real
+        // failures (git-diff error, tracer error) and returns null only for
+        // intentional skips (--skip-flow-review, no diff, capacity defer).
+        // On rejection, synthesize a high-severity finding so the checkpoint
+        // logic below forces another cycle instead of silently passing.
+        let flowReport: FlowTracingReport | null;
+        if (settled[1].status === "fulfilled") {
+          flowReport = settled[1].value; // may legitimately be null
+        } else {
+          const reason = String(settled[1].reason);
+          this.logger.error(
+            `Flow tracing rejected: ${reason}. Synthesizing high-severity finding to force another cycle.`,
+          );
+          const syntheticFinding: FlowFinding = {
+            flow_id: `flow-tracing-failure-cycle-${cycleNum}`,
+            severity: "high",
+            actor: "conductor",
+            title: "Flow tracing failed — security gate not evaluated",
+            description:
+              `Flow tracing threw an exception during cycle ${cycleNum}: ${reason}. ` +
+              `Force another cycle so the security gate is actually evaluated.`,
+            file_path: "<flow-tracing-infrastructure>",
+            cross_boundary: false,
+          };
+          flowReport = {
+            generated_at: new Date().toISOString(),
+            flows_traced: 0,
+            findings: [syntheticFinding],
+            summary: { critical: 0, high: 1, medium: 0, low: 0, total: 1, cross_boundary_count: 0 },
+          };
+        }
+
+        // Leg 2: design spec (non-gating). Warn on rejection but do not block.
+        if (settled[2].status === "rejected") {
+          this.logger.warn(`Design spec update failed (non-fatal): ${String(settled[2].reason)}`);
+        }
 
 
 
@@ -1144,9 +1200,19 @@ export class Orchestrator {
             "4. Provide a clear, structured response addressing each point.",
           ].join("\n");
 
+          // H-9: investigator participates in security-gate plan review —
+          // use planner's resolved model + effort instead of SDK defaults.
+          const planInvSpec = resolveSdkArgs(this.options.modelConfig, "planner");
           let responseText = await queryWithTimeout(
             investigatorPrompt,
-            { allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "LSP"], cwd: this.options.project, maxTurns: 20, settingSources: ["project"] },
+            {
+              allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "LSP"],
+              cwd: this.options.project,
+              maxTurns: 20,
+              model: planInvSpec.model,
+              ...(planInvSpec.effort ? { effort: planInvSpec.effort } : {}),
+              settingSources: ["project"],
+            },
             10 * 60 * 1000, // 10 min
             `plan-investigator-round-${discussionRound}`,
             this.logger,
@@ -1594,7 +1660,13 @@ export class Orchestrator {
               const correctivePrompt = retryTask.last_error
                 ? `Previous attempt failed: ${retryTask.last_error}. Please fix this and complete the task.`
                 : undefined;
-              await this.workers.spawnWorkerForRetry(sessionId, retryTask.id, correctivePrompt);
+              // H-10: pass task_type so retries keep role-specific model/effort.
+              await this.workers.spawnWorkerForRetry(
+                sessionId,
+                retryTask.id,
+                correctivePrompt,
+                retryTask.task_type ?? null,
+              );
             } else {
               await this.workers.spawnWorker(sessionId, hint);
             }
@@ -1787,9 +1859,18 @@ export class Orchestrator {
         "4. Provide a summary of what you fixed and what you left unchanged.",
       ].join("\n");
 
+      // H-9: code-review investigator also uses planner's model + effort.
+      const codeInvSpec = resolveSdkArgs(this.options.modelConfig, "planner");
       let responseText = await queryWithTimeout(
         reviewerPrompt,
-        { allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"], cwd: this.options.project, maxTurns: 30, settingSources: ["project"] },
+        {
+          allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"],
+          cwd: this.options.project,
+          maxTurns: 30,
+          model: codeInvSpec.model,
+          ...(codeInvSpec.effort ? { effort: codeInvSpec.effort } : {}),
+          settingSources: ["project"],
+        },
         10 * 60 * 1000, // 10 min
         `code-review-investigator-round-${reviewRound}`,
         this.logger,
@@ -1899,11 +1980,12 @@ export class Orchestrator {
       diff = await this.git.getDiff(this.baseBranch);
       changedFiles = await this.git.getChangedFiles(this.baseBranch);
     } catch (err) {
-      this.logger.warn(
-        `Could not get git diff for flow-tracing: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // H-4: real failure (not an intentional skip) — throw so the
+      // Promise.allSettled handler can synthesize a forcing finding instead
+      // of silently bypassing the security gate.
       recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
-      return null;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Flow-tracing failed to get git diff: ${msg}`);
     }
 
     if (!diff || diff.trim().length === 0) {
@@ -1935,11 +2017,11 @@ export class Orchestrator {
       recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
       return report;
     } catch (err) {
-      this.logger.error(
-        `Flow-tracing failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      // H-4: real failure (not an intentional skip) — throw so the
+      // Promise.allSettled handler synthesizes a forcing finding.
       recordPhaseEnd(this.eventLog, "flow_tracing", flowStartTime);
-      return null;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Flow-tracing tracer failed: ${msg}`);
     }
   }
 
@@ -2408,11 +2490,8 @@ export class Orchestrator {
           options: ["resume", "stop"],
         };
         const escalationPath = getEscalationPath(this.options.project);
-        await fs.writeFile(
-          escalationPath,
-          JSON.stringify(escalation, null, 2) + "\n",
-          { encoding: "utf-8", mode: 0o600 },
-        );
+        // H-14: atomic write to prevent torn JSON on crash mid-write.
+        await writeJsonAtomic(escalationPath, JSON.stringify(escalation, null, 2) + "\n");
         throw new ConductorExitError(2, "User requested pause");
       }
 
@@ -2478,11 +2557,8 @@ export class Orchestrator {
       };
 
       const escalationPath = getEscalationPath(this.options.project);
-      await fs.writeFile(
-        escalationPath,
-        JSON.stringify(escalation, null, 2) + "\n",
-        { encoding: "utf-8", mode: 0o600 },
-      );
+      // H-14: atomic write to prevent torn JSON on crash mid-write.
+      await writeJsonAtomic(escalationPath, JSON.stringify(escalation, null, 2) + "\n");
 
       this.logger.info(`Escalation written to ${escalationPath} — exiting for external handler`);
 

@@ -15,6 +15,7 @@ import {
 } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
 import { mkdirSecure } from "../utils/secure-fs.js";
+import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
 
 /** Timeout for each codex review invocation: 5 minutes. */
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
@@ -361,6 +362,7 @@ export class CodexReviewer {
     presumed_rate_limits: 0,
     last_presumed_rate_limit_at: null,
     output_too_large_failures: 0, // CR-2: tracked separately from rate limits
+    execution_errors: 0, // H-16: second-attempt crash/timeout without rate-limit signal
   };
 
   constructor(
@@ -605,25 +607,45 @@ export class CodexReviewer {
       return secondResult;
     }
 
-    // Both attempts failed — classify by the SECOND attempt's failure mode.
-    // If 2nd attempt had an execution error (timeout/crash/no-output) → RATE_LIMITED.
-    // If 2nd attempt returned output but invalid JSON → ERROR (not rate limited).
+    // Both attempts failed. H-16: don't blanket-classify as RATE_LIMITED —
+    // check the error's message + partialOutput (which contains stderr)
+    // for actual rate-limit signals. If no signal, treat as ERROR so
+    // retryCodexWithBackoff doesn't waste 16 minutes on non-rate-limit errors.
     if (secondExecError) {
-      this.metrics.presumed_rate_limits++;
-      this.metrics.last_presumed_rate_limit_at = new Date().toISOString();
-      this.logger.error(
-        `[${label}] Codex failed on second attempt with execution error (${secondExecError.reason}). Presuming rate limit.`,
-      );
+      const detail = coerceLogText(secondExecError.partialOutput ?? "") + " " + secondExecError.message;
+      const rlSignal = detectProviderRateLimit("codex", detail);
 
+      if (rlSignal) {
+        this.metrics.presumed_rate_limits++;
+        this.metrics.last_presumed_rate_limit_at = new Date().toISOString();
+        this.logger.error(
+          `[${label}] Codex failed on second attempt with rate-limit signal (${rlSignal.detail}). Classified as RATE_LIMITED.`,
+        );
+        const filePath = firstResult?.file_path ?? secondResult?.file_path ?? label;
+        const result: CodexReviewResult = {
+          verdict: "RATE_LIMITED",
+          raw_output: `CODEX RATE LIMITED: ${secondExecError.message}`,
+          issues: [],
+          file_path: filePath,
+        };
+        await this.saveReview(result, `${label}-RATE_LIMITED`);
+        return result;
+      }
+
+      // No rate-limit evidence — terminal execution error, not rate-limited.
+      this.metrics.execution_errors++;
+      this.logger.error(
+        `[${label}] Codex failed on second attempt with execution error (${secondExecError.reason}, no rate-limit signal). Returning ERROR.`,
+      );
       const filePath = firstResult?.file_path ?? secondResult?.file_path ?? label;
-      const result: CodexReviewResult = {
-        verdict: "RATE_LIMITED",
-        raw_output: `CODEX RATE LIMITED: ${secondExecError.message}`,
+      const errResult: CodexReviewResult = {
+        verdict: "ERROR",
+        raw_output: `CODEX EXECUTION FAILED: ${secondExecError.message}`,
         issues: [],
         file_path: filePath,
       };
-      await this.saveReview(result, `${label}-RATE_LIMITED`);
-      return result;
+      await this.saveReview(errResult, `${label}-ERROR`);
+      return errResult;
     }
 
     // Second attempt returned output but it was invalid JSON → ERROR (not rate limited)

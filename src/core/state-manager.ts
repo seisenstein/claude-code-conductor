@@ -30,6 +30,13 @@ import {
 } from "../utils/constants.js";
 import { mkdirSecure } from "../utils/secure-fs.js";
 
+// Local warn sink — StateManager has no logger dependency and we don't want
+// to add one for a narrow fix (H-5, H-6). Writes to stderr so CLI output
+// stays visible.
+function warnStateManager(msg: string): void {
+  process.stderr.write(`[state-manager] ${msg}\n`);
+}
+
 export class StateManager {
   private projectDir: string;
   private state: OrchestratorState | null = null;
@@ -109,18 +116,69 @@ export class StateManager {
    */
   async load(): Promise<OrchestratorState> {
     const statePath = getStatePath(this.projectDir);
-    const raw = await fs.readFile(statePath, "utf-8");
+    try {
+      const raw = await fs.readFile(statePath, "utf-8");
+      const result = validateStateJsonLenient(raw);
+      if (!result.valid) {
+        throw new Error(
+          `State file validation failed (${statePath}):\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+        );
+      }
+      this.state = result.state as OrchestratorState;
+      return this.state;
+    } catch (primaryErr) {
+      // H-5: try to recover from state.json.bak before giving up.
+      const backupPath = statePath + ".bak";
+      let backupState: OrchestratorState;
+      try {
+        const backupRaw = await fs.readFile(backupPath, "utf-8");
+        const backupResult = validateStateJsonLenient(backupRaw);
+        if (!backupResult.valid) {
+          throw new Error(
+            `state.json.bak also failed validation:\n${backupResult.errors.map((e) => `  - ${e}`).join("\n")}`,
+          );
+        }
+        backupState = backupResult.state as OrchestratorState;
+      } catch (backupErr) {
+        throw new Error(
+          `State load failed and backup recovery also failed.\n` +
+          `Primary (${statePath}): ${String(primaryErr)}\n` +
+          `Backup (${backupPath}): ${String(backupErr)}`,
+        );
+      }
 
-    // Validate with Zod schema (CRITICAL - state.json validation)
-    const result = validateStateJsonLenient(raw);
-    if (!result.valid) {
-      throw new Error(
-        `State file validation failed (${statePath}):\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+      // Preserve the corrupt primary for forensics. Only claim preservation
+      // if the rename actually succeeded — otherwise the operator gets a
+      // misleading path that doesn't exist.
+      const corruptTs = Date.now();
+      const corruptPath = `${statePath}.corrupt-${corruptTs}`;
+      let preserved = false;
+      try {
+        await fs.rename(statePath, corruptPath);
+        preserved = true;
+      } catch (renameErr) {
+        warnStateManager(
+          `Could not preserve corrupt state.json for forensics: ${String(renameErr)}`,
+        );
+      }
+      warnStateManager(
+        `state.json corrupt (${String(primaryErr)}); recovered from ${backupPath}.` +
+          (preserved ? ` Original preserved at ${corruptPath}.` : ""),
       );
-    }
 
-    this.state = result.state as OrchestratorState;
-    return this.state;
+      this.state = backupState;
+      // Best-effort: persist recovered state so next load finds a valid primary.
+      // Non-fatal if save fails — state is valid in memory.
+      try {
+        await this.save();
+      } catch (saveErr) {
+        warnStateManager(
+          `Recovered state loaded from .bak but post-recovery save failed: ${String(saveErr)}. ` +
+          `State is valid in memory; next successful save will re-establish state.json.`,
+        );
+      }
+      return this.state;
+    }
   }
 
   /**
@@ -153,11 +211,46 @@ export class StateManager {
         stale: 5000, // Consider locks stale after 5 seconds
       });
 
-      // Write to temp file first with secure permissions (mode 0o600)
-      await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+      // H-6: write tmp file and fsync BEFORE rename. Without the fsync, on
+      // power-loss the rename can complete while tmp data is still only in
+      // page cache, leaving state.json pointing at zero-length or garbage.
+      const tmpFh = await fs.open(tmpPath, "w", 0o600);
+      try {
+        await tmpFh.writeFile(content, { encoding: "utf-8" });
+        await tmpFh.sync(); // flush file data to disk before rename
+      } finally {
+        await tmpFh.close();
+      }
 
       // Atomic rename (prevents partial writes from being read)
       await fs.rename(tmpPath, statePath);
+
+      // H-6: fsync parent directory for full power-loss durability. Without
+      // this, the rename itself can be lost on power loss even though the
+      // file data was fsynced. Wrapped in try/catch because some filesystems
+      // (network mounts, certain FUSE FSs) return EINVAL on dir fsync.
+      try {
+        const dirFh = await fs.open(path.dirname(statePath), "r");
+        try {
+          await dirFh.sync();
+        } finally {
+          await dirFh.close();
+        }
+      } catch (err) {
+        warnStateManager(`Parent-dir fsync after state.json rename failed: ${String(err)}`);
+      }
+
+      // H-5: update .bak AFTER successful main rename. Crash-mid-bak is
+      // safe because the main state.json is already good — we'd just have
+      // a stale but valid .bak. fsync not required on .bak (redundant copy).
+      try {
+        const backupPath = statePath + ".bak";
+        const backupTmp = backupPath + ".tmp";
+        await fs.writeFile(backupTmp, content, { encoding: "utf-8", mode: 0o600 });
+        await fs.rename(backupTmp, backupPath);
+      } catch (err) {
+        warnStateManager(`Failed to update state.json.bak: ${String(err)}`);
+      }
     } finally {
       // Always release the lock, even if writing fails
       if (release) {
@@ -707,7 +800,12 @@ export class StateManager {
    */
   async resume(workerRuntime?: "claude" | "codex"): Promise<void> {
     this.ensureState();
-    this.state!.status = "executing";
+    // H-13: use the transient "initializing" status rather than "executing".
+    // resume() runs before any phase has actually started work; if the
+    // conductor crashes between here and the first real phase, a re-resume
+    // must not assume execution was in progress. Each phase calls setStatus
+    // itself when it actually begins.
+    this.state!.status = "initializing";
     this.state!.paused_at = null;
     this.state!.resume_after = null;
     if (workerRuntime) {

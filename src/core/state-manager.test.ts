@@ -541,11 +541,11 @@ describe("StateManager integration", () => {
       expect(state.paused_at).toBeTruthy();
       expect(state.resume_after).toBe(resumeAfter);
 
-      // Resume
+      // Resume — H-13: sets transient "initializing", not "executing".
       await stateManager.resume();
 
       state = stateManager.get();
-      expect(state.status).toBe("executing");
+      expect(state.status).toBe("initializing");
       expect(state.paused_at).toBeNull();
       expect(state.resume_after).toBeNull();
     });

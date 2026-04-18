@@ -289,3 +289,63 @@ describe("override merge semantics (CLI integration)", () => {
     }
   });
 });
+
+// ============================================================
+// resolveLooseModelArg — H-11 analyzer entry-point resolver
+// ============================================================
+
+import { resolveLooseModelArg } from "./models-config.js";
+
+describe("resolveLooseModelArg (H-11)", () => {
+  it("passes through RoleModelSpec unchanged", () => {
+    const out = resolveLooseModelArg({ tier: "opus-4-7", effort: "high" }, "planner");
+    expect(out.model).toBe("claude-opus-4-7");
+    expect(out.effort).toBe("high");
+  });
+
+  it("resolves a known tier string via MODEL_TIER_TO_ID", () => {
+    const out = resolveLooseModelArg("opus-4-7", "planner");
+    expect(out.model).toBe("claude-opus-4-7");
+    // Applies role default effort since input was tier-only
+    expect(out.effort).toBe(DEFAULT_ROLE_CONFIG.planner.effort);
+  });
+
+  it("warns and falls back on unknown tier string", () => {
+    const warnings: string[] = [];
+    const warn = (msg: string) => warnings.push(msg);
+    const out = resolveLooseModelArg("not-a-real-tier", "planner", warn);
+    // Falls back to role default
+    expect(out.model).toBe("claude-opus-4-7"); // planner default
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("not-a-real-tier");
+  });
+
+  it("treats a full SDK model ID as unknown tier (doesn't misinterpret)", () => {
+    // Regression: Codex code-review round 1 found that passing a
+    // fully-resolved SDK model ID (e.g. "claude-opus-4-7") to
+    // resolveLooseModelArg silently downgrades to role default. The CLI
+    // init path was pre-resolving tiers before passing to analyzers,
+    // which defeated the whole point of the resolver. CLI now passes
+    // the tier shorthand instead; this test documents the resolver's
+    // behavior when it DOES receive a full ID.
+    const warnings: string[] = [];
+    const out = resolveLooseModelArg("claude-opus-4-7", "design_spec_analyzer", (m) => warnings.push(m));
+    expect(out.model).toBe(DEFAULT_ROLE_CONFIG.design_spec_analyzer.tier === "opus-4-7" ? "claude-opus-4-7" : "claude-sonnet-4-6"); // role default
+    // Importantly, a warning was emitted so misuse is visible.
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("claude-opus-4-7");
+  });
+
+  it("returns role default when input is undefined", () => {
+    const out = resolveLooseModelArg(undefined, "planner");
+    const expected = specToSdkArgs(DEFAULT_ROLE_CONFIG.planner);
+    expect(out).toEqual(expected);
+  });
+
+  it("accepts legacy tier alias strings (opus, sonnet, haiku)", () => {
+    // Legacy "opus" alias maps to claude-opus-4-6 (back-compat with 0.6.x),
+    // not 4.7 — users must opt in explicitly with "opus-4-7".
+    const out = resolveLooseModelArg("opus", "planner");
+    expect(out.model).toBe("claude-opus-4-6");
+  });
+});

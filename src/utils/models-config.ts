@@ -196,8 +196,52 @@ export async function loadModelsConfig(projectDir: string): Promise<LoadModelsCo
  */
 export function resolveRoleSpec(config: ModelConfig | undefined, role: AgentRole): RoleModelSpec {
   const override = config?.roles?.[role];
-  if (override) return { tier: override.tier, effort: override.effort };
+  if (override) {
+    // H-7: inherit default effort when override is tier-only. Previously the
+    // return was `{ tier: override.tier, effort: override.effort }` which
+    // silently dropped the role's default effort for a partial override
+    // like `{ "planner": { "tier": "sonnet-4-6" } }`.
+    return {
+      tier: override.tier,
+      effort: override.effort ?? DEFAULT_ROLE_CONFIG[role].effort,
+    };
+  }
   return { ...DEFAULT_ROLE_CONFIG[role] };
+}
+
+/**
+ * H-8: Field-level merge of per-role spec maps. For each role, the patch's
+ * fields are spread over the base's fields — so a tier-only patch does NOT
+ * wipe the base's effort. This is the intended behavior for every layer of
+ * composeRoleConfig (state seed → file → legacy expansion → CLI patches).
+ *
+ * Before this helper, the CLI used shallow spreads (`{ ...merged, ...patch }`)
+ * which silently lost fields when a later layer supplied a partial spec.
+ */
+export function mergeRoleMaps(
+  base: Partial<Record<AgentRole, RoleModelSpec>>,
+  patch: Partial<Record<AgentRole, Partial<RoleModelSpec>>> | undefined,
+): Partial<Record<AgentRole, RoleModelSpec>> {
+  if (!patch) return { ...base };
+  const result: Partial<Record<AgentRole, RoleModelSpec>> = { ...base };
+  for (const role of Object.keys(patch) as AgentRole[]) {
+    const p = patch[role];
+    if (!p) continue;
+    const b = result[role];
+    if (!b) {
+      // New entry — fill any missing field from DEFAULT_ROLE_CONFIG (H-7 parity).
+      result[role] = {
+        tier: p.tier ?? DEFAULT_ROLE_CONFIG[role].tier,
+        effort: p.effort ?? DEFAULT_ROLE_CONFIG[role].effort,
+      };
+    } else {
+      result[role] = {
+        tier: p.tier ?? b.tier,
+        effort: p.effort ?? b.effort,
+      };
+    }
+  }
+  return result;
 }
 
 // ============================================================
@@ -227,6 +271,38 @@ export function specToSdkArgs(spec: RoleModelSpec): ResolvedSdkArgs {
 /** Convenience: resolve + convert in one call. */
 export function resolveSdkArgs(config: ModelConfig | undefined, role: AgentRole): ResolvedSdkArgs {
   return specToSdkArgs(resolveRoleSpec(config, role));
+}
+
+/**
+ * H-11: resolve a `RoleModelSpec | string | undefined` input to concrete SDK
+ * args. Used by analyzer entry points that accept a loose model input for CLI
+ * convenience.
+ *
+ * - `RoleModelSpec` → passthrough via `specToSdkArgs`
+ * - string that matches a `ClaudeModelTier` → wrap in spec using role
+ *   default's effort, then `specToSdkArgs`
+ * - string that does NOT match a tier → warn, fall back to role default
+ * - undefined → role default
+ *
+ * Before this helper, analyzers passed raw tier shorthands ("opus") directly
+ * to the SDK as `model`, bypassing `MODEL_TIER_TO_ID`.
+ */
+export function resolveLooseModelArg(
+  input: RoleModelSpec | string | undefined,
+  role: AgentRole,
+  warn?: (msg: string) => void,
+): ResolvedSdkArgs {
+  if (!input) return specToSdkArgs(DEFAULT_ROLE_CONFIG[role]);
+  if (typeof input === "object") return specToSdkArgs(input);
+  // string — interpret as tier shorthand
+  if (input in MODEL_TIER_TO_ID) {
+    return specToSdkArgs({
+      tier: input as ClaudeModelTier,
+      effort: DEFAULT_ROLE_CONFIG[role].effort,
+    });
+  }
+  warn?.(`Unknown model tier "${input}" for role ${role}; falling back to default.`);
+  return specToSdkArgs(DEFAULT_ROLE_CONFIG[role]);
 }
 
 // ============================================================

@@ -272,7 +272,7 @@ describe("Orchestrator State Machine", () => {
       expect(tasks[0].id).toBe("task-001");
     });
 
-    it("resume clears paused_at and sets executing status", async () => {
+    it("resume clears paused_at and sets initializing status (H-13)", async () => {
       await stateManager.setStatus("executing");
       await stateManager.pause("test-pause");
 
@@ -282,7 +282,9 @@ describe("Orchestrator State Machine", () => {
       await stateManager.resume();
 
       const state = stateManager.get();
-      expect(state.status).toBe("executing");
+      // H-13: resume() sets transient "initializing" so a crash between here
+      // and the first real phase can't falsely claim execution was live.
+      expect(state.status).toBe("initializing");
       expect(state.paused_at).toBeNull();
       expect(state.resume_after).toBeNull();
     });
