@@ -16,6 +16,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { ProjectProfile, ProjectArchetype } from "../utils/types.js";
 import { getProjectProfilePath } from "../utils/constants.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 
 // ============================================================
 // Main Detection Function
@@ -604,7 +605,7 @@ export async function cacheProfile(
 
   // Ensure .conductor directory exists with secure permissions
   const conductorDir = path.dirname(profilePath);
-  await fs.mkdir(conductorDir, { recursive: true, mode: 0o700 });
+  await mkdirSecure(conductorDir, { recursive: true }); // H-2
 
   // Use secure permissions: mode 0o600 for file (owner rw only)
   await fs.writeFile(profilePath, JSON.stringify(profile, null, 2), { encoding: "utf-8", mode: 0o600 });

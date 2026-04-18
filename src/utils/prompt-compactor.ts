@@ -4,6 +4,7 @@ import {
   COMPACTION_AGENT_MAX_TURNS,
   COMPACTION_AGENT_TIMEOUT_MS,
   CHARS_PER_TOKEN_ESTIMATE,
+  READ_ONLY_DISALLOWED_TOOLS,
   getTasksDir,
   getKnownIssuesPath,
 } from "./constants.js";
@@ -256,6 +257,7 @@ async function applyTier4(prompt: string, projectDir: string, model: string, log
       systemPrompt,
       {
         allowedTools: ["Read", "Glob", "Grep"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: COMPACTION_AGENT_MAX_TURNS,
         model,

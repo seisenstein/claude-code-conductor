@@ -17,6 +17,7 @@ import {
   MAX_EVENT_LOG_SIZE_BYTES,
   ORCHESTRATOR_DIR,
 } from "../utils/constants.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 
 // ============================================================
 // Types
@@ -182,7 +183,7 @@ export class EventLog {
     try {
       // Ensure .conductor directory exists
       const conductorDir = path.join(this.projectDir, ORCHESTRATOR_DIR);
-      await fs.mkdir(conductorDir, { recursive: true, mode: 0o700 });
+      await mkdirSecure(conductorDir, { recursive: true }); // H-2
 
       // Check file size before writing (DoS mitigation)
       let currentSize = 0;

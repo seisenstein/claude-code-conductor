@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
+import { mkdirSecureSync } from "./utils/secure-fs.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,7 +47,7 @@ function main(): void {
   // Create ~/.claude/commands/ if it doesn't exist
   // Use secure permissions: mode 0o700 (owner rwx only)
   if (!fs.existsSync(destDir)) {
-    fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
+    mkdirSecureSync(destDir, { recursive: true }); // H-2
     log(`Created directory: ${destDir}`);
   }
 

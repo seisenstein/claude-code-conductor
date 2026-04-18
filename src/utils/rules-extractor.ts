@@ -14,6 +14,7 @@ import {
   RULES_EXTRACTOR_MAX_TURNS,
   RULES_EXTRACTOR_TIMEOUT_MS,
   DEFAULT_ROLE_CONFIG,
+  READ_ONLY_DISALLOWED_TOOLS,
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
@@ -165,6 +166,7 @@ export async function extractProjectRules(
       EXTRACTION_PROMPT,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: RULES_EXTRACTOR_MAX_TURNS,
         model: sdkArgs.model,

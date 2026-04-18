@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { lock } from "proper-lockfile";
 import { getKnownIssuesPath } from "./constants.js";
-import { writeFileSecure, SECURE_FILE_MODE, SECURE_DIR_MODE } from "./secure-fs.js";
+import { writeFileSecure, mkdirSecure, SECURE_FILE_MODE } from "./secure-fs.js";
 import type { KnownIssue } from "./types.js";
 import type { Logger } from "./logger.js";
 
@@ -45,7 +45,7 @@ export async function loadKnownIssues(projectDir: string, logger?: Logger): Prom
  */
 export async function saveKnownIssues(projectDir: string, issues: KnownIssue[]): Promise<void> {
   const issuesPath = getKnownIssuesPath(projectDir);
-  await fs.mkdir(path.dirname(issuesPath), { recursive: true, mode: SECURE_DIR_MODE });
+  await mkdirSecure(path.dirname(issuesPath), { recursive: true }); // H-2
   await writeFileSecure(issuesPath, JSON.stringify(issues, null, 2) + "\n");
 }
 
@@ -56,7 +56,7 @@ export async function saveKnownIssues(projectDir: string, issues: KnownIssue[]):
  * missing and one truncates the other's data.
  */
 async function ensureFileForLock(filePath: string): Promise<void> {
-  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: SECURE_DIR_MODE });
+  await mkdirSecure(path.dirname(filePath), { recursive: true }); // H-2
   const fh = await fs.open(filePath, "a", SECURE_FILE_MODE);
   await fh.close();
 }

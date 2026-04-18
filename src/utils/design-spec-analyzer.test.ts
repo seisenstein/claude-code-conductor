@@ -564,12 +564,15 @@ describe("design-spec-analyzer pattern verification", () => {
     expect(source).toContain("process.stderr.write");
   });
 
-  it("uses secure file permissions (0o600 for files, 0o700 for directories)", async () => {
+  it("uses secure file permissions (0o600 for files, mkdirSecure for directories)", async () => {
     const source = await fs.readFile(
       path.join(process.cwd(), "src/utils/design-spec-analyzer.ts"),
       "utf-8",
     );
+    // Files still use writeFile with mode: 0o600 directly
     expect(source).toContain("mode: 0o600");
-    expect(source).toContain("mode: 0o700");
+    // Directories now use mkdirSecure, which wraps fs.mkdir + fs.chmod to
+    // defeat umask (H-2). Assert the helper is imported and used here.
+    expect(source).toContain("mkdirSecure");
   });
 });

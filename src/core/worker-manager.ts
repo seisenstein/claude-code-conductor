@@ -30,12 +30,13 @@ import {
   SENTINEL_WORKER_MAX_TURNS,
   SENTINEL_SESSION_ID,
   FLOW_TRACING_READ_ONLY_TOOLS,
+  READ_ONLY_DISALLOWED_TOOLS,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
-import { appendJsonlLocked, writeFileSecure } from "../utils/secure-fs.js";
+import { appendJsonlLocked, mkdirSecure, writeFileSecure } from "../utils/secure-fs.js";
 
 // ============================================================
 // Worker Handle
@@ -146,7 +147,7 @@ export class WorkerManager implements ExecutionWorkerManager {
       SESSIONS_DIR,
       sessionId,
     );
-    await fs.mkdir(sessionDir, { recursive: true });
+    await mkdirSecure(sessionDir, { recursive: true }); // H-2
 
     // Write initial status with secure permissions (H12 fix)
     const initialStatus: SessionStatus = {
@@ -205,7 +206,7 @@ export class WorkerManager implements ExecutionWorkerManager {
       SESSIONS_DIR,
       sentinelId,
     );
-    await fs.mkdir(sessionDir, { recursive: true });
+    await mkdirSecure(sessionDir, { recursive: true }); // H-2
 
     // Write initial status with secure permissions (H12 fix)
     const initialStatus: SessionStatus = {
@@ -289,7 +290,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     this.logger.info(`Sending wind-down signal to all workers: ${validatedReason}`);
 
     const messagesDir = path.join(this.orchestratorDir, MESSAGES_DIR);
-    await fs.mkdir(messagesDir, { recursive: true });
+    await mkdirSecure(messagesDir, { recursive: true }); // H-2
 
     const message: Message = {
       id: `orchestrator-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -633,6 +634,9 @@ export class WorkerManager implements ExecutionWorkerManager {
             "mcp__coordinator__post_update",
             "mcp__coordinator__get_tasks",
           ],
+          // CR-1: enforce read-only — allowedTools alone is insufficient under
+          // bypassPermissions. See constants.ts:READ_ONLY_DISALLOWED_TOOLS.
+          disallowedTools: READ_ONLY_DISALLOWED_TOOLS,
           mcpServers: {
             coordinator: {
               command: "node",
@@ -792,7 +796,7 @@ export class WorkerManager implements ExecutionWorkerManager {
     );
 
     try {
-      await fs.mkdir(sessionDir, { recursive: true });
+      await mkdirSecure(sessionDir, { recursive: true }); // H-2
 
       const statusPath = path.join(sessionDir, SESSION_STATUS_FILE);
 

@@ -6,9 +6,11 @@ import {
   DESIGN_SPEC_UPDATER_MAX_TURNS,
   DESIGN_SPEC_UPDATER_TIMEOUT_MS,
   DEFAULT_ROLE_CONFIG,
+  READ_ONLY_DISALLOWED_TOOLS,
 } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
+import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
 
 /** Frontend file extensions to watch for design spec changes. */
@@ -64,6 +66,7 @@ export async function updateDesignSpec(
       prompt,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: DESIGN_SPEC_UPDATER_MAX_TURNS,
         model: sdkArgs.model,
@@ -197,7 +200,7 @@ async function parseUpdateResult(
     const specPath = getDesignSpecPath(projectDir);
     const tmpPath = specPath + ".tmp";
     try {
-      await fs.mkdir(path.dirname(specPath), { recursive: true, mode: 0o700 });
+      await mkdirSecure(path.dirname(specPath), { recursive: true }); // H-2
       await fs.writeFile(tmpPath, JSON.stringify(updatedSpec, null, 2), { encoding: "utf-8", mode: 0o600 });
       await fs.rename(tmpPath, specPath);
     } catch (err) {

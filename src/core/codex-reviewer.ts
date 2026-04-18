@@ -1,13 +1,20 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { CodexReviewResult, CodexVerdict, CodexUsageMetrics } from "../utils/types.js";
-import { getCodexReviewsDir } from "../utils/constants.js";
-import type { Logger } from "../utils/logger.js";
-
 const execFileAsync = promisify(execFile);
+
+import type { CodexReviewResult, CodexVerdict, CodexUsageMetrics, ModelConfig } from "../utils/types.js";
+import {
+  getCodexReviewsDir,
+  getCodexModel,
+  MAX_CODEX_PROMPT_FILE_CHARS,
+  MAX_CODEX_PROMPT_AGGREGATE_CHARS,
+  MAX_CODEX_STDOUT_BYTES,
+} from "../utils/constants.js";
+import type { Logger } from "../utils/logger.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 
 /** Timeout for each codex review invocation: 5 minutes. */
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
@@ -75,7 +82,7 @@ Rules:
 export class CodexExecutionError extends Error {
   constructor(
     message: string,
-    public readonly reason: "not_found" | "timeout" | "crash",
+    public readonly reason: "not_found" | "timeout" | "crash" | "output_too_large",
     public readonly partialOutput?: string,
   ) {
     super(message);
@@ -83,17 +90,277 @@ export class CodexExecutionError extends Error {
   }
 }
 
+/**
+ * Read at most `maxChars` UTF-16 code units from a file without allocating
+ * the whole file in memory. Uses fs.open + bounded read. Returns:
+ *   { content, fullByteLength, wasTruncated }
+ * where wasTruncated is authoritatively true iff the file exceeded the cap
+ * AND the returned content was sliced. Callers should not infer truncation
+ * from byte/char mismatches — unreliable for multi-byte content (CR-2).
+ */
+async function readFilePrefix(
+  p: string,
+  maxChars: number,
+): Promise<{ content: string; fullByteLength: number; wasTruncated: boolean }> {
+  const stat = await fs.stat(p);
+  const fullByteLength = stat.size;
+  const readBytes = Math.min(fullByteLength, maxChars * 4);
+  const fh = await fs.open(p, "r");
+  try {
+    const buf = Buffer.alloc(readBytes);
+    const { bytesRead } = await fh.read(buf, 0, readBytes, 0);
+    const decoded = buf.subarray(0, bytesRead).toString("utf-8");
+    const wasTruncated = bytesRead < fullByteLength || decoded.length > maxChars;
+    const content = wasTruncated ? decoded.slice(0, maxChars) : decoded;
+    return { content, fullByteLength, wasTruncated };
+  } finally {
+    await fh.close();
+  }
+}
+
+interface SpawnOptions {
+  cwd: string;
+  timeoutMs: number;
+  maxStdoutBytes: number;
+  logger: Logger;
+}
+
+/**
+ * Spawn a process, pipe `stdinPayload` to its stdin, collect stdout/stderr
+ * with a byte-count maxBuffer guard, and map failure modes to
+ * CodexExecutionError. Parity contract with the previous execFileAsync
+ * wrapper, plus explicit output_too_large handling (CR-2).
+ */
+async function spawnCodexWithStdin(
+  command: string,
+  args: string[],
+  stdinPayload: string,
+  opts: SpawnOptions,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(command, args, { cwd: opts.cwd });
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        opts.logger.error("Codex CLI not found — is it installed and on PATH?");
+        reject(
+          new CodexExecutionError(
+            "Codex CLI not found. Please install codex.",
+            "not_found",
+          ),
+        );
+        return;
+      }
+      reject(
+        new CodexExecutionError(`Codex spawn failed: ${String(err)}`, "crash"),
+      );
+      return;
+    }
+
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let overflowed = false;
+    let timedOut = false;
+    let settled = false;
+    let exited = false; // child actually emitted 'close' — distinct from proc.killed
+                        // (proc.killed flips true the moment we CALL kill(), not when the OS reaps)
+
+    proc.on("close", () => {
+      exited = true;
+    });
+
+    const killChild = () => {
+      if (exited) return;
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // ignore — process may already be gone
+      }
+      // Unconditional SIGKILL fallback after 2s. `proc.killed` is already true
+      // post-SIGTERM even if the child is still alive, so we gate on `exited`
+      // (set by the 'close' listener) instead.
+      setTimeout(() => {
+        if (exited) return;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }, 2000).unref();
+    };
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBytes += Buffer.byteLength(chunk);
+      if (stdoutBytes > opts.maxStdoutBytes) {
+        overflowed = true;
+        killChild();
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrBytes += Buffer.byteLength(chunk);
+      if (stderrBytes > opts.maxStdoutBytes) {
+        overflowed = true;
+        killChild();
+        return;
+      }
+      stderrChunks.push(chunk);
+    });
+
+    proc.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") {
+        opts.logger.error("Codex CLI not found — is it installed and on PATH?");
+        settle(() =>
+          reject(
+            new CodexExecutionError(
+              "Codex CLI not found. Please install codex.",
+              "not_found",
+            ),
+          ),
+        );
+        return;
+      }
+      settle(() =>
+        reject(
+          new CodexExecutionError(`Codex spawn error: ${err.message}`, "crash"),
+        ),
+      );
+    });
+
+    proc.on("close", (code) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf-8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf-8");
+
+      if (overflowed) {
+        opts.logger.error(
+          `Codex stdout exceeded ${opts.maxStdoutBytes} bytes — killed.`,
+        );
+        settle(() =>
+          reject(
+            new CodexExecutionError(
+              `Codex stdout exceeded ${opts.maxStdoutBytes} bytes.`,
+              "output_too_large",
+              stdout,
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (timedOut) {
+        opts.logger.error("Codex review timed out");
+        settle(() =>
+          reject(
+            new CodexExecutionError(
+              "Codex review timed out.",
+              "timeout",
+              stdout,
+            ),
+          ),
+        );
+        return;
+      }
+
+      if (stderr) {
+        opts.logger.debug(`codex stderr: ${stderr.trim()}`);
+      }
+
+      if (code === 0) {
+        settle(() => resolve(stdout));
+        return;
+      }
+
+      // Non-zero exit but stdout present → return stdout (behavioral parity).
+      if (stdout.trim().length > 0) {
+        opts.logger.warn(
+          `Codex exited with code ${code} but produced output (${stdout.length} chars). stderr: ${stderr.trim()}`,
+        );
+        settle(() => resolve(stdout));
+        return;
+      }
+
+      opts.logger.error(`Codex execution failed: exit ${code}. stderr: ${stderr.trim()}`);
+      settle(() =>
+        reject(
+          new CodexExecutionError(
+            `Codex execution failed: exit ${code}. ${stderr.trim()}`,
+            "crash",
+            stderr,
+          ),
+        ),
+      );
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChild();
+    }, opts.timeoutMs);
+
+    // EPIPE defense: if codex exits before we finish writing, the stdin
+    // stream emits 'error' (EPIPE). Without a listener, Node treats this as
+    // an unhandled error and terminates the process. The proc-level 'error'
+    // handler does NOT catch stdin stream errors. EPIPE specifically is not
+    // fatal to us — the 'close' event will still run and report whatever
+    // stdout/stderr we got. For other stdin errors, treat as crash.
+    proc.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EPIPE") {
+        opts.logger.debug(
+          "codex stdin closed before write completed (EPIPE) — child exited early",
+        );
+        return;
+      }
+      settle(() =>
+        reject(
+          new CodexExecutionError(
+            `Codex stdin error: ${err.message}`,
+            "crash",
+          ),
+        ),
+      );
+    });
+
+    // Write prompt to stdin and close.
+    try {
+      proc.stdin?.write(stdinPayload);
+      proc.stdin?.end();
+    } catch (err) {
+      settle(() =>
+        reject(
+          new CodexExecutionError(
+            `Failed to write prompt to codex stdin: ${String(err)}`,
+            "crash",
+          ),
+        ),
+      );
+    }
+  });
+}
+
 export class CodexReviewer {
   private projectDir: string;
   private orchestratorDir: string;
   private mcpServerPath: string;
   private logger: Logger;
+  private modelConfig: ModelConfig;
   private metrics: CodexUsageMetrics = {
     invocations: 0,
     successes: 0,
     invalid_responses: 0,
     presumed_rate_limits: 0,
     last_presumed_rate_limit_at: null,
+    output_too_large_failures: 0, // CR-2: tracked separately from rate limits
   };
 
   constructor(
@@ -101,11 +368,13 @@ export class CodexReviewer {
     orchestratorDir: string,
     mcpServerPath: string,
     logger: Logger,
+    modelConfig: ModelConfig, // CR-3: reviewer now threads model from orchestrator config
   ) {
     this.projectDir = projectDir;
     this.orchestratorDir = orchestratorDir;
     this.mcpServerPath = mcpServerPath;
     this.logger = logger;
+    this.modelConfig = modelConfig;
   }
 
   // ----------------------------------------------------------------
@@ -242,6 +511,27 @@ export class CodexReviewer {
    * - If execution error (timeout/crash) or NO_VERDICT, retries once.
    * - On second failure: execution errors → RATE_LIMITED; invalid JSON → ERROR.
    */
+  /**
+   * CR-2: terminal handling for "output_too_large" at either attempt.
+   * Retrying with the same over-large prompt will fail again, and throwing
+   * would hard-stop the conductor at orchestrator.ts:548. Return an ERROR
+   * verdict so orchestration stays resilient while the failure is visible.
+   */
+  private async outputTooLargeResult(
+    err: CodexExecutionError,
+    label: string,
+  ): Promise<CodexReviewResult> {
+    this.metrics.output_too_large_failures++;
+    const result: CodexReviewResult = {
+      verdict: "ERROR",
+      raw_output: `CODEX OUTPUT TOO LARGE: ${err.message}`,
+      issues: [],
+      file_path: label,
+    };
+    await this.saveReview(result, `${label}-ERROR`);
+    return result;
+  }
+
   private async withRetryOnInvalidResponse(
     operation: () => Promise<CodexReviewResult>,
     label: string,
@@ -259,6 +549,10 @@ export class CodexReviewer {
         if (err.reason === "not_found") {
           // Codex not installed — no point retrying
           throw err;
+        }
+        if (err.reason === "output_too_large") {
+          // CR-2: terminal on first attempt (retry is pointless)
+          return this.outputTooLargeResult(err, label);
         }
         firstExecError = err;
       } else {
@@ -294,6 +588,10 @@ export class CodexReviewer {
       if (err instanceof CodexExecutionError) {
         if (err.reason === "not_found") {
           throw err;
+        }
+        if (err.reason === "output_too_large") {
+          // CR-2: terminal on second attempt too
+          return this.outputTooLargeResult(err, label);
         }
         secondExecError = err;
       } else {
@@ -351,97 +649,136 @@ export class CodexReviewer {
 
   /**
    * Execute `codex exec` with the given prompt and file contents.
-   * Reads files from disk and includes their contents in the prompt.
-   * Returns the raw stdout on success.
-   * THROWS CodexExecutionError on failure instead of returning error strings.
+   *
+   * CR-2/CR-3 changes vs pre-0.7.2:
+   *  - File contents are read with `readFilePrefix` (bounded; memory-safe).
+   *  - Per-file cap MAX_CODEX_PROMPT_FILE_CHARS.
+   *  - Hard aggregate cap MAX_CODEX_PROMPT_AGGREGATE_CHARS with clamping +
+   *    single summary marker for skipped files.
+   *  - Prompt delivered via stdin (`codex exec ... -`), not argv, so OS
+   *    ARG_MAX is not a factor.
+   *  - `--model` threaded through from modelConfig.worker.
+   *  - spawn() with byte-count maxBuffer guard on stdout/stderr; overflow
+   *    throws CodexExecutionError("output_too_large").
+   *
+   * Preserved behaviors:
+   *  - Non-zero exit + stdout present → return stdout.
+   *  - Timeout → CodexExecutionError("timeout", partialOutput).
+   *  - ENOENT (codex missing) → CodexExecutionError("not_found").
    */
   private async runCodex(prompt: string, readPaths: string[]): Promise<string> {
-    // Read file contents and append to prompt
     const fileContents: string[] = [];
+    let aggregateChars = 0;
+    let truncatedFiles = 0;
+    let skippedAfterCap = 0;
+    let capReached = false;
+
     for (const p of readPaths) {
+      // Check cap BEFORE reading. Previously `readFilePrefix` ran first and
+      // its result was discarded post-cap — bounded but wasteful (100K chars
+      // × N files of pointless I/O). Fix: short-circuit here.
+      if (capReached) {
+        skippedAfterCap++;
+        continue;
+      }
+
       try {
-        const content = await fs.readFile(p, "utf-8");
+        const { content, fullByteLength, wasTruncated } = await readFilePrefix(
+          p,
+          MAX_CODEX_PROMPT_FILE_CHARS,
+        );
         const basename = path.basename(p);
-        fileContents.push(`\n\n## File: ${basename}\n\n\`\`\`\n${content}\n\`\`\``);
+
+        const remaining = MAX_CODEX_PROMPT_AGGREGATE_CHARS - aggregateChars;
+        if (remaining <= 0) {
+          capReached = true;
+          skippedAfterCap++;
+          continue;
+        }
+
+        let body = content;
+        if (wasTruncated) {
+          body =
+            content +
+            `\n\n[TRUNCATED — file is ${fullByteLength} bytes, showing first ${content.length} chars]`;
+          truncatedFiles++;
+        }
+
+        const wrapperOpen = `\n\n## File: ${basename}\n\n\`\`\`\n`;
+        const wrapperClose = "\n```";
+        const fullChunk = wrapperOpen + body + wrapperClose;
+
+        let chunk = fullChunk;
+        if (chunk.length > remaining) {
+          const marker = `\n\n[TRUNCATED_BY_AGGREGATE_CAP]`;
+          chunk =
+            fullChunk.slice(0, Math.max(0, remaining - marker.length)) + marker;
+          truncatedFiles++;
+          capReached = true;
+        }
+
+        fileContents.push(chunk);
+        aggregateChars += chunk.length;
       } catch (err) {
         this.logger.warn(`Could not read file ${p}: ${String(err)}`);
       }
     }
 
-    const fullPrompt = prompt + fileContents.join("");
+    if (skippedAfterCap > 0) {
+      fileContents.push(
+        `\n\n[${skippedAfterCap} additional file(s) skipped due to aggregate prompt cap of ${MAX_CODEX_PROMPT_AGGREGATE_CHARS} chars.]`,
+      );
+    }
 
-    // Use --full-auto for non-interactive review
-    // No --sandbox since Codex needs MCP tool access (MCP tools are read-only anyway)
-    // Configure the coordinator MCP server so review prompts can access
-    // get_tasks, get_contracts, get_decisions, and read_updates tools.
+    if (truncatedFiles > 0 || skippedAfterCap > 0) {
+      this.logger.warn(
+        `Codex reviewer prompt: ${truncatedFiles} file(s) truncated, ${skippedAfterCap} file(s) skipped ` +
+          `(aggregate cap ${MAX_CODEX_PROMPT_AGGREGATE_CHARS}). Review may be incomplete.`,
+      );
+    }
+
+    const fullPrompt = prompt + fileContents.join("");
+    const codexModel = getCodexModel(this.modelConfig.worker); // CR-3
+
+    // CR-2: `-` tells codex exec to read the prompt from stdin. This avoids
+    // argv size limits entirely (macOS ARG_MAX is 1MB; many Linux distros
+    // are 128KB–2MB, and env counts against the same budget).
     const args: string[] = [
       "exec",
       "--full-auto",
-      "-C", this.projectDir,
-      "-c", 'mcp_servers.coordinator.command="node"',
-      "-c", `mcp_servers.coordinator.args=[${JSON.stringify(this.mcpServerPath)}]`,
-      "-c", `mcp_servers.coordinator.env.CONDUCTOR_DIR=${JSON.stringify(this.orchestratorDir)}`,
-      "-c", 'mcp_servers.coordinator.env.SESSION_ID="codex-reviewer"',
-      "-c", "mcp_servers.coordinator.startup_timeout_sec=10",
-      "-c", "mcp_servers.coordinator.tool_timeout_sec=30",
-      "-c", "mcp_servers.coordinator.enabled=true",
-      "-c", "mcp_servers.coordinator.required=false",
-      fullPrompt,
+      "--model",
+      codexModel,
+      "-C",
+      this.projectDir,
+      "-c",
+      'mcp_servers.coordinator.command="node"',
+      "-c",
+      `mcp_servers.coordinator.args=[${JSON.stringify(this.mcpServerPath)}]`,
+      "-c",
+      `mcp_servers.coordinator.env.CONDUCTOR_DIR=${JSON.stringify(this.orchestratorDir)}`,
+      "-c",
+      'mcp_servers.coordinator.env.SESSION_ID="codex-reviewer"',
+      "-c",
+      "mcp_servers.coordinator.startup_timeout_sec=10",
+      "-c",
+      "mcp_servers.coordinator.tool_timeout_sec=30",
+      "-c",
+      "mcp_servers.coordinator.enabled=true",
+      "-c",
+      "mcp_servers.coordinator.required=false",
+      "-",
     ];
 
-    this.logger.info(`Running codex review (${readPaths.length} file(s), prompt ${fullPrompt.length} chars)...`);
+    this.logger.info(
+      `Running codex review (${readPaths.length} file(s), prompt ${fullPrompt.length} chars, model ${codexModel})...`,
+    );
 
-    try {
-      const { stdout, stderr } = await execFileAsync("codex", args, {
-        timeout: REVIEW_TIMEOUT_MS,
-        maxBuffer: 10 * 1024 * 1024, // 10 MB
-        cwd: this.projectDir,
-      });
-
-      if (stderr) {
-        this.logger.debug(`codex stderr: ${stderr.trim()}`);
-      }
-
-      return stdout;
-    } catch (err: unknown) {
-      const error = err as NodeJS.ErrnoException & {
-        stdout?: string;
-        stderr?: string;
-        killed?: boolean;
-      };
-
-      if (error.code === "ENOENT") {
-        this.logger.error("Codex CLI not found — is it installed and on PATH?");
-        throw new CodexExecutionError(
-          "Codex CLI not found. Please install codex.",
-          "not_found",
-        );
-      }
-
-      if (error.killed) {
-        this.logger.error("Codex review timed out after 5 minutes");
-        throw new CodexExecutionError(
-          "Codex review timed out after 5 minutes.",
-          "timeout",
-          error.stdout,
-        );
-      }
-
-      // Codex may exit non-zero but still produce useful output
-      if (error.stdout && error.stdout.trim().length > 0) {
-        this.logger.warn(
-          `Codex exited with error but produced output (${error.stdout.length} chars). stderr: ${error.stderr?.trim() ?? ""}`,
-        );
-        return error.stdout;
-      }
-
-      this.logger.error(`Codex execution failed: ${String(err)}`);
-      throw new CodexExecutionError(
-        `Codex execution failed: ${String(err)}`,
-        "crash",
-        error.stderr,
-      );
-    }
+    return spawnCodexWithStdin("codex", args, fullPrompt, {
+      cwd: this.projectDir,
+      timeoutMs: REVIEW_TIMEOUT_MS,
+      maxStdoutBytes: MAX_CODEX_STDOUT_BYTES,
+      logger: this.logger,
+    });
   }
 
   // ----------------------------------------------------------------
@@ -580,7 +917,7 @@ export class CodexReviewer {
     const reviewsDir = getCodexReviewsDir(this.projectDir);
 
     // Ensure directory exists
-    await fs.mkdir(reviewsDir, { recursive: true });
+    await mkdirSecure(reviewsDir, { recursive: true }); // H-2
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `${prefix}-${timestamp}.md`;

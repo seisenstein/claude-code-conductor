@@ -1,9 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ProjectConventions, RoleModelSpec } from "./types.js";
-import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, DEFAULT_ROLE_CONFIG } from "./constants.js";
+import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, DEFAULT_ROLE_CONFIG, READ_ONLY_DISALLOWED_TOOLS } from "./constants.js";
 import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
+import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
 
 const DEFAULT_CONVENTIONS: ProjectConventions = {
@@ -133,6 +134,7 @@ export async function extractConventions(
       EXTRACTION_PROMPT,
       {
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS,
         model: sdkArgs.model,
@@ -154,7 +156,7 @@ export async function extractConventions(
   // Ensure the directory exists and save cache with secure permissions
   try {
     // Use mode 0o700 for directory (owner rwx only)
-    await fs.mkdir(path.dirname(conventionsPath), { recursive: true, mode: 0o700 });
+    await mkdirSecure(path.dirname(conventionsPath), { recursive: true }); // H-2
     // Use mode 0o600 for file (owner rw only)
     await fs.writeFile(conventionsPath, JSON.stringify(conventions, null, 2), { encoding: "utf-8", mode: 0o600 });
   } catch (error) {

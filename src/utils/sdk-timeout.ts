@@ -8,6 +8,14 @@ import type { EffortLevel } from "./types.js";
  */
 export interface QueryOptions {
   allowedTools: string[];
+  /**
+   * Tools that MUST NOT be available to this worker. Unlike `allowedTools`
+   * (which only auto-approves at the permission gate — a no-op under
+   * `permissionMode: "bypassPermissions"`), `disallowedTools` actually
+   * removes tools from the model's context. Use for read-only workers.
+   * See `READ_ONLY_DISALLOWED_TOOLS` in constants.ts.
+   */
+  disallowedTools?: string[];
   cwd: string;
   maxTurns: number;
   mcpServers?: Record<string, McpServerConfig>;
@@ -63,6 +71,7 @@ export async function queryWithTimeout(
       prompt,
       options: {
         allowedTools: options.allowedTools,
+        ...(options.disallowedTools ? { disallowedTools: options.disallowedTools } : {}),
         cwd: options.cwd,
         maxTurns: options.maxTurns,
         permissionMode: permMode,

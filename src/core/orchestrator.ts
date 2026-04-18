@@ -76,6 +76,7 @@ import { updateDesignSpec } from "../utils/design-spec-updater.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 import { ensureGitignore } from "../utils/gitignore.js";
+import { mkdirSecure } from "../utils/secure-fs.js";
 import {
   detectProject,
   loadCachedProfile,
@@ -187,7 +188,13 @@ export class Orchestrator {
     const __dirname = path.dirname(__filename);
     const mcpServerPath = path.join(__dirname, "..", "mcp", "coordination-server.js");
 
-    this.codex = new CodexReviewer(options.project, orchestratorDir, mcpServerPath, this.logger);
+    this.codex = new CodexReviewer(
+      options.project,
+      orchestratorDir,
+      mcpServerPath,
+      this.logger,
+      options.modelConfig, // CR-3: thread model through to codex exec --model
+    );
     this.planner = new Planner(
       options.project,
       this.logger,
@@ -793,7 +800,7 @@ export class Orchestrator {
     const conductorDir = path.resolve(getOrchestratorDir(this.options.project));
 
     const configDir = path.join(this.options.project, ".codex");
-    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
+    await mkdirSecure(configDir, { recursive: true }); // H-2
 
     // M-19: Include agents.job_max_runtime_seconds for belt-and-suspenders timeout
     const toml = [
@@ -1148,7 +1155,10 @@ export class Orchestrator {
           // Guard against empty investigator response
           if (!responseText || responseText.trim().length === 0) {
             this.logger.warn("Investigator agent produced empty response. Writing fallback.");
-            responseText = "The plan has been updated to address all feedback. Please re-review the plan file directly for the latest changes.";
+            // H-17: honest fallback — the investigator produced nothing, so
+            // the plan was NOT modified. Previous text ("has been updated")
+            // misled Codex into approving unchanged plans.
+            responseText = "The investigator was unable to produce a response. The plan was not modified. Please re-review based on the original plan and maintain prior findings if they still apply.";
           }
 
           // Save the response
@@ -1788,7 +1798,10 @@ export class Orchestrator {
       // Guard against empty reviewer response
       if (!responseText || responseText.trim().length === 0) {
         this.logger.warn("Code review investigator produced empty response. Writing fallback.");
-        responseText = "All code review feedback has been addressed. Please re-review the changed files directly for the latest state.";
+        // H-17: honest fallback — the investigator produced nothing, so no
+        // code was modified. Previous text ("has been addressed") misled
+        // Codex into approving unchanged code.
+        responseText = "The code-review investigator was unable to produce a response. No code changes were applied. Please re-review based on the current state of the changed files and maintain prior findings if they still apply.";
       }
 
       await fs.writeFile(responsePath, responseText, { encoding: "utf-8", mode: 0o600 });

@@ -301,6 +301,52 @@ export const FLOW_TRACING_READ_ONLY_TOOLS = [
 ];
 
 // ============================================================
+// Read-only worker enforcement (CR-1)
+// ============================================================
+
+/**
+ * Tools that MUST NOT be available to read-only workers (sentinel, flow-tracer,
+ * planner question-gen, prompt-compactor, rules-extractor, design-spec
+ * analyzer/updater, conventions-extractor, flow-config-analyzer). Passed to the
+ * SDK via `disallowedTools` to remove these tools from the model's context
+ * entirely — unlike `allowedTools`, which only controls permission-prompt
+ * auto-approval and is ineffective under `permissionMode: "bypassPermissions"`.
+ *
+ * NotebookEdit is the .ipynb write tool. Task spawns subagents which can
+ * themselves have write tools, so it is also excluded.
+ *
+ * Note: `Bash` is NOT in this list — read-only workers need Bash for `git diff`,
+ * `rg`, `find`, etc. A residual write-via-shell risk remains at 7 Bash-present
+ * callsites; see .claude/specs/v0.7.2-critical-fixes.md for the enumeration.
+ */
+export const READ_ONLY_DISALLOWED_TOOLS = [
+  "Write",
+  "Edit",
+  "NotebookEdit",
+  "Task",
+];
+
+// ============================================================
+// CodexReviewer prompt size guards (CR-2)
+// ============================================================
+
+/** Per-file cap: 100K UTF-16 code units. Large enough for most files but
+ *  prevents one giant file from dominating the prompt. */
+export const MAX_CODEX_PROMPT_FILE_CHARS = 100_000;
+
+/** Aggregate file-content cap: 2 million UTF-16 code units (~2-4MB).
+ *  Applies only to the concatenated file chunks appended to the prompt —
+ *  NOT the base prompt prefix or summary marker (typical overhead <5KB).
+ *  Bounds Node heap pressure and Codex token cost. Prompt is delivered via
+ *  stdin (not argv), so OS ARG_MAX is not a factor. */
+export const MAX_CODEX_PROMPT_AGGREGATE_CHARS = 2_000_000;
+
+/** spawn stdout byte cap — parity with the 10MB execFile maxBuffer the
+ *  previous implementation used. On overflow, child is killed and
+ *  CodexExecutionError("output_too_large") is thrown. */
+export const MAX_CODEX_STDOUT_BYTES = 10 * 1024 * 1024;
+
+// ============================================================
 // Git
 // ============================================================
 
