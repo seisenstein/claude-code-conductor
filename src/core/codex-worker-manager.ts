@@ -86,7 +86,11 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     this.workerContext = context;
   }
 
-  async spawnWorker(sessionId: string): Promise<void> {
+  // taskTypeHint accepted for interface conformance with WorkerManager.
+  // Codex backend currently uses a single tier across all task types — the
+  // hint is recorded for future per-role Codex model selection.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async spawnWorker(sessionId: string, _taskTypeHint?: import("../utils/types.js").TaskType | null): Promise<void> {
     if (this.activeWorkers.has(sessionId)) {
       this.logger.warn(`Worker ${sessionId} is already active; skipping spawn`);
       return;

@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { ProjectConventions } from "./types.js";
-import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS } from "./constants.js";
+import type { ProjectConventions, RoleModelSpec } from "./types.js";
+import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS, DEFAULT_ROLE_CONFIG } from "./constants.js";
+import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
 
@@ -99,9 +100,18 @@ function tryFixJson(text: string): string {
  * Results are cached to .conductor/conventions.json.
  * If cached and less than 1 hour old, returns cached version.
  */
-export async function extractConventions(projectDir: string, model?: string, logger?: Logger): Promise<ProjectConventions> {
+export async function extractConventions(
+  projectDir: string,
+  spec?: RoleModelSpec | string,
+  logger?: Logger,
+): Promise<ProjectConventions> {
   const conventionsPath = getConventionsPath(projectDir);
   const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
+
+  // Resolve model + effort from spec (RoleModelSpec preferred, bare string for legacy callers)
+  const sdkArgs = typeof spec === "string"
+    ? { model: spec, effort: DEFAULT_ROLE_CONFIG.conventions_extractor.effort }
+    : specToSdkArgs(spec ?? DEFAULT_ROLE_CONFIG.conventions_extractor);
 
   // Check cache (< 1 hour old)
   try {
@@ -116,14 +126,19 @@ export async function extractConventions(projectDir: string, model?: string, log
   }
 
   // Spawn read-only agent to extract conventions
-  // Note: resultText initialization to "" is not needed since it's always reassigned in try block
-  // or function returns early in catch. ESLint flags this as useless assignment.
   let resultText = "";
 
   try {
     resultText = await queryWithTimeout(
       EXTRACTION_PROMPT,
-      { allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, settingSources: ["project"] },
+      {
+        allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
+        cwd: projectDir,
+        maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS,
+        model: sdkArgs.model,
+        effort: sdkArgs.effort,
+        settingSources: ["project"],
+      },
       5 * 60 * 1000, // 5 min
       "conventions-extraction",
       logger,

@@ -10,10 +10,13 @@ import {
   getRulesPath,
   getRecommendedConfigsDir,
   getLogsDir,
+  getModelsConfigPath,
+  DEFAULT_ROLE_CONFIG,
 } from "../utils/constants.js";
-import { detectProjectWithCache } from "./project-detector.js";
+import { detectProjectWithCache, cacheProfile } from "./project-detector.js";
 import { analyzeDesignSystem } from "../utils/design-spec-analyzer.js";
 import { generateFlowConfig } from "../utils/flow-config-generator.js";
+import { analyzeFlowConfig } from "../utils/flow-config-analyzer.js";
 import { extractProjectRules } from "../utils/rules-extractor.js";
 import { ensureGitignore } from "../utils/gitignore.js";
 import { Logger } from "../utils/logger.js";
@@ -64,18 +67,91 @@ export async function runInit(
     chalk.green(`  Detected: `) +
       `${profile.languages.join(", ")} | ` +
       `Frameworks: ${profile.frameworks.length > 0 ? profile.frameworks.join(", ") : "none"} | ` +
-      `Tests: ${profile.test_runners.length > 0 ? profile.test_runners.join(", ") : "none"}`,
+      `Tests: ${profile.test_runners.length > 0 ? profile.test_runners.join(", ") : "none"} | ` +
+      `Archetype: ${profile.archetype ?? "unknown"}`,
   );
 
   // 3. Check for frontend
   const hasFrontend = profile.frameworks.some((f) => FRONTEND_FRAMEWORKS.has(f));
   result.hasFrontend = hasFrontend;
 
-  // 4. Generate flow config
+  // 4. Generate seed flow config (template based on archetype + framework),
+  //    then refine it with the LLM-based flow-config-analyzer that inspects
+  //    the actual codebase. The analyzer is non-fatal — if it fails or times
+  //    out, we ship the seed and warn.
+  //
+  //    Important: the analyzer caches its output to .conductor/flow-config.json
+  //    as a side-effect, so we must capture pre-existence BEFORE invoking it
+  //    (mirrors the design-spec-analyzer pattern at line ~108) to decide
+  //    whether the user already had a hand-edited flow-config we should
+  //    route to recommended-configs/ instead of overwriting.
   console.log(chalk.cyan("  Generating flow configuration..."));
-  const flowConfig = generateFlowConfig(profile);
+  const seedFlowConfig = generateFlowConfig(profile);
   const flowConfigPath = getFlowConfigPath(projectDir);
-  await writeConfigFile(flowConfigPath, JSON.stringify(flowConfig, null, 2), options.force, result, projectDir);
+  const flowConfigExistedBeforeAnalysis = await fileExists(flowConfigPath);
+
+  console.log(chalk.cyan("  Refining flow configuration with codebase analysis..."));
+  // skipCache: true means the analyzer doesn't touch flow-config.json on
+  // disk. We handle the existing-file-safe write below, so a user's
+  // hand-edited config never gets clobbered.
+  const flowAnalysis = await analyzeFlowConfig(
+    projectDir,
+    seedFlowConfig,
+    profile,
+    options.model,
+    logger,
+    { skipCache: true },
+  );
+  const flowConfig = flowAnalysis.flowConfig;
+  if (flowAnalysis.analyzed) {
+    console.log(
+      chalk.green(
+        `  Flow config tailored: ${flowConfig.layers.length} layers, ` +
+          `${flowConfig.actor_types.length} actor type(s), ` +
+          `${flowConfig.example_flows.length} example flow(s)`,
+      ),
+    );
+  } else {
+    console.log(chalk.yellow("  Flow analyzer fell back to seed template — see warnings above."));
+  }
+  // If the analyzer suggested a different archetype than the heuristic, persist it.
+  if (flowAnalysis.refinedArchetype && flowAnalysis.refinedArchetype !== profile.archetype) {
+    console.log(
+      chalk.cyan(
+        `  Archetype refined: ${profile.archetype ?? "unknown"} → ${flowAnalysis.refinedArchetype}`,
+      ),
+    );
+    profile.archetype = flowAnalysis.refinedArchetype;
+    result.projectProfile = profile;
+    await cacheProfile(projectDir, profile);
+  }
+
+  // Persist via the existing-file-safe writer. Analyzer ran with skipCache,
+  // so the on-disk file is untouched at this point — writeConfigFile sees
+  // the true pre-state and routes correctly.
+  void flowConfigExistedBeforeAnalysis; // (kept for explicit log clarity)
+  await writeConfigFile(
+    flowConfigPath,
+    JSON.stringify(flowConfig, null, 2),
+    options.force,
+    result,
+    projectDir,
+  );
+
+  // 4b. Write per-role model + effort defaults (.conductor/models.json).
+  //     Materializes DEFAULT_ROLE_CONFIG so users have a starting point they
+  //     can edit to tune cost/latency/quality per role.
+  const modelsConfigPath = getModelsConfigPath(projectDir);
+  const modelsConfigContent = JSON.stringify(
+    {
+      $schema: "https://raw.githubusercontent.com/anthropics/claude-code-conductor/main/schemas/models-config.schema.json",
+      $comment: "Per-role model + effort overrides. Tiers: opus-4-7 | opus-4-6 | sonnet-4-6 | haiku-4-5 (legacy: opus/sonnet/haiku). Efforts: low | medium | high | xhigh | max.",
+      roles: DEFAULT_ROLE_CONFIG,
+    },
+    null,
+    2,
+  );
+  await writeConfigFile(modelsConfigPath, modelsConfigContent, options.force, result, projectDir);
 
   // 5. Extract rules from project guidance files (CLAUDE.md, .claude/rules/, etc.)
   console.log(chalk.cyan("  Extracting worker rules from project guidance..."));

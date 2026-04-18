@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "path";
-import type { ClaudeModelTier, TaskType } from "./types.js";
+import type { AgentRole, ClaudeModelTier, RoleModelSpec, TaskType } from "./types.js";
 
 // ============================================================
 // Directory & File Names
@@ -32,6 +32,7 @@ export const ESCALATION_FILE = "escalation.json";
 export const PAUSE_SIGNAL_FILE = "pause.signal";
 export const CLI_LOCK_FILE = "conductor.lock"; // Process lock file (#10)
 export const TASKS_DRAFT_FILE = "tasks-draft.json"; // Planner writes task definitions here (#4)
+export const MODELS_CONFIG_FILE = "models.json"; // Per-role model + effort overrides (v0.7.0)
 
 // ============================================================
 // Default Configuration
@@ -57,6 +58,8 @@ export const DESIGN_SPEC_ANALYZER_MAX_TURNS = 30;
 export const DESIGN_SPEC_ANALYZER_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
 export const DESIGN_SPEC_UPDATER_MAX_TURNS = 15;
 export const DESIGN_SPEC_UPDATER_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
+export const FLOW_CONFIG_ANALYZER_MAX_TURNS = 25;
+export const FLOW_CONFIG_ANALYZER_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
 export const INCREMENTAL_REVIEW_MAX_TURNS = 15;
 export const MAX_SEMGREP_RETRIES = 2;
 
@@ -81,14 +84,24 @@ export const USAGE_API_429_BACKOFF_MS = 60 * 60 * 1000; // 60 min — on 429, ba
 // Codex Worker Parity Configuration
 // ============================================================
 
-/** Model maps for API accounts (tiered) vs ChatGPT accounts (limited selection). */
+/** Model maps for API accounts (tiered) vs ChatGPT accounts (limited selection).
+ *  Both legacy aliases (opus/sonnet/haiku) and explicit tiers (opus-4-7, etc.)
+ *  must map to a Codex model since either can show up in `ModelConfig`. */
 const CODEX_MODEL_MAP_API: Record<ClaudeModelTier, string> = {
+  "opus-4-7": "gpt-5.3-codex-high",
+  "opus-4-6": "gpt-5.3-codex-high",
+  "sonnet-4-6": "gpt-5.3-codex-medium",
+  "haiku-4-5": "gpt-5.3-codex-low",
   opus: "gpt-5.3-codex-high",
   sonnet: "gpt-5.3-codex-medium",
   haiku: "gpt-5.3-codex-low",
 };
 
 const CODEX_MODEL_MAP_CHATGPT: Record<ClaudeModelTier, string> = {
+  "opus-4-7": "gpt-5.3-codex",
+  "opus-4-6": "gpt-5.3-codex",
+  "sonnet-4-6": "gpt-5.3-codex",
+  "haiku-4-5": "codex-mini-latest",
   opus: "gpt-5.3-codex",
   sonnet: "gpt-5.3-codex",
   haiku: "codex-mini-latest",
@@ -410,6 +423,52 @@ export function getCliLockPath(projectDir: string): string {
 export function getTasksDraftPath(projectDir: string): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, TASKS_DRAFT_FILE);
 }
+
+export function getModelsConfigPath(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, MODELS_CONFIG_FILE);
+}
+
+// ============================================================
+// Per-Role Model + Effort Defaults (v0.7.0)
+// ============================================================
+
+/**
+ * Default model + effort per agent role.
+ *
+ * Rationale:
+ *   - planner / sentinel / worker_security on Opus 4.7 xhigh
+ *     (4.7's reasoning step-change matters most for planning + cyber-sec review).
+ *   - frontend_ui on Opus 4.7 high (4.7 is materially better at frontend work).
+ *   - All other workers on Opus 4.6 high — 4.7 has shown a tendency to leave
+ *     stub code with TODO comments on backend/infra work, which is unacceptable.
+ *   - Read-only analyzers on Sonnet 4.6 medium — preserves prior behavior
+ *     (these were `subagent` tier = sonnet pre-0.7.0). Medium effort because
+ *     the work is mechanical extraction, not reasoning-heavy.
+ *
+ * Users override via .conductor/models.json or per-role CLI flags.
+ */
+export const DEFAULT_ROLE_CONFIG: Record<AgentRole, RoleModelSpec> = {
+  planner: { tier: "opus-4-7", effort: "xhigh" },
+  worker_security: { tier: "opus-4-7", effort: "xhigh" },
+  sentinel: { tier: "opus-4-7", effort: "xhigh" },
+  worker_frontend_ui: { tier: "opus-4-7", effort: "high" },
+  worker_backend_api: { tier: "opus-4-6", effort: "high" },
+  worker_database: { tier: "opus-4-6", effort: "high" },
+  worker_infrastructure: { tier: "opus-4-6", effort: "high" },
+  worker_integration: { tier: "opus-4-6", effort: "high" },
+  worker_testing: { tier: "opus-4-6", effort: "high" },
+  worker_reverse_engineering: { tier: "opus-4-6", effort: "high" },
+  worker_general: { tier: "opus-4-6", effort: "high" },
+  flow_tracer: { tier: "sonnet-4-6", effort: "medium" },
+  flow_config_analyzer: { tier: "sonnet-4-6", effort: "medium" },
+  conventions_extractor: { tier: "sonnet-4-6", effort: "medium" },
+  rules_extractor: { tier: "sonnet-4-6", effort: "medium" },
+  design_spec_analyzer: { tier: "sonnet-4-6", effort: "medium" },
+  design_spec_updater: { tier: "sonnet-4-6", effort: "medium" },
+};
+
+/** All AgentRole values (handy for iteration). Kept in sync with DEFAULT_ROLE_CONFIG. */
+export const ALL_AGENT_ROLES: AgentRole[] = Object.keys(DEFAULT_ROLE_CONFIG) as AgentRole[];
 
 // ============================================================
 // V2 Path Helpers

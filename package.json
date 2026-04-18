@@ -1,6 +1,6 @@
 {
   "name": "claude-code-conductor",
-  "version": "0.6.0",
+  "version": "0.7.1",
   "description": "Hierarchical multi-agent orchestration for Claude Code -- plans, delegates to parallel workers, reviews with Codex, and traces user flows across code boundaries",
   "type": "module",
   "bin": {
@@ -14,7 +14,8 @@
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "setup": "node dist/setup.js",
-    "postbuild": "node dist/setup.js --quiet 2>/dev/null || true"
+    "postbuild": "node dist/setup.js --quiet 2>/dev/null || true",
+    "postinstall": "node dist/setup.js --quiet 2>/dev/null || true"
   },
   "keywords": [
     "claude",
@@ -37,14 +38,14 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.1.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.113",
     "@anthropic-ai/sdk": "^0.52.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "chalk": "^5.3.0",
     "commander": "^12.0.0",
     "proper-lockfile": "^4.1.2",
     "simple-git": "^3.22.0",
-    "zod": "^3.22.0"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { DesignSpec, ComponentInfo, VariantExample, SharedPrimitive } from "./types.js";
+import type { DesignSpec, ComponentInfo, VariantExample, SharedPrimitive, RoleModelSpec } from "./types.js";
 import {
   getDesignSpecPath,
   DESIGN_SPEC_ANALYZER_MAX_TURNS,
   DESIGN_SPEC_ANALYZER_TIMEOUT_MS,
+  DEFAULT_ROLE_CONFIG,
 } from "./constants.js";
+import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
 
@@ -132,11 +134,15 @@ function tryFixJson(text: string): string {
  */
 export async function analyzeDesignSystem(
   projectDir: string,
-  model?: string,
+  modelSpec?: RoleModelSpec | string,
   logger?: Logger,
 ): Promise<DesignSpec | null> {
   const specPath = getDesignSpecPath(projectDir);
   const warn = (msg: string) => (logger ? logger.warn(msg) : process.stderr.write(msg + "\n"));
+
+  const sdkArgs = typeof modelSpec === "string"
+    ? { model: modelSpec, effort: DEFAULT_ROLE_CONFIG.design_spec_analyzer.effort }
+    : specToSdkArgs(modelSpec ?? DEFAULT_ROLE_CONFIG.design_spec_analyzer);
 
   // Check cache (< 1 hour old)
   try {
@@ -158,7 +164,8 @@ export async function analyzeDesignSystem(
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
         cwd: projectDir,
         maxTurns: DESIGN_SPEC_ANALYZER_MAX_TURNS,
-        model,
+        model: sdkArgs.model,
+        effort: sdkArgs.effort,
         settingSources: ["project"],
       },
       DESIGN_SPEC_ANALYZER_TIMEOUT_MS,

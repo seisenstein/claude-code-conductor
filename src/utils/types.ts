@@ -290,40 +290,118 @@ export interface ThreatModel {
 
 /**
  * Supported Claude model tiers.
- * These map to model IDs:
- *   - opus:   claude-opus-4-6
- *   - sonnet: claude-sonnet-4-6
- *   - haiku:  claude-haiku-4-5-20251001
+ *
+ * Explicit tiers (preferred) and legacy aliases (kept for backwards compat
+ * with the pre-0.7.0 `--worker-model opus|sonnet|haiku` flags and existing
+ * state.json / models.json files).
+ *
+ *   - opus-4-7:   claude-opus-4-7              (Jan 2026, adaptive thinking only)
+ *   - opus-4-6:   claude-opus-4-6              (still supports /fast)
+ *   - sonnet-4-6: claude-sonnet-4-6
+ *   - haiku-4-5:  claude-haiku-4-5-20251001
+ *   - opus  -> opus-4-6   (legacy alias; safe default for existing users)
+ *   - sonnet-> sonnet-4-6 (legacy alias)
+ *   - haiku -> haiku-4-5  (legacy alias)
  */
-export type ClaudeModelTier = "opus" | "sonnet" | "haiku";
+export type ClaudeModelTier =
+  | "opus-4-7"
+  | "opus-4-6"
+  | "sonnet-4-6"
+  | "haiku-4-5"
+  | "opus"
+  | "sonnet"
+  | "haiku";
+
+/**
+ * Reasoning-effort levels that the Claude Agent SDK accepts on its `effort`
+ * option (adaptive thinking guidance). `xhigh` is Opus 4.7 only; `max` is
+ * Opus 4.6, Opus 4.7, and Sonnet 4.6.
+ */
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * Distinct agent spawn points in the conductor. Used to look up a per-role
+ * model + effort spec from `ModelConfig.roles` and `DEFAULT_ROLE_CONFIG`.
+ *
+ * Worker roles are keyed off `Task.task_type` (the persona system) so the
+ * orchestrator can pick a different model for, e.g., frontend vs. backend
+ * work in the same run.
+ */
+export type AgentRole =
+  | "planner"
+  | "worker_backend_api"
+  | "worker_frontend_ui"
+  | "worker_database"
+  | "worker_security"
+  | "worker_testing"
+  | "worker_infrastructure"
+  | "worker_reverse_engineering"
+  | "worker_integration"
+  | "worker_general"
+  | "sentinel"
+  | "flow_tracer"
+  | "flow_config_analyzer"
+  | "conventions_extractor"
+  | "rules_extractor"
+  | "design_spec_analyzer"
+  | "design_spec_updater";
+
+/** A model + effort selection for a single agent role. */
+export interface RoleModelSpec {
+  tier: ClaudeModelTier;
+  effort?: EffortLevel;
+}
 
 /**
  * Model configuration for the conductor.
- * Controls which Claude model is used at each layer of the system.
+ *
+ * The legacy two-tier shape (`worker` + `subagent`) is preserved so existing
+ * CLI flags and state.json files keep working. Per-role overrides go in
+ * `roles`; resolution precedence (highest to lowest):
+ *
+ *   1. `ModelConfig.roles[role]`
+ *   2. Legacy `worker` (for execution-worker roles) or `subagent` (for
+ *      sentinel + read-only analyzers) — applied only if the user supplied
+ *      these via legacy flags
+ *   3. `DEFAULT_ROLE_CONFIG[role]` from constants.ts
  */
 export interface ModelConfig {
-  /** Model used for execution workers and internal agents (planner, conventions, flow tracing) */
+  /** Legacy: model used for execution workers when no per-role override applies. */
   worker: ClaudeModelTier;
-  /** Model used for subagents spawned by workers (via the Agent/Task tool) */
+  /** Legacy: model used for sentinel + read-only analyzers when no per-role override applies. */
   subagent: ClaudeModelTier;
   /**
    * Whether to use the extended 1M token context window.
-   * - Opus 4.6: 1M is included at no extra cost (this flag is ignored; always enabled).
+   * - Opus 4.6 / 4.7: 1M is included at no extra cost (this flag is ignored; always enabled).
    * - Sonnet 4.6: 1M is billed as extra usage (opt-in).
    * - Haiku: not supported.
    */
   extendedContext: boolean;
+  /** Per-role model + effort overrides. Loaded from `.conductor/models.json` or CLI flags. */
+  roles?: Partial<Record<AgentRole, RoleModelSpec>>;
 }
 
-/** Map from model tier to full model ID */
+/**
+ * Map from model tier to full Claude API model ID.
+ *
+ * Legacy aliases (`opus` / `sonnet` / `haiku`) intentionally resolve to the
+ * SAME model IDs they did in 0.6.x — that is, `opus -> claude-opus-4-6`, NOT
+ * `claude-opus-4-7`. Users who want 4.7 must opt in explicitly via the new
+ * `opus-4-7` tier or the per-role config.
+ */
 export const MODEL_TIER_TO_ID: Record<ClaudeModelTier, string> = {
+  "opus-4-7": "claude-opus-4-7",
+  "opus-4-6": "claude-opus-4-6",
+  "sonnet-4-6": "claude-sonnet-4-6",
+  "haiku-4-5": "claude-haiku-4-5-20251001",
+  // Legacy aliases — preserve pre-0.7.0 behavior
   opus: "claude-opus-4-6",
   sonnet: "claude-sonnet-4-6",
   haiku: "claude-haiku-4-5-20251001",
 };
 
-/** Default model config: opus for workers, sonnet for subagents.
- *  extendedContext defaults to false but is ignored for opus (always 1M). */
+/** Default model config: legacy two-tier defaults remain the same. Per-role
+ *  defaults live in `DEFAULT_ROLE_CONFIG` (constants.ts). */
 export const DEFAULT_MODEL_CONFIG: ModelConfig = {
   worker: "opus",
   subagent: "sonnet",
@@ -419,7 +497,13 @@ export interface TaskRetryTrackerInterface {
 
 export interface ExecutionWorkerManager {
   setWorkerContext(context: WorkerSharedContext): void;
-  spawnWorker(sessionId: string): Promise<void>;
+  /**
+   * Spawn a new worker session.
+   * `taskTypeHint` (optional) is the most likely task type the worker will
+   * claim — used to pick a per-role model + effort. Workers may still claim
+   * a different task via MCP; the hint just guides initial model selection.
+   */
+  spawnWorker(sessionId: string, taskTypeHint?: TaskType | null): Promise<void>;
   spawnSentinelWorker(): Promise<void>;
   getActiveWorkers(): string[];
   isWorkerActive(sessionId: string): boolean;
@@ -728,6 +812,23 @@ export interface KnownIssue {
 // Project Auto-Detection Types (V2)
 // ============================================================
 
+/**
+ * High-level project archetype, used to pick flow-config seed templates
+ * and to adapt downstream prompts (worker, threat model, etc.) to the
+ * actual shape of the project rather than assuming a web app.
+ *
+ *   - cli:     A command-line tool or developer tool (has `bin` in package.json,
+ *              `src/cli*` entry, argparse/commander/click deps, etc.)
+ *   - web:     A web application (frontend framework detected, or API-only
+ *              backend paired with a browser client)
+ *   - library: A reusable package that exports modules/APIs for other code
+ *              (has `main`/`module`/`exports` / `types`, no bin, no server)
+ *   - service: A long-running backend service without a web frontend
+ *              (express/fastify/hono/nestjs/fastapi/django/flask detected)
+ *   - other:   Anything that doesn't fit the archetypes above
+ */
+export type ProjectArchetype = "cli" | "web" | "library" | "service" | "other";
+
 export interface ProjectProfile {
   detected_at: string;
   languages: ("typescript" | "javascript" | "python")[];
@@ -736,6 +837,8 @@ export interface ProjectProfile {
   linters: string[]; // e.g., 'eslint', 'prettier', 'ruff'
   ci_systems: string[]; // e.g., 'github-actions', 'gitlab-ci'
   package_managers: string[]; // e.g., 'npm', 'yarn', 'pip'
+  /** v0.7.1: high-level shape of the project (CLI / web app / library / service). */
+  archetype?: ProjectArchetype;
 }
 
 // ============================================================

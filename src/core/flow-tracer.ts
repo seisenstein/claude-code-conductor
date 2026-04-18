@@ -9,6 +9,7 @@ import type {
   FlowTracingReport,
   FlowTracingSummary,
   FlowConfig,
+  RoleModelSpec,
 } from "../utils/types.js";
 
 import {
@@ -16,10 +17,12 @@ import {
   FLOW_TRACING_WORKER_MAX_TURNS,
   MAX_FLOW_TRACING_WORKERS,
   FLOW_TRACING_OVERALL_TIMEOUT_MS,
+  DEFAULT_ROLE_CONFIG,
   getFlowTracingDir,
   getFlowTracingReportPath,
   getFlowTracingSummaryPath,
 } from "../utils/constants.js";
+import { specToSdkArgs } from "../utils/models-config.js";
 
 import { getFlowWorkerPrompt } from "../flow-worker-prompt.js";
 import { loadFlowConfig } from "../utils/flow-config.js";
@@ -39,11 +42,20 @@ import { mkdirSecure, writeFileSecure } from "../utils/secure-fs.js";
  * This runs as Phase 3.5 between code review and checkpoint.
  */
 export class FlowTracer {
+  private readonly model: string;
+  private readonly effort: RoleModelSpec["effort"];
+
   constructor(
     private projectDir: string,
     private logger: Logger,
-    private model?: string,
-  ) {}
+    spec?: RoleModelSpec | string,
+  ) {
+    const resolved = typeof spec === "string"
+      ? { model: spec, effort: DEFAULT_ROLE_CONFIG.flow_tracer.effort }
+      : specToSdkArgs(spec ?? DEFAULT_ROLE_CONFIG.flow_tracer);
+    this.model = resolved.model;
+    this.effort = resolved.effort;
+  }
 
   // ----------------------------------------------------------------
   // Main entry point
@@ -250,7 +262,14 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const resultText = await queryWithTimeout(
       prompt,
-      { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 15, model: this.model, settingSources: ["project"] },
+      {
+        allowedTools: ["Read", "Glob", "Grep", "LSP"],
+        cwd: this.projectDir,
+        maxTurns: 15,
+        model: this.model,
+        effort: this.effort,
+        settingSources: ["project"],
+      },
       5 * 60 * 1000, // 5 min
       "flow-extraction",
       this.logger,
@@ -355,7 +374,15 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
     try {
       const resultText = await queryWithTimeout(
         prompt,
-        { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS, model: this.model, settingSources: ["project"], abortController: workerAbort },
+        {
+          allowedTools: FLOW_TRACING_READ_ONLY_TOOLS,
+          cwd: this.projectDir,
+          maxTurns: FLOW_TRACING_WORKER_MAX_TURNS,
+          model: this.model,
+          effort: this.effort,
+          settingSources: ["project"],
+          abortController: workerAbort,
+        },
         10 * 60 * 1000, // 10 min
         `flow-tracing-${flow.id}`,
         this.logger,

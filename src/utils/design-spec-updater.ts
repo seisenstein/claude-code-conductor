@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { DesignSpec, DesignSpecUpdateResult } from "./types.js";
+import type { DesignSpec, DesignSpecUpdateResult, RoleModelSpec } from "./types.js";
 import {
   getDesignSpecPath,
   DESIGN_SPEC_UPDATER_MAX_TURNS,
   DESIGN_SPEC_UPDATER_TIMEOUT_MS,
+  DEFAULT_ROLE_CONFIG,
 } from "./constants.js";
+import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
 
@@ -37,7 +39,7 @@ export async function updateDesignSpec(
   projectDir: string,
   changedFiles: string[],
   currentSpec: DesignSpec,
-  model?: string,
+  modelSpec?: RoleModelSpec | string,
   logger?: Logger,
 ): Promise<DesignSpecUpdateResult> {
   const warn = (msg: string) => (logger ? logger.warn(msg) : process.stderr.write(msg + "\n"));
@@ -52,6 +54,10 @@ export async function updateDesignSpec(
 
   const prompt = buildUpdatePrompt(frontendFiles, currentSpec, primitivePaths);
 
+  const sdkArgs = typeof modelSpec === "string"
+    ? { model: modelSpec, effort: DEFAULT_ROLE_CONFIG.design_spec_updater.effort }
+    : specToSdkArgs(modelSpec ?? DEFAULT_ROLE_CONFIG.design_spec_updater);
+
   let resultText = "";
   try {
     resultText = await queryWithTimeout(
@@ -60,7 +66,8 @@ export async function updateDesignSpec(
         allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
         cwd: projectDir,
         maxTurns: DESIGN_SPEC_UPDATER_MAX_TURNS,
-        model,
+        model: sdkArgs.model,
+        effort: sdkArgs.effort,
         settingSources: ["project"],
       },
       DESIGN_SPEC_UPDATER_TIMEOUT_MS,

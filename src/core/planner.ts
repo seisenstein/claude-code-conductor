@@ -5,9 +5,9 @@ import { stdin as input, stdout as output } from "node:process";
 import { z } from "zod";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 
-import type { PlannerOutput, TaskDefinition, Task, ThreatModel } from "../utils/types.js";
-import { MODEL_TIER_TO_ID, DEFAULT_MODEL_CONFIG } from "../utils/types.js";
-import { getPlanPath, getTasksDraftPath, getTasksDir, getOrchestratorDir, PLANNER_ALLOWED_TOOLS } from "../utils/constants.js";
+import type { PlannerOutput, TaskDefinition, Task, ThreatModel, RoleModelSpec } from "../utils/types.js";
+import { getPlanPath, getTasksDraftPath, getTasksDir, getOrchestratorDir, PLANNER_ALLOWED_TOOLS, DEFAULT_ROLE_CONFIG } from "../utils/constants.js";
+import { specToSdkArgs } from "../utils/models-config.js";
 import type { Logger } from "../utils/logger.js";
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
 import { validateTaskArray } from "../utils/task-validator.js";
@@ -21,13 +21,26 @@ import { compactReplanPrompt } from "../utils/prompt-compactor.js";
 /**
  * Uses the Claude Agent SDK to analyze a codebase and create
  * detailed implementation plans broken into parallelizable tasks.
+ *
+ * Accepts either a `RoleModelSpec` (preferred — carries model + effort) or
+ * a bare model ID string (legacy). When neither is supplied, falls back to
+ * `DEFAULT_ROLE_CONFIG.planner` (Opus 4.7 xhigh).
  */
 export class Planner {
+  private readonly model: string;
+  private readonly effort: RoleModelSpec["effort"];
+
   constructor(
     private projectDir: string,
     private logger: Logger,
-    private model?: string,
-  ) {}
+    spec?: RoleModelSpec | string,
+  ) {
+    const resolved = typeof spec === "string"
+      ? { model: spec, effort: DEFAULT_ROLE_CONFIG.planner.effort }
+      : specToSdkArgs(spec ?? DEFAULT_ROLE_CONFIG.planner);
+    this.model = resolved.model;
+    this.effort = resolved.effort;
+  }
 
   // ----------------------------------------------------------------
   // Public API
@@ -66,7 +79,14 @@ export class Planner {
     // can inspect the codebase to inform its questions.
     let questionsText = await queryWithTimeout(
       questionPrompt,
-      { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 20, model: this.model, settingSources: ["project"] },
+      {
+        allowedTools: ["Read", "Glob", "Grep", "LSP"],
+        cwd: this.projectDir,
+        maxTurns: 20,
+        model: this.model,
+        effort: this.effort,
+        settingSources: ["project"],
+      },
       5 * 60 * 1000, // 5 min
       "question-generation",
       this.logger,
@@ -150,6 +170,7 @@ export class Planner {
           maxTurns: 80,
           mcpServers: { planner: plannerMcp },
           model: this.model,
+          effort: this.effort,
           settingSources: ["project"],
         },
         15 * 60 * 1000, // 15 min
@@ -212,13 +233,12 @@ export class Planner {
       cycleFeedback,
     );
 
-    // Defense-in-depth: progressively compact the prompt if it's too large
-    // H-6 FIX: Use modelConfig default instead of hardcoded model string
-    const replanModel = this.model ?? MODEL_TIER_TO_ID[DEFAULT_MODEL_CONFIG.worker];
+    // Defense-in-depth: progressively compact the prompt if it's too large.
+    // The constructor guarantees `this.model` is always populated.
     const replanPrompt = await compactReplanPrompt(
       rawReplanPrompt,
       this.projectDir,
-      replanModel,
+      this.model,
       this.logger,
     );
 
@@ -234,6 +254,7 @@ export class Planner {
           maxTurns: 80,
           mcpServers: { planner: plannerMcp },
           model: this.model,
+          effort: this.effort,
           settingSources: ["project"],
         },
         15 * 60 * 1000, // 15 min

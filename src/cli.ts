@@ -8,8 +8,10 @@ import { lock, unlock, check } from "proper-lockfile";
 
 import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
-import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig } from "./utils/types.js";
-import { DEFAULT_MODEL_CONFIG, MODEL_TIER_TO_ID, ConductorExitError } from "./utils/types.js";
+import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig, EffortLevel, AgentRole, RoleModelSpec } from "./utils/types.js";
+import { DEFAULT_MODEL_CONFIG, ConductorExitError } from "./utils/types.js";
+import { loadModelsConfig, expandLegacyTiers } from "./utils/models-config.js";
+import { ALL_AGENT_ROLES, DEFAULT_ROLE_CONFIG } from "./utils/constants.js";
 import {
   getStatePath,
   getLogsDir,
@@ -131,21 +133,171 @@ function parseWorkerRuntime(value: string): WorkerRuntime {
   );
 }
 
+const VALID_MODEL_TIERS: ClaudeModelTier[] = [
+  "opus-4-7",
+  "opus-4-6",
+  "sonnet-4-6",
+  "haiku-4-5",
+  "opus",
+  "sonnet",
+  "haiku",
+];
+
 function parseModelTier(value: string): ClaudeModelTier {
-  if (value === "opus" || value === "sonnet" || value === "haiku") {
-    return value;
+  const v = value.trim().toLowerCase();
+  if ((VALID_MODEL_TIERS as string[]).includes(v)) {
+    return v as ClaudeModelTier;
   }
   throw new InvalidArgumentError(
-    `Invalid model tier "${value}". Expected "opus", "sonnet", or "haiku".`,
+    `Invalid model tier "${value}". Expected one of: ${VALID_MODEL_TIERS.join(", ")}.`,
   );
+}
+
+const VALID_EFFORT_LEVELS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+
+function parseEffortLevel(value: string): EffortLevel {
+  const v = value.trim().toLowerCase();
+  if ((VALID_EFFORT_LEVELS as string[]).includes(v)) {
+    return v as EffortLevel;
+  }
+  throw new InvalidArgumentError(
+    `Invalid effort level "${value}". Expected one of: ${VALID_EFFORT_LEVELS.join(", ")}.`,
+  );
+}
+
+// ============================================================
+// Per-role CLI flag resolution
+// ============================================================
+
+/** Role groups that a single --<group>-model flag expands into. */
+const ROLE_GROUPS: Record<string, AgentRole[]> = {
+  planner: ["planner"],
+  security: ["worker_security", "sentinel"],
+  frontend: ["worker_frontend_ui"],
+  backend: ["worker_backend_api", "worker_database", "worker_infrastructure", "worker_integration"],
+  analyzer: ["flow_tracer", "conventions_extractor", "rules_extractor", "design_spec_analyzer", "design_spec_updater"],
+};
+
+/**
+ * A partial role override emitted by CLI flags. Either field may be absent —
+ * unspecified fields are preserved from the underlying base (file config,
+ * legacy expansion, or DEFAULT_ROLE_CONFIG) when the patch is applied.
+ */
+type RoleOverridePatch = { tier?: ClaudeModelTier; effort?: EffortLevel };
+
+/**
+ * Build per-role override patches from CLI flags.
+ *
+ * `--<group>-model X` and `--<group>-effort Y` each emit a patch with only
+ * the field they set — never a full RoleModelSpec — so that effort-only
+ * flags don't accidentally clobber the tier from a lower-precedence layer
+ * (regression Codex caught in the first review).
+ *
+ * `--default-effort` applies to every role whose per-group effort flag is
+ * absent.
+ */
+function collectRoleOverridesFromFlags(
+  opts: Record<string, string | boolean | undefined>,
+): Partial<Record<AgentRole, RoleOverridePatch>> {
+  const patches: Partial<Record<AgentRole, RoleOverridePatch>> = {};
+  const defaultEffort = opts.defaultEffort as EffortLevel | undefined;
+
+  // Track which roles got an explicit per-group effort (so --default-effort
+  // doesn't overwrite per-group choices).
+  const hasExplicitEffort = new Set<AgentRole>();
+
+  for (const [groupKey, roles] of Object.entries(ROLE_GROUPS)) {
+    const tier = opts[`${groupKey}Model`] as ClaudeModelTier | undefined;
+    const effort = opts[`${groupKey}Effort`] as EffortLevel | undefined;
+    if (!tier && !effort) continue;
+    for (const role of roles) {
+      const prev = patches[role] ?? {};
+      patches[role] = {
+        ...prev,
+        ...(tier !== undefined ? { tier } : {}),
+        ...(effort !== undefined ? { effort } : {}),
+      };
+      if (effort !== undefined) hasExplicitEffort.add(role);
+    }
+  }
+
+  // --default-effort: apply to every role lacking an explicit per-group effort.
+  if (defaultEffort !== undefined) {
+    for (const role of ALL_AGENT_ROLES as AgentRole[]) {
+      if (hasExplicitEffort.has(role)) continue;
+      patches[role] = { ...(patches[role] ?? {}), effort: defaultEffort };
+    }
+  }
+
+  return patches;
+}
+
+/**
+ * Apply patches on top of a base role map. Unspecified patch fields fall
+ * through to the base (or to DEFAULT_ROLE_CONFIG when the role isn't in base).
+ */
+function applyRolePatches(
+  base: Partial<Record<AgentRole, RoleModelSpec>>,
+  patches: Partial<Record<AgentRole, RoleOverridePatch>>,
+): Partial<Record<AgentRole, RoleModelSpec>> {
+  const out: Partial<Record<AgentRole, RoleModelSpec>> = { ...base };
+  for (const [role, patch] of Object.entries(patches) as [AgentRole, RoleOverridePatch][]) {
+    const existing = out[role] ?? DEFAULT_ROLE_CONFIG[role];
+    out[role] = {
+      tier: patch.tier ?? existing.tier,
+      effort: patch.effort ?? existing.effort,
+    };
+  }
+  return out;
+}
+
+/**
+ * Compose the final per-role override map for a run. Order (later wins):
+ *   1. saved state roles (resume only — caller passes them in `seedRoles`)
+ *   2. .conductor/models.json file roles
+ *   3. legacy --worker-model / --subagent-model expansions (only when
+ *      `legacyExplicit` is true so we don't auto-expand inherited defaults
+ *      from the interactive prompt)
+ *   4. per-group CLI flag patches (handled as patches so effort-only flags
+ *      preserve the underlying tier)
+ */
+async function composeRoleConfig(
+  projectDir: string,
+  opts: Record<string, string | boolean | undefined>,
+  legacy: { workerTier?: ClaudeModelTier; subagentTier?: ClaudeModelTier; explicit: boolean },
+  seedRoles?: Partial<Record<AgentRole, RoleModelSpec>>,
+): Promise<{ roles?: Partial<Record<AgentRole, RoleModelSpec>>; warnings: string[] }> {
+  const fileResult = await loadModelsConfig(projectDir);
+  let merged: Partial<Record<AgentRole, RoleModelSpec>> = { ...(seedRoles ?? {}) };
+  if (fileResult.roles) {
+    merged = { ...merged, ...fileResult.roles };
+  }
+  if (legacy.explicit) {
+    const legacyExpanded = expandLegacyTiers(legacy.workerTier, legacy.subagentTier);
+    merged = { ...merged, ...legacyExpanded };
+  }
+  const patches = collectRoleOverridesFromFlags(opts);
+  merged = applyRolePatches(merged, patches);
+  return {
+    roles: Object.keys(merged).length > 0 ? merged : undefined,
+    warnings: fileResult.warnings,
+  };
 }
 
 /**
  * Interactive model selection prompt.
- * Only runs when no CLI model flags are provided and no context file is given
- * (i.e., interactive mode).
+ *
+ * Default flow (just press enter): use the per-role defaults from
+ * `DEFAULT_ROLE_CONFIG` — Opus 4.7 xhigh for planner/security, Opus 4.7 high
+ * for frontend, Opus 4.6 high for other workers, Sonnet 4.6 medium for
+ * read-only analyzers. The returned `legacyExplicit` flag is `false`, which
+ * tells the caller NOT to expand `worker`/`subagent` into per-role overrides.
+ *
+ * Legacy two-tier mode is opt-in: if the user answers "y" to the legacy
+ * question, we ask for `worker`/`subagent` tiers and the returned
+ * `legacyExplicit` is `true`, which tells the caller to expand them.
  */
-async function promptModelSelection(): Promise<ModelConfig> {
+async function promptModelSelection(): Promise<{ config: ModelConfig; legacyExplicit: boolean }> {
   const readline = await import("node:readline/promises");
   const { stdin: input, stdout: output } = await import("node:process");
   const rl = readline.createInterface({ input, output });
@@ -155,37 +307,58 @@ async function promptModelSelection(): Promise<ModelConfig> {
     console.log(chalk.bold.cyan("  MODEL CONFIGURATION"));
     console.log(chalk.bold.cyan("  " + "-".repeat(40)));
     console.log("");
-    console.log(chalk.white("  Available models:"));
-    console.log(chalk.white("    1) opus   - Claude Opus 4.6   (most capable, highest cost)"));
-    console.log(chalk.white("    2) sonnet - Claude Sonnet 4.6 (balanced capability/cost)"));
-    console.log(chalk.white("    3) haiku  - Claude Haiku 4.5  (fastest, lowest cost)"));
+    console.log(chalk.white("  Per-role defaults will be used (recommended):"));
+    console.log(chalk.gray("    planner / security / sentinel    → opus-4-7 xhigh"));
+    console.log(chalk.gray("    frontend_ui                       → opus-4-7 high"));
+    console.log(chalk.gray("    backend / database / infra / etc. → opus-4-6 high"));
+    console.log(chalk.gray("    read-only analyzers               → sonnet-4-6 medium"));
+    console.log(chalk.gray("    (edit .conductor/models.json or pass --<group>-model flags to override)"));
     console.log("");
 
-    // Worker model
-    const workerAnswer = await rl.question(
-      chalk.yellow("  Worker model [opus/sonnet/haiku] (default: opus): "),
+    const legacyAnswer = await rl.question(
+      chalk.yellow("  Use legacy two-tier mode (single tier for all workers)? [y/N]: "),
     );
-    const workerModel: ClaudeModelTier = (["opus", "sonnet", "haiku"] as const).includes(
-      workerAnswer.trim().toLowerCase() as ClaudeModelTier,
-    )
-      ? (workerAnswer.trim().toLowerCase() as ClaudeModelTier)
+    const wantsLegacy = ["y", "yes"].includes(legacyAnswer.trim().toLowerCase());
+
+    if (!wantsLegacy) {
+      // Per-role default path: return DEFAULT_MODEL_CONFIG with legacyExplicit=false.
+      // The caller will NOT expand worker/subagent into roles, so per-role defaults win.
+      console.log("");
+      console.log(chalk.green("  Using per-role defaults."));
+      console.log("");
+      return { config: { ...DEFAULT_MODEL_CONFIG }, legacyExplicit: false };
+    }
+
+    console.log("");
+    console.log(chalk.white("  Available tiers: opus-4-7 / opus-4-6 / sonnet-4-6 / haiku-4-5"));
+    console.log(chalk.white("  Aliases: opus → opus-4-6, sonnet → sonnet-4-6, haiku → haiku-4-5"));
+    console.log("");
+
+    const workerAnswer = await rl.question(
+      chalk.yellow("  Worker tier (default: opus-4-6): "),
+    );
+    const workerInput = workerAnswer.trim().toLowerCase();
+    const workerModel: ClaudeModelTier = (VALID_MODEL_TIERS as string[]).includes(workerInput)
+      ? (workerInput as ClaudeModelTier)
       : "opus";
 
-    // Subagent model
+    const subagentDefault: ClaudeModelTier =
+      workerModel === "opus" || workerModel === "opus-4-6" || workerModel === "opus-4-7"
+        ? "sonnet"
+        : workerModel;
     const subagentAnswer = await rl.question(
-      chalk.yellow(`  Subagent model [opus/sonnet/haiku] (default: ${workerModel === "opus" ? "sonnet" : workerModel}): `),
+      chalk.yellow(`  Subagent tier (default: ${subagentDefault}): `),
     );
-    const subagentDefault: ClaudeModelTier = workerModel === "opus" ? "sonnet" : workerModel;
-    const subagentModel: ClaudeModelTier = (["opus", "sonnet", "haiku"] as const).includes(
-      subagentAnswer.trim().toLowerCase() as ClaudeModelTier,
-    )
-      ? (subagentAnswer.trim().toLowerCase() as ClaudeModelTier)
+    const subagentInput = subagentAnswer.trim().toLowerCase();
+    const subagentModel: ClaudeModelTier = (VALID_MODEL_TIERS as string[]).includes(subagentInput)
+      ? (subagentInput as ClaudeModelTier)
       : subagentDefault;
 
-    // Extended context: Opus 4.6 always gets 1M at no extra cost.
+    // Extended context: Opus (4.6 / 4.7) always gets 1M at no extra cost.
     // Only ask for Sonnet workers since 1M is billed as extra usage.
+    // Match both the legacy alias `sonnet` and the explicit tier `sonnet-4-6`.
     let extendedContext = false;
-    if (workerModel === "sonnet") {
+    if (workerModel === "sonnet" || workerModel === "sonnet-4-6") {
       const extAnswer = await rl.question(
         chalk.yellow("  Use extended 1M token context window? (billed as extra usage) [y/N]: "),
       );
@@ -193,18 +366,19 @@ async function promptModelSelection(): Promise<ModelConfig> {
     }
 
     const config: ModelConfig = { worker: workerModel, subagent: subagentModel, extendedContext };
+    const { MODEL_TIER_TO_ID } = await import("./utils/types.js");
 
     console.log("");
     console.log(chalk.green(`  Workers:   ${config.worker} (${MODEL_TIER_TO_ID[config.worker]})`));
     console.log(chalk.green(`  Subagents: ${config.subagent} (${MODEL_TIER_TO_ID[config.subagent]})`));
-    if (config.worker === "opus") {
+    if (config.worker === "opus" || config.worker === "opus-4-6" || config.worker === "opus-4-7") {
       console.log(chalk.green("  Context:   1M tokens (included)"));
     } else if (config.extendedContext) {
       console.log(chalk.green("  Context:   1M tokens (extra usage)"));
     }
     console.log("");
 
-    return config;
+    return { config, legacyExplicit: true };
   } finally {
     rl.close();
   }
@@ -363,7 +537,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.6.0");
+  .version("0.7.1");
 
 // ============================================================
 // init command
@@ -423,9 +597,20 @@ program
   .option("--current-branch", "Work on the current branch instead of creating conduct/<slug>", false)
   .option("--context-file <path>", "Path to pre-gathered context file (skips interactive Q&A)")
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime, "claude")
-  .option("--worker-model <tier>", "Claude model for workers: opus, sonnet, or haiku", parseModelTier)
-  .option("--subagent-model <tier>", "Claude model for subagents: opus, sonnet, or haiku", parseModelTier)
+  .option("--worker-model <tier>", "Legacy: model tier for execution workers (opus/sonnet/haiku/opus-4-7/opus-4-6/sonnet-4-6/haiku-4-5). Prefer per-role flags below.", parseModelTier)
+  .option("--subagent-model <tier>", "Legacy: model tier for sentinel + read-only analyzers.", parseModelTier)
   .option("--extended-context", "Use 1M token context for sonnet workers (billed as extra usage; opus always has 1M included)", false)
+  .option("--planner-model <tier>", "Model for the planner role.", parseModelTier)
+  .option("--planner-effort <level>", "Effort level for the planner.", parseEffortLevel)
+  .option("--security-model <tier>", "Model for security worker + sentinel.", parseModelTier)
+  .option("--security-effort <level>", "Effort level for security + sentinel.", parseEffortLevel)
+  .option("--frontend-model <tier>", "Model for frontend_ui workers.", parseModelTier)
+  .option("--frontend-effort <level>", "Effort level for frontend workers.", parseEffortLevel)
+  .option("--backend-model <tier>", "Model for backend-class workers (backend_api, database, infrastructure, integration).", parseModelTier)
+  .option("--backend-effort <level>", "Effort level for backend workers.", parseEffortLevel)
+  .option("--analyzer-model <tier>", "Model for read-only analyzer agents (flow tracer, conventions, rules, design-spec).", parseModelTier)
+  .option("--analyzer-effort <level>", "Effort level for analyzer agents.", parseEffortLevel)
+  .option("--default-effort <level>", "Effort level applied to roles without a group flag.", parseEffortLevel)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
@@ -444,33 +629,58 @@ program
       throw new InvalidArgumentError(err instanceof Error ? err.message : String(err));
     }
 
-    // Resolve model configuration: CLI flags > interactive prompt > defaults
+    // Resolve legacy two-tier configuration: CLI flags > interactive prompt > defaults.
+    // `legacyExplicit` is the source-of-truth for "should we expand worker/subagent
+    // into per-role overrides?". CLI flags always count as explicit; the interactive
+    // prompt sets it true only when the user opts into legacy two-tier mode; pure
+    // defaults stay legacyExplicit=false so per-role defaults win.
     let modelConfig: ModelConfig;
-    const hasModelFlags = opts.workerModel || opts.subagentModel || opts.extendedContext;
+    let legacyExplicit = false;
+    const hasLegacyFlags = Boolean(opts.workerModel || opts.subagentModel || opts.extendedContext);
 
-    if (hasModelFlags) {
-      // Use CLI flags (fill in defaults for unspecified values)
+    if (hasLegacyFlags) {
       modelConfig = {
         worker: (opts.workerModel as ClaudeModelTier) ?? DEFAULT_MODEL_CONFIG.worker,
         subagent: (opts.subagentModel as ClaudeModelTier) ?? DEFAULT_MODEL_CONFIG.subagent,
         extendedContext: Boolean(opts.extendedContext),
       };
+      legacyExplicit = Boolean(opts.workerModel || opts.subagentModel);
     } else if (!opts.contextFile) {
-      // Interactive mode: prompt user
-      modelConfig = await promptModelSelection();
+      const prompted = await promptModelSelection();
+      modelConfig = prompted.config;
+      legacyExplicit = prompted.legacyExplicit;
     } else {
-      // Non-interactive mode with context file: use defaults
       modelConfig = { ...DEFAULT_MODEL_CONFIG };
     }
 
+    // Compose final per-role overrides: file → legacy expansion (only when
+    // explicit) → per-group flag patches (effort-only flags preserve underlying tier).
+    // Legacy tiers come from the resolved `modelConfig` (which carries the
+    // prompt's interactive answers OR the CLI flag values), not from `opts`
+    // directly — otherwise the interactive legacy path silently contributes
+    // nothing because opts.workerModel is undefined in that flow.
+    const composed = await composeRoleConfig(
+      projectDir,
+      opts,
+      {
+        workerTier: legacyExplicit ? modelConfig.worker : undefined,
+        subagentTier: legacyExplicit ? modelConfig.subagent : undefined,
+        explicit: legacyExplicit,
+      },
+    );
+    if (composed.roles) modelConfig.roles = composed.roles;
+    for (const w of composed.warnings) console.warn(chalk.yellow(`  [models.json] ${w}`));
+
     // Validate: extended context only works with sonnet (opus always has 1M, haiku doesn't support it)
-    if (modelConfig.extendedContext && modelConfig.worker !== "sonnet") {
-      if (modelConfig.worker === "haiku") {
+    const workerIsSonnet = modelConfig.worker === "sonnet" || modelConfig.worker === "sonnet-4-6";
+    const workerIsHaiku = modelConfig.worker === "haiku" || modelConfig.worker === "haiku-4-5";
+    if (modelConfig.extendedContext && !workerIsSonnet) {
+      if (workerIsHaiku) {
         throw new InvalidArgumentError(
           "Extended context (1M tokens) is not supported with haiku. Use opus or sonnet for the worker model.",
         );
       }
-      // For opus, silently ignore --extended-context since 1M is already included
+      // For opus variants, silently ignore --extended-context since 1M is already included
       modelConfig.extendedContext = false;
     }
 
@@ -616,9 +826,10 @@ program
     if (state.model_config) {
       console.log(chalk.white(`  Worker Model: ${state.model_config.worker}`));
       console.log(chalk.white(`  Agent Model:  ${state.model_config.subagent}`));
-      if (state.model_config.worker === "opus") {
+      const w = state.model_config.worker;
+      if (w === "opus" || w === "opus-4-6" || w === "opus-4-7") {
         console.log(chalk.white(`  Context:      1M tokens (included)`));
-      } else if (state.model_config.extendedContext && state.model_config.worker === "sonnet") {
+      } else if (state.model_config.extendedContext && (w === "sonnet" || w === "sonnet-4-6")) {
         console.log(chalk.white(`  Context:      1M tokens (extra usage)`));
       }
     }
@@ -805,9 +1016,20 @@ program
   .option("--skip-flow-review", "Skip flow-tracing review phase", false)
   .option("--skip-design-spec-update", "Skip post-cycle design spec update", false)
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime)
-  .option("--worker-model <tier>", "Claude model for workers: opus, sonnet, or haiku", parseModelTier)
-  .option("--subagent-model <tier>", "Claude model for subagents: opus, sonnet, or haiku", parseModelTier)
+  .option("--worker-model <tier>", "Legacy: model tier for execution workers.", parseModelTier)
+  .option("--subagent-model <tier>", "Legacy: model tier for sentinel + analyzers.", parseModelTier)
   .option("--extended-context", "Use 1M token context for sonnet workers (billed as extra usage; opus always has 1M included)", false)
+  .option("--planner-model <tier>", "Model for the planner role.", parseModelTier)
+  .option("--planner-effort <level>", "Effort level for the planner.", parseEffortLevel)
+  .option("--security-model <tier>", "Model for security worker + sentinel.", parseModelTier)
+  .option("--security-effort <level>", "Effort level for security + sentinel.", parseEffortLevel)
+  .option("--frontend-model <tier>", "Model for frontend_ui workers.", parseModelTier)
+  .option("--frontend-effort <level>", "Effort level for frontend workers.", parseEffortLevel)
+  .option("--backend-model <tier>", "Model for backend-class workers.", parseModelTier)
+  .option("--backend-effort <level>", "Effort level for backend workers.", parseEffortLevel)
+  .option("--analyzer-model <tier>", "Model for read-only analyzer agents.", parseModelTier)
+  .option("--analyzer-effort <level>", "Effort level for analyzer agents.", parseEffortLevel)
+  .option("--default-effort <level>", "Effort level applied to roles without a group flag.", parseEffortLevel)
   .option("--force-resume", "Force resume even if state is stale (for example stuck in executing)", false)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (opts: Record<string, string | boolean | undefined>) => {
@@ -868,15 +1090,42 @@ program
     }
 
     // Resolve model config: CLI flags override > saved state > defaults
-    const hasModelFlags = opts.workerModel || opts.subagentModel || opts.extendedContext;
+    const hasModelFlags = Boolean(opts.workerModel || opts.subagentModel || opts.extendedContext);
     const savedModelConfig = state.model_config ?? DEFAULT_MODEL_CONFIG;
     const resumeModelConfig: ModelConfig = hasModelFlags
       ? {
           worker: (opts.workerModel as ClaudeModelTier) ?? savedModelConfig.worker,
           subagent: (opts.subagentModel as ClaudeModelTier) ?? savedModelConfig.subagent,
           extendedContext: opts.extendedContext ? Boolean(opts.extendedContext) : savedModelConfig.extendedContext,
+          roles: savedModelConfig.roles,
         }
-      : savedModelConfig;
+      : { ...savedModelConfig };
+
+    // Re-merge per-role overrides via composeRoleConfig with the saved
+    // state's roles as the seed. Resume only expands legacy tiers from
+    // CLI flags — saved state's worker/subagent are intentionally not
+    // re-expanded (they were either already expanded into roles at start
+    // time or the user originally chose per-role defaults). When the user
+    // passes legacy flags now, we read the resolved tiers from
+    // `resumeModelConfig` (which already fused CLI flags over saved state
+    // on lines 1088-1096 above).
+    const resumeLegacyExplicit = Boolean(opts.workerModel || opts.subagentModel);
+    const resumeComposed = await composeRoleConfig(
+      projectDir,
+      opts,
+      {
+        workerTier: resumeLegacyExplicit ? resumeModelConfig.worker : undefined,
+        subagentTier: resumeLegacyExplicit ? resumeModelConfig.subagent : undefined,
+        explicit: resumeLegacyExplicit,
+      },
+      resumeModelConfig.roles,
+    );
+    if (resumeComposed.roles) {
+      resumeModelConfig.roles = resumeComposed.roles;
+    } else {
+      delete resumeModelConfig.roles;
+    }
+    for (const w of resumeComposed.warnings) console.warn(chalk.yellow(`  [models.json] ${w}`));
 
     // Validate bounds for CLI overrides on resume (#20 - security: reject extreme values)
     // H-3 FIX: Validate concurrency when overridden (matches start command validation)

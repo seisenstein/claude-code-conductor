@@ -858,6 +858,113 @@ describe("WorkerManager", () => {
     });
   });
 
+  describe("per-task-type model selection (v0.7.0)", () => {
+    it("frontend_ui hint resolves to opus-4-7 in the SDK call", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () { /* exit */ }),
+      );
+
+      await workerManager.spawnWorker("worker-fe", "frontend_ui");
+      await new Promise((r) => setTimeout(r, 50));
+
+      const call = vi.mocked(query).mock.calls.find((c) => c[0]?.options?.cwd === tempDir);
+      expect(call).toBeDefined();
+      expect(call![0].options!.model).toBe("claude-opus-4-7");
+      expect(call![0].options!.effort).toBe("high");
+    });
+
+    it("backend_api hint resolves to opus-4-6 (avoids 4.7 stub-code regression)", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () { /* exit */ }),
+      );
+
+      await workerManager.spawnWorker("worker-be", "backend_api");
+      await new Promise((r) => setTimeout(r, 50));
+
+      const call = vi.mocked(query).mock.calls.find((c) => c[0]?.options?.cwd === tempDir);
+      expect(call).toBeDefined();
+      expect(call![0].options!.model).toBe("claude-opus-4-6");
+      expect(call![0].options!.effort).toBe("high");
+    });
+
+    it("security hint resolves to opus-4-7 xhigh", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () { /* exit */ }),
+      );
+
+      await workerManager.spawnWorker("worker-sec", "security");
+      await new Promise((r) => setTimeout(r, 50));
+
+      const call = vi.mocked(query).mock.calls.find((c) => c[0]?.options?.cwd === tempDir);
+      expect(call).toBeDefined();
+      expect(call![0].options!.model).toBe("claude-opus-4-7");
+      expect(call![0].options!.effort).toBe("xhigh");
+    });
+
+    it("no hint falls back to worker_general (opus-4-6 high)", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () { /* exit */ }),
+      );
+
+      await workerManager.spawnWorker("worker-generic");
+      await new Promise((r) => setTimeout(r, 50));
+
+      const call = vi.mocked(query).mock.calls.find((c) => c[0]?.options?.cwd === tempDir);
+      expect(call).toBeDefined();
+      expect(call![0].options!.model).toBe("claude-opus-4-6");
+      expect(call![0].options!.effort).toBe("high");
+    });
+
+    it("sentinel uses opus-4-7 xhigh (not the legacy subagent tier)", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () { /* exit */ }),
+      );
+
+      await workerManager.spawnSentinelWorker();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const call = vi.mocked(query).mock.calls.find((c) => c[0]?.options?.cwd === tempDir);
+      expect(call).toBeDefined();
+      expect(call![0].options!.model).toBe("claude-opus-4-7");
+      expect(call![0].options!.effort).toBe("xhigh");
+    });
+
+    it("models.json roles override defaults", async () => {
+      const { query } = await import("@anthropic-ai/claude-agent-sdk");
+      vi.mocked(query).mockReturnValue(
+        createMockQueryResult(async function* () { /* exit */ }),
+      );
+
+      const overridden = new WorkerManager(
+        tempDir,
+        orchestratorDir,
+        path.join(tempDir, "fake-mcp-server.js"),
+        mockLogger,
+        {
+          worker: "opus",
+          subagent: "sonnet",
+          extendedContext: false,
+          roles: {
+            worker_frontend_ui: { tier: "haiku-4-5", effort: "low" },
+          },
+        },
+      );
+
+      await overridden.spawnWorker("worker-fe-override", "frontend_ui");
+      await new Promise((r) => setTimeout(r, 50));
+
+      const call = vi.mocked(query).mock.calls.find((c) => c[0]?.options?.cwd === tempDir);
+      expect(call).toBeDefined();
+      expect(call![0].options!.model).toBe("claude-haiku-4-5-20251001");
+      expect(call![0].options!.effort).toBe("low");
+    });
+  });
+
   describe("sentinel tool documentation (H11 fix)", () => {
     it("sentinel worker tool list includes post_update with documentation", async () => {
       // Verify at the source level that the sentinel's tool list is documented

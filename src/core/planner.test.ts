@@ -324,19 +324,16 @@ describe("Planner H-6 fix: replan model config", () => {
     expect(replanBody).not.toContain("'claude-sonnet-4-6'");
   });
 
-  it("source code uses MODEL_TIER_TO_ID and DEFAULT_MODEL_CONFIG for fallback", async () => {
+  it("source code uses DEFAULT_ROLE_CONFIG (per-role) for fallback (v0.7.0)", async () => {
     const source = await fs.readFile(
       path.join(process.cwd(), "src/core/planner.ts"),
       "utf-8",
     );
 
-    // Should import both MODEL_TIER_TO_ID and DEFAULT_MODEL_CONFIG
-    expect(source).toContain("MODEL_TIER_TO_ID");
-    expect(source).toContain("DEFAULT_MODEL_CONFIG");
-
-    // The replan model fallback should use these instead of a hardcoded string
-    const replanStart = source.indexOf("async replan(");
-    const replanBody = source.substring(replanStart, replanStart + 2000);
-    expect(replanBody).toContain("MODEL_TIER_TO_ID[DEFAULT_MODEL_CONFIG");
+    // Per-role defaults replaced the legacy MODEL_TIER_TO_ID[DEFAULT_MODEL_CONFIG]
+    // fallback. The constructor now resolves to DEFAULT_ROLE_CONFIG.planner when
+    // no spec is supplied, so DEFAULT_ROLE_CONFIG must be imported and referenced.
+    expect(source).toContain("DEFAULT_ROLE_CONFIG");
+    expect(source).toContain("DEFAULT_ROLE_CONFIG.planner");
   });
 });

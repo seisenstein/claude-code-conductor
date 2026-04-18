@@ -124,12 +124,59 @@ export const WorkerRuntimeSchema = z.enum(["claude", "codex"]);
 // Model Config Schema
 // ============================================================
 
-export const ClaudeModelTierSchema = z.enum(["opus", "sonnet", "haiku"]);
+// Accept both new explicit tiers and the legacy aliases (back-compat with
+// pre-0.7.0 state.json). MODEL_TIER_TO_ID resolves both forms identically.
+export const ClaudeModelTierSchema = z.enum([
+  "opus-4-7",
+  "opus-4-6",
+  "sonnet-4-6",
+  "haiku-4-5",
+  "opus",
+  "sonnet",
+  "haiku",
+]);
+
+export const EffortLevelSchema = z.enum(["low", "medium", "high", "xhigh", "max"]);
+
+// Mirrors AgentRole in src/utils/types.ts. Kept here as a literal list to
+// avoid a circular import between state-schema and types. If a new role is
+// added, update both. The lenient state validator treats schema mismatches
+// as fall-back-to-defaults, so a forward-incompat state.json from a newer
+// binary version drops the unknown role keys gracefully rather than crashing.
+export const AgentRoleSchema = z.enum([
+  "planner",
+  "worker_backend_api",
+  "worker_frontend_ui",
+  "worker_database",
+  "worker_security",
+  "worker_testing",
+  "worker_infrastructure",
+  "worker_reverse_engineering",
+  "worker_integration",
+  "worker_general",
+  "sentinel",
+  "flow_tracer",
+  "flow_config_analyzer",
+  "conventions_extractor",
+  "rules_extractor",
+  "design_spec_analyzer",
+  "design_spec_updater",
+]);
+
+export const RoleModelSpecSchema = z.object({
+  tier: ClaudeModelTierSchema,
+  effort: EffortLevelSchema.optional(),
+});
 
 export const ModelConfigSchema = z.object({
   worker: ClaudeModelTierSchema,
   subagent: ClaudeModelTierSchema,
   extendedContext: z.boolean(),
+  // v0.7.0: per-role overrides. Keys constrained to the AgentRole union so
+  // typos (e.g. `"sentinall": {...}`) get caught by validation instead of
+  // silently persisting and being ignored at resolution time. Older state
+  // files missing this field still validate (it's optional).
+  roles: z.record(AgentRoleSchema, RoleModelSpecSchema).optional(),
 });
 
 // ============================================================

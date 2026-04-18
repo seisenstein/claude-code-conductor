@@ -2,12 +2,24 @@ import type { FlowConfig, ProjectProfile } from "./types.js";
 import { DEFAULT_FLOW_CONFIG } from "./flow-config.js";
 
 /**
- * Generate a framework-specific flow config based on the detected project profile.
- * Uses templates for known frameworks and falls back to DEFAULT_FLOW_CONFIG.
+ * Generate a flow-config seed for the project.
+ *
+ * Pick order (highest priority first):
+ *   1. Project archetype (cli / library / web / service / other)
+ *      — handled here when no specific framework template exists.
+ *   2. Specific framework template (Next.js, React SPA, Vue, ...)
+ *   3. Generic DEFAULT_FLOW_CONFIG fallback.
+ *
+ * v0.7.1: this output is now a SEED — the LLM-based flow-config-analyzer
+ * uses it as a reference and refines/replaces it based on actual codebase
+ * inspection. If the analyzer is skipped or fails, this seed is what gets
+ * written to disk.
  */
 export function generateFlowConfig(profile: ProjectProfile): FlowConfig {
   const frameworks = profile.frameworks;
 
+  // 1. Specific frontend frameworks (these take precedence over archetype
+  //    so a Next.js app gets the App-Router template, not the generic web one).
   if (frameworks.includes("nextjs")) {
     return NEXTJS_CONFIG;
   }
@@ -28,7 +40,8 @@ export function generateFlowConfig(profile: ProjectProfile): FlowConfig {
     return ANGULAR_CONFIG;
   }
 
-  // API-only frameworks
+  // 2. API-only frameworks (covered by SERVICE archetype but kept for
+  //    backward compat with profiles that don't have archetype yet).
   if (
     frameworks.includes("express") ||
     frameworks.includes("fastify") ||
@@ -47,7 +60,21 @@ export function generateFlowConfig(profile: ProjectProfile): FlowConfig {
     return PYTHON_API_CONFIG;
   }
 
-  return { ...DEFAULT_FLOW_CONFIG };
+  // 3. Archetype-based fallback for projects without a framework template.
+  switch (profile.archetype) {
+    case "cli":
+      return CLI_TOOL_CONFIG;
+    case "library":
+      return LIBRARY_CONFIG;
+    case "service":
+      // Reach here only if no specific service-framework matched above
+      return NODE_API_CONFIG;
+    case "web":
+    case "other":
+    case undefined:
+    default:
+      return { ...DEFAULT_FLOW_CONFIG };
+  }
 }
 
 // ============================================================
@@ -406,4 +433,234 @@ const PYTHON_API_CONFIG: FlowConfig = {
     "Missing environment variables",
   ],
   example_flows: [],
+};
+
+// ============================================================
+// Archetype-specific templates (v0.7.1)
+// ============================================================
+
+/**
+ * CLI tool / developer tool template.
+ *
+ * Designed for projects shaped like `conduct`, `eslint`, `prettier`, `tsc`:
+ * a binary entry point that parses args, loads config, performs file/system
+ * operations, and emits structured output. No web layers, no actor RBAC.
+ */
+const CLI_TOOL_CONFIG: FlowConfig = {
+  layers: [
+    {
+      name: "CLI Entry & Argument Parsing",
+      checks: [
+        "Are required arguments validated with clear error messages on missing/invalid input?",
+        "Are flag combinations validated (mutually exclusive flags, required pairs)?",
+        "Does --help describe every option and accurately reflect current behavior?",
+        "Are exit codes correct and consistent (0 = ok, non-zero = failure type)?",
+        "Is there a global --version that matches package.json?",
+      ],
+    },
+    {
+      name: "Configuration & Environment",
+      checks: [
+        "Does the tool gracefully handle missing or malformed config files (no stack traces leaked)?",
+        "Are config-file precedence rules documented (CLI flag > env > file > default)?",
+        "Are env vars validated at startup (fail-fast on missing required values)?",
+        "Are file paths normalized (absolute vs relative, ~ expansion, symlinks)?",
+        "Are sensitive config values (tokens, keys) redacted from logs/errors?",
+      ],
+    },
+    {
+      name: "Core Logic & I/O",
+      checks: [
+        "Are file operations atomic (write to temp + rename) for crash safety?",
+        "Are file/directory permissions set explicitly (no umask surprises)?",
+        "Is stdin/stdout used correctly (don't mix logs with structured output)?",
+        "Are long-running operations interruptible (SIGINT/SIGTERM cleanup)?",
+        "Are subprocess invocations validated and quoted (no shell injection)?",
+        "Are network calls bounded by timeouts and retried with backoff?",
+      ],
+    },
+    {
+      name: "State & Persistence",
+      checks: [
+        "Is on-disk state validated on read (schema check + version migration)?",
+        "Are concurrent invocations serialized via lock files or rejected?",
+        "Are stale locks (dead PID, old timestamp) detected and cleaned up?",
+        "Are partial writes recoverable (transactional or torn-write detection)?",
+      ],
+    },
+    {
+      name: "Output & Exit",
+      checks: [
+        "Are errors written to stderr with actionable remediation hints?",
+        "Is the output format stable (programmatic consumers, --json flag)?",
+        "Is verbose/debug output gated behind a flag?",
+        "Are background processes / file handles cleaned up on exit?",
+      ],
+    },
+    {
+      name: "Cross-Boundary",
+      checks: [
+        "When the tool spawns subprocesses, do failures propagate cleanly to the user?",
+        "Do environment changes made by the tool persist as documented (or revert on failure)?",
+        "When the tool calls external services, are credentials sourced consistently?",
+      ],
+    },
+  ],
+  actor_types: [
+    "interactive_user",
+    "ci_runner",
+    "scripted_invocation",
+    "subprocess_caller",
+  ],
+  edge_cases: [
+    "Missing required CLI arg",
+    "Conflicting flag combinations",
+    "Malformed or missing config file",
+    "Required env var unset",
+    "Stale lock file from crashed previous run",
+    "Concurrent invocations on the same project",
+    "Disk full mid-write",
+    "SIGINT during a multi-step operation",
+    "Symlink loop or permission denied on a file path",
+    "Subprocess returns non-zero exit",
+    "Network partition during external API call",
+    "Unicode / non-ASCII in file paths or args",
+  ],
+  example_flows: [
+    {
+      id: "cli-init",
+      name: "First-time init",
+      description: "User runs `<tool> init` in an empty project to scaffold config files.",
+      entry_points: ["src/cli.ts", "src/core/init.ts"],
+      actors: ["interactive_user"],
+      edge_cases: [
+        "Some config files already exist (don't clobber)",
+        "Project directory not writable",
+        "Detection heuristics return ambiguous results",
+      ],
+    },
+    {
+      id: "cli-resume",
+      name: "Resume a previous run",
+      description: "User runs `<tool> resume` after a crash or pause to continue from saved state.",
+      entry_points: ["src/cli.ts"],
+      actors: ["interactive_user", "ci_runner"],
+      edge_cases: [
+        "State file missing or corrupted",
+        "State schema is older than current binary version",
+        "Resume requested while another instance is running",
+      ],
+    },
+    {
+      id: "cli-pipe",
+      name: "Tool used in a pipeline",
+      description: "Output of the tool is consumed by another process via stdout pipe.",
+      entry_points: ["src/cli.ts"],
+      actors: ["subprocess_caller", "scripted_invocation"],
+      edge_cases: [
+        "Downstream process closes pipe early (SIGPIPE)",
+        "Logs accidentally written to stdout instead of stderr",
+        "Output format changes break the consumer",
+      ],
+    },
+  ],
+};
+
+/**
+ * Library / SDK template.
+ *
+ * Designed for packages whose primary deliverable is a public API consumed
+ * by other code: SDKs, utility libraries, type packages. Focuses on API
+ * stability, error contracts, and integration surface.
+ */
+const LIBRARY_CONFIG: FlowConfig = {
+  layers: [
+    {
+      name: "Public API Surface",
+      checks: [
+        "Are all exported symbols documented and intentional (no accidental exports)?",
+        "Do exported types accurately describe the runtime contract?",
+        "Are breaking changes explicit (semver bump, CHANGELOG entry, deprecation period)?",
+        "Are async APIs consistently Promise-based or callback-based (not mixed)?",
+        "Are options objects extensible (additive non-breaking changes possible)?",
+      ],
+    },
+    {
+      name: "Input Validation & Error Contracts",
+      checks: [
+        "Are all public function arguments validated with clear error messages?",
+        "Are errors typed (custom Error subclasses) so callers can discriminate?",
+        "Is failure reporting consistent (throw vs Result<T> vs callback)?",
+        "Do error messages avoid leaking internal implementation details?",
+      ],
+    },
+    {
+      name: "Internal Logic",
+      checks: [
+        "Are pure functions actually pure (no hidden module-level state)?",
+        "Is shared state thread/async safe (no race conditions across awaits)?",
+        "Are caches bounded and invalidatable?",
+        "Do internal helpers stay internal (not accidentally re-exported)?",
+      ],
+    },
+    {
+      name: "Side-Effect Boundary (I/O, network)",
+      checks: [
+        "Are network calls wrapped in retry / timeout / cancellation primitives?",
+        "Do file or env reads happen lazily (not at module load time)?",
+        "Are subprocess spawns bounded (memory, runtime, output size)?",
+        "Are platform differences abstracted (path separators, line endings)?",
+      ],
+    },
+    {
+      name: "Packaging & Distribution",
+      checks: [
+        "Does package.json `exports` cover every entry point cleanly (ESM/CJS)?",
+        "Are TypeScript declarations published and accurate?",
+        "Are peerDependencies declared correctly (no version conflicts for consumers)?",
+        "Is the tarball size reasonable (no dev artifacts shipped)?",
+      ],
+    },
+  ],
+  actor_types: [
+    "library_consumer",
+    "type_consumer",
+    "transitive_dependency_user",
+    "framework_integration",
+  ],
+  edge_cases: [
+    "Caller passes null/undefined to a required argument",
+    "Caller awaits a value that's actually synchronous",
+    "Two consumers import different versions transitively (peer-dep conflict)",
+    "Module imported but never instantiated (tree-shake correctness)",
+    "ESM consumer importing a CJS-only entry",
+    "Bundler strips a side-effect import the library relies on",
+    "Concurrent calls to a stateful API",
+    "Backwards-compat break in a minor version (regression)",
+  ],
+  example_flows: [
+    {
+      id: "library-import",
+      name: "Consumer imports the library",
+      description: "A downstream project installs the package and imports its main API.",
+      entry_points: ["src/index.ts"],
+      actors: ["library_consumer"],
+      edge_cases: [
+        "Consumer uses ESM but library only ships CJS",
+        "Consumer pins an old version with a known bug",
+      ],
+    },
+    {
+      id: "library-misuse",
+      name: "Consumer calls API incorrectly",
+      description: "Consumer passes invalid arguments or calls APIs in the wrong order.",
+      entry_points: ["src/*"],
+      actors: ["library_consumer"],
+      edge_cases: [
+        "Wrong type passed (no runtime check)",
+        "Required option missing",
+        "API called before initialization",
+      ],
+    },
+  ],
 };

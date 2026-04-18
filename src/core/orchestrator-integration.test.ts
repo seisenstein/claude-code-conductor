@@ -23,7 +23,58 @@ import path from "node:path";
 // The Query interface extends AsyncGenerator<SDKMessage, void> and requires additional methods
 vi.mock("@anthropic-ai/claude-agent-sdk", () => {
   // Helper to create a fully-typed mock Query object that satisfies the SDK interface
-  // Defined inline to ensure it's available when the mock factory runs
+  // Defined inline to ensure it's available when the mock factory runs.
+  // Adds the methods that came in @anthropic-ai/claude-agent-sdk 0.2.x (applyFlagSettings,
+  // initializationResult, supportedAgents, getContextUsage, reloadPlugins, seedReadState,
+  // reconnectMcpServer, toggleMcpServer, stopTask, close).
+  const buildMockQueryShape = (
+    generator: AsyncGenerator<unknown, void, unknown>,
+  ): Record<string, unknown> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const shape: any = {
+      next: generator.next.bind(generator),
+      return: generator.return.bind(generator),
+      throw: generator.throw.bind(generator),
+      [Symbol.asyncIterator]: () => shape,
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      setPermissionMode: vi.fn().mockResolvedValue(undefined),
+      setModel: vi.fn().mockResolvedValue(undefined),
+      setMaxThinkingTokens: vi.fn().mockResolvedValue(undefined),
+      applyFlagSettings: vi.fn().mockResolvedValue(undefined),
+      initializationResult: vi.fn().mockResolvedValue({}),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+      supportedModels: vi.fn().mockResolvedValue([]),
+      supportedAgents: vi.fn().mockResolvedValue([]),
+      mcpServerStatus: vi.fn().mockResolvedValue([]),
+      getContextUsage: vi.fn().mockResolvedValue({}),
+      reloadPlugins: vi.fn().mockResolvedValue({}),
+      accountInfo: vi.fn().mockResolvedValue({
+        email: "test@example.com",
+        organizationName: null,
+        subscriptionType: "free",
+      }),
+      rewindFiles: vi.fn().mockResolvedValue({
+        canRewind: true,
+        error: null,
+        filesAdded: 0,
+        filesModified: 0,
+        filesDeleted: 0,
+      }),
+      seedReadState: vi.fn().mockResolvedValue(undefined),
+      reconnectMcpServer: vi.fn().mockResolvedValue(undefined),
+      toggleMcpServer: vi.fn().mockResolvedValue(undefined),
+      setMcpServers: vi.fn().mockResolvedValue({
+        added: [],
+        removed: [],
+        errors: [],
+      }),
+      streamInput: vi.fn().mockResolvedValue(undefined),
+      stopTask: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn(),
+    };
+    return shape;
+  };
+
   const createMockQueryInternal = (result: string) => {
     // Create a proper SDKResultMessage-like object (only "result" type is used in tests)
     const mockResultMessage = {
@@ -53,40 +104,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => {
     })();
 
     // Create the mock Query object with all required interface methods
-    const mockQuery = {
-      // AsyncGenerator methods
-      next: generator.next.bind(generator),
-      return: generator.return.bind(generator),
-      throw: generator.throw.bind(generator),
-      [Symbol.asyncIterator]: () => mockQuery,
-
-      // Query interface methods (control requests)
-      interrupt: vi.fn().mockResolvedValue(undefined),
-      setPermissionMode: vi.fn().mockResolvedValue(undefined),
-      setModel: vi.fn().mockResolvedValue(undefined),
-      setMaxThinkingTokens: vi.fn().mockResolvedValue(undefined),
-      supportedCommands: vi.fn().mockResolvedValue([]),
-      supportedModels: vi.fn().mockResolvedValue([]),
-      mcpServerStatus: vi.fn().mockResolvedValue([]),
-      accountInfo: vi.fn().mockResolvedValue({
-        email: "test@example.com",
-        organizationName: null,
-        subscriptionType: "free",
-      }),
-      rewindFiles: vi.fn().mockResolvedValue({
-        canRewind: true,
-        error: null,
-        filesAdded: 0,
-        filesModified: 0,
-        filesDeleted: 0,
-      }),
-      setMcpServers: vi.fn().mockResolvedValue({
-        added: [],
-        removed: [],
-        errors: [],
-      }),
-      streamInput: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockQuery = buildMockQueryShape(generator);
 
     return mockQuery;
   };
@@ -200,22 +218,26 @@ function createMockQueryResult(result: string) {
     yield mockResultMessage;
   })();
 
-  // Create the mock Query object with all required interface methods
-  const mockQuery = {
-    // AsyncGenerator methods
+  // Create the mock Query object with all required interface methods.
+  // Mirrors the shape inside the vi.mock() factory above.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mockQuery: any = {
     next: generator.next.bind(generator),
     return: generator.return.bind(generator),
     throw: generator.throw.bind(generator),
     [Symbol.asyncIterator]: () => mockQuery,
-
-    // Query interface methods (control requests)
     interrupt: vi.fn().mockResolvedValue(undefined),
     setPermissionMode: vi.fn().mockResolvedValue(undefined),
     setModel: vi.fn().mockResolvedValue(undefined),
     setMaxThinkingTokens: vi.fn().mockResolvedValue(undefined),
+    applyFlagSettings: vi.fn().mockResolvedValue(undefined),
+    initializationResult: vi.fn().mockResolvedValue({}),
     supportedCommands: vi.fn().mockResolvedValue([]),
     supportedModels: vi.fn().mockResolvedValue([]),
+    supportedAgents: vi.fn().mockResolvedValue([]),
     mcpServerStatus: vi.fn().mockResolvedValue([]),
+    getContextUsage: vi.fn().mockResolvedValue({}),
+    reloadPlugins: vi.fn().mockResolvedValue({}),
     accountInfo: vi.fn().mockResolvedValue({
       email: "test@example.com",
       organizationName: null,
@@ -228,12 +250,17 @@ function createMockQueryResult(result: string) {
       filesModified: 0,
       filesDeleted: 0,
     }),
+    seedReadState: vi.fn().mockResolvedValue(undefined),
+    reconnectMcpServer: vi.fn().mockResolvedValue(undefined),
+    toggleMcpServer: vi.fn().mockResolvedValue(undefined),
     setMcpServers: vi.fn().mockResolvedValue({
       added: [],
       removed: [],
       errors: [],
     }),
     streamInput: vi.fn().mockResolvedValue(undefined),
+    stopTask: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn(),
   };
 
   return mockQuery;

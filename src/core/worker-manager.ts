@@ -10,8 +10,12 @@ import type {
   SessionStatus,
   WorkerSharedContext,
   ModelConfig,
+  TaskType,
+  AgentRole,
+  EffortLevel,
 } from "../utils/types.js";
-import { MODEL_TIER_TO_ID, DEFAULT_MODEL_CONFIG } from "../utils/types.js";
+import { DEFAULT_MODEL_CONFIG } from "../utils/types.js";
+import { resolveSdkArgs } from "../utils/models-config.js";
 import {
   TaskRetryTracker,
   WorkerTimeoutTracker,
@@ -43,6 +47,30 @@ interface WorkerHandle {
   events: OrchestratorEvent[];
   startedAt: string;
   rateLimitReported: boolean;
+  /** Resolved per-role model + effort for this worker. Populated at spawn. */
+  model: string;
+  effort?: EffortLevel;
+  /** The task_type hint used to pick the role, or null for sentinel/general. */
+  taskTypeHint: TaskType | null;
+}
+
+/** Map a Task.task_type into the matching execution-worker AgentRole. */
+function taskTypeToRole(taskType: TaskType | null | undefined): AgentRole {
+  switch (taskType) {
+    case "backend_api": return "worker_backend_api";
+    case "frontend_ui": return "worker_frontend_ui";
+    case "database": return "worker_database";
+    case "security": return "worker_security";
+    case "testing": return "worker_testing";
+    case "infrastructure": return "worker_infrastructure";
+    case "reverse_engineering": return "worker_reverse_engineering";
+    case "integration": return "worker_integration";
+    case "general":
+    case undefined:
+    case null:
+    default:
+      return "worker_general";
+  }
 }
 
 // ============================================================
@@ -96,13 +124,21 @@ export class WorkerManager implements ExecutionWorkerManager {
    * Creates the session directory, writes initial status, and launches
    * the SDK query in a background async task.
    */
-  async spawnWorker(sessionId: string): Promise<void> {
+  async spawnWorker(sessionId: string, taskTypeHint?: TaskType | null): Promise<void> {
     if (this.activeWorkers.has(sessionId)) {
       this.logger.warn(`Worker ${sessionId} is already active; skipping spawn`);
       return;
     }
 
-    this.logger.info(`Spawning worker: ${sessionId}`);
+    // Resolve the per-role model + effort based on the task_type hint.
+    // Workers may end up claiming a different task type via MCP — the hint
+    // just guides initial model selection. worker_general is the safe fallback.
+    const role = taskTypeToRole(taskTypeHint ?? null);
+    const sdkArgs = resolveSdkArgs(this.modelConfig, role);
+
+    this.logger.info(
+      `Spawning worker: ${sessionId} (role=${role}, model=${sdkArgs.model}, effort=${sdkArgs.effort ?? "sdk-default"})`,
+    );
 
     // Create session directory
     const sessionDir = path.join(
@@ -126,13 +162,17 @@ export class WorkerManager implements ExecutionWorkerManager {
       JSON.stringify(initialStatus, null, 2) + "\n",
     );
 
-    // Build the worker handle
+    // Build the worker handle (carries the resolved model + effort so runWorker
+    // doesn't have to re-resolve)
     const handle: WorkerHandle = {
       sessionId,
       promise: Promise.resolve(), // will be replaced below
       events: [],
       startedAt: new Date().toISOString(),
       rateLimitReported: false,
+      model: sdkArgs.model,
+      effort: sdkArgs.effort,
+      taskTypeHint: taskTypeHint ?? null,
     };
 
     // V2: Start resilience tracking
@@ -183,12 +223,18 @@ export class WorkerManager implements ExecutionWorkerManager {
 
     const sentinelPrompt = this.buildSentinelPrompt();
 
+    // Sentinel resolves its own role inside runSentinelWorker (handle.model
+    // is unused for the sentinel path; populated for shape consistency).
+    const sentinelArgs = resolveSdkArgs(this.modelConfig, "sentinel");
     const handle: WorkerHandle = {
       sessionId: sentinelId,
       promise: Promise.resolve(),
       events: [],
       startedAt: new Date().toISOString(),
       rateLimitReported: false,
+      model: sentinelArgs.model,
+      effort: sentinelArgs.effort,
+      taskTypeHint: null,
     };
 
     // V2: Start resilience tracking for sentinel
@@ -465,7 +511,6 @@ export class WorkerManager implements ExecutionWorkerManager {
     const workerPrompt = this.buildWorkerPrompt(sessionId);
 
     try {
-      const workerModelId = MODEL_TIER_TO_ID[this.modelConfig.worker];
       const asyncIterable = query({
         prompt: workerPrompt,
         options: {
@@ -482,7 +527,8 @@ export class WorkerManager implements ExecutionWorkerManager {
           },
           cwd: this.projectDir,
           maxTurns: DEFAULT_WORKER_MAX_TURNS,
-          model: workerModelId,
+          model: handle.model,
+          ...(handle.effort ? { effort: handle.effort } : {}),
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           settingSources: ["project"],
@@ -567,8 +613,12 @@ export class WorkerManager implements ExecutionWorkerManager {
     prompt: string,
   ): Promise<void> {
     try {
-      // Sentinel uses subagent model tier (read-only, lighter workload)
-      const sentinelModelId = MODEL_TIER_TO_ID[this.modelConfig.subagent];
+      // Sentinel resolves its own role spec — defaults to opus-4-7 xhigh
+      // because cyber-security review is one of 4.7's biggest wins.
+      const sentinelArgs = resolveSdkArgs(this.modelConfig, "sentinel");
+      this.logger.info(
+        `Sentinel model=${sentinelArgs.model} effort=${sentinelArgs.effort ?? "sdk-default"}`,
+      );
       const asyncIterable = query({
         prompt,
         options: {
@@ -595,7 +645,8 @@ export class WorkerManager implements ExecutionWorkerManager {
           },
           cwd: this.projectDir,
           maxTurns: SENTINEL_WORKER_MAX_TURNS,
-          model: sentinelModelId,
+          model: sentinelArgs.model,
+          ...(sentinelArgs.effort ? { effort: sentinelArgs.effort } : {}),
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
           settingSources: ["project"],

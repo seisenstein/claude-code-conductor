@@ -29,7 +29,8 @@ import type {
   DesignSpec,
   DesignSpecUpdateResult,
 } from "../utils/types.js";
-import { MODEL_TIER_TO_ID, ConductorExitError } from "../utils/types.js";
+import { ConductorExitError } from "../utils/types.js";
+import { resolveRoleSpec, describeResolvedRoles } from "../utils/models-config.js";
 
 import {
   BRANCH_PREFIX,
@@ -190,7 +191,7 @@ export class Orchestrator {
     this.planner = new Planner(
       options.project,
       this.logger,
-      MODEL_TIER_TO_ID[options.modelConfig.worker],
+      resolveRoleSpec(options.modelConfig, "planner"),
     );
 
     this.claudeUsage = new UsageMonitor({
@@ -246,7 +247,7 @@ export class Orchestrator {
     this.flowTracer = new FlowTracer(
       options.project,
       this.logger,
-      MODEL_TIER_TO_ID[options.modelConfig.worker],
+      resolveRoleSpec(options.modelConfig, "flow_tracer"),
     );
 
     // V2: Initialize event logging
@@ -352,8 +353,11 @@ export class Orchestrator {
         if (!canExtractConventions) {
           return;
         }
-        const workerModelId = MODEL_TIER_TO_ID[this.options.modelConfig.worker];
-        this.conventions = await extractConventions(this.options.project, workerModelId, this.logger);
+        this.conventions = await extractConventions(
+          this.options.project,
+          resolveRoleSpec(this.options.modelConfig, "conventions_extractor"),
+          this.logger,
+        );
         this.projectRules = await loadWorkerRules(this.options.project);
         phaseDurations.conventions_ms = Date.now() - conventionsStart;
 
@@ -1337,10 +1341,16 @@ export class Orchestrator {
       await logProgress(this.options.project, "executing", `Spawning ${numWorkers} workers + sentinel for ${pendingTasks.length} pending tasks`);
       this.logger.info(`Spawning ${numWorkers} worker(s) for ${pendingTasks.length} pending task(s)`);
 
-      // Spawn initial workers
+      // Spawn initial workers. Assign a task_type hint to each worker based
+      // on the pending tasks — the Nth worker is seeded with the Nth pending
+      // task's task_type so the WorkerManager picks a matching model + effort
+      // (e.g. frontend_ui -> opus-4-7 high). Workers may still claim a
+      // different task via MCP; the hint just guides initial model selection.
+      const hintPool = [...pendingTasks];
       for (let i = 0; i < numWorkers; i++) {
         const sessionId = `worker-${Date.now()}-${i}`;
-        await this.workers.spawnWorker(sessionId);
+        const hint = hintPool[i]?.task_type ?? null;
+        await this.workers.spawnWorker(sessionId, hint);
         await this.state.addActiveSession(sessionId);
         // V2: Record worker spawn event
         recordWorkerSpawn(this.eventLog, sessionId);
@@ -1562,9 +1572,13 @@ export class Orchestrator {
           );
           // Identify retry-eligible tasks (tasks that were reset from a previous failure)
           const retryTasks = pendingNow.filter((t) => (t.retry_count ?? 0) > 0);
+          // Seed each respawned worker with a task_type hint (first from retries,
+          // then from general pending) so model + effort match the expected work.
+          const respawnHints = [...retryTasks, ...pendingNow.filter((t) => !retryTasks.includes(t))];
           for (let i = 0; i < respawnCount; i++) {
             const sessionId = `worker-${Date.now()}-respawn-${i}`;
             const retryTask = retryTasks[i]; // May be undefined if fewer retries than workers
+            const hint = respawnHints[i]?.task_type ?? null;
             // Use spawnWorkerForRetry for retry-eligible tasks when the manager supports it
             if (retryTask && this.workers.spawnWorkerForRetry) {
               const correctivePrompt = retryTask.last_error
@@ -1572,7 +1586,7 @@ export class Orchestrator {
                 : undefined;
               await this.workers.spawnWorkerForRetry(sessionId, retryTask.id, correctivePrompt);
             } else {
-              await this.workers.spawnWorker(sessionId);
+              await this.workers.spawnWorker(sessionId, hint);
             }
             await this.state.addActiveSession(sessionId);
             // V2: Record worker spawn event
@@ -1938,15 +1952,13 @@ export class Orchestrator {
       return null;
     }
 
-    const workerModelId = MODEL_TIER_TO_ID[this.options.modelConfig.worker];
-
     try {
       this.logger.info("Updating design spec from cycle changes...");
       const result = await updateDesignSpec(
         this.options.project,
         changedFiles,
         this.designSpec,
-        workerModelId,
+        resolveRoleSpec(this.options.modelConfig, "design_spec_updater"),
         this.logger,
       );
 
@@ -2881,14 +2893,18 @@ export class Orchestrator {
     console.log(chalk.white(`  Concurrency:  ${this.options.concurrency} worker(s)`));
     console.log(chalk.white(`  Runtime:      ${this.options.workerRuntime}`));
     const mc = this.options.modelConfig;
-    console.log(chalk.white(`  Worker Model: ${mc.worker} (${MODEL_TIER_TO_ID[mc.worker]})`));
-    console.log(chalk.white(`  Agent Model:  ${mc.subagent} (${MODEL_TIER_TO_ID[mc.subagent]})`));
-    // Opus 4.6 always has 1M context at no extra cost; Sonnet 4.6 1M is opt-in (extra usage)
-    if (mc.worker === "opus") {
+    console.log(chalk.white(`  Legacy tiers: worker=${mc.worker}  subagent=${mc.subagent}`));
+    // Opus (4.6 / 4.7) always has 1M context at no extra cost; Sonnet 4.6 1M is opt-in (extra usage)
+    if (mc.worker === "opus" || mc.worker === "opus-4-6" || mc.worker === "opus-4-7") {
       console.log(chalk.white(`  Context:      1M tokens (included)`));
-    } else if (mc.extendedContext && mc.worker === "sonnet") {
+    } else if (mc.extendedContext && (mc.worker === "sonnet" || mc.worker === "sonnet-4-6")) {
       console.log(chalk.white(`  Context:      1M tokens (extra usage)`));
     }
+    // Surface the full per-role resolution so users see exactly which model + effort
+    // each agent role will use. Loaded from .conductor/models.json + defaults.
+    console.log("");
+    console.log(chalk.bold.white("  Per-role model + effort:"));
+    console.log(chalk.gray(describeResolvedRoles(mc)));
     console.log(chalk.white(`  Max Cycles:   ${this.options.maxCycles}`));
     console.log(chalk.white(`  Usage Limit:  ${(this.options.usageThreshold * 100).toFixed(0)}%`));
     console.log(chalk.white(`  Skip Codex:   ${this.options.skipCodex ? "Yes" : "No"}`));

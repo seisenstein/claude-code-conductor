@@ -14,7 +14,7 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
-import type { ProjectProfile } from "../utils/types.js";
+import type { ProjectProfile, ProjectArchetype } from "../utils/types.js";
 import { getProjectProfilePath } from "../utils/constants.js";
 
 // ============================================================
@@ -57,7 +57,121 @@ export async function detectProject(projectDir: string): Promise<ProjectProfile>
   // Detect package managers
   profile.package_managers = await detectPackageManagers(projectDir);
 
+  // v0.7.1: high-level archetype (cli / web / library / service / other).
+  // Refined later by the LLM-based flow-config-analyzer — this is a seed.
+  profile.archetype = await detectArchetype(projectDir, profile);
+
   return profile;
+}
+
+// ============================================================
+// Archetype Detection (v0.7.1)
+// ============================================================
+
+/**
+ * Classify the project into a high-level archetype for flow-config seeding
+ * and downstream prompt tailoring. The rules are heuristic and intentionally
+ * conservative — anything ambiguous falls through to "other" and the
+ * flow-config-analyzer LLM pass gets the final call.
+ *
+ * Priority order (first match wins):
+ *   1. Frontend framework → "web"
+ *   2. `bin` in package.json OR CLI-style dep (commander/yargs/oclif/click/argparse) OR src/cli* → "cli"
+ *   3. Backend/API framework → "service"
+ *   4. package.json `main`/`module`/`exports` with no bin/server → "library"
+ *   5. Python pyproject with no framework → "library"
+ *   6. Otherwise → "other"
+ */
+async function detectArchetype(
+  projectDir: string,
+  profile: ProjectProfile,
+): Promise<ProjectArchetype> {
+  const FRONTEND_FRAMEWORKS = new Set([
+    "nextjs", "react", "vue", "svelte", "angular",
+  ]);
+  const SERVICE_FRAMEWORKS = new Set([
+    "express", "fastify", "hono", "koa", "nestjs",
+    "fastapi", "django", "flask", "starlette", "aiohttp",
+  ]);
+
+  // 1. Web app — any frontend framework wins
+  if (profile.frameworks.some((f) => FRONTEND_FRAMEWORKS.has(f))) {
+    return "web";
+  }
+
+  const pkg = await readJsonSafe<PackageJsonWithBin>(
+    path.join(projectDir, "package.json"),
+  );
+
+  // 2. CLI detection
+  if (pkg) {
+    if (pkg.bin !== undefined) {
+      const hasBinEntry =
+        typeof pkg.bin === "string" ||
+        (typeof pkg.bin === "object" && Object.keys(pkg.bin).length > 0);
+      if (hasBinEntry) return "cli";
+    }
+
+    // Only consider runtime dependencies. devDependencies often contain CLI
+    // libraries used by build scripts (commander/yargs in tooling, etc.) that
+    // don't make the project itself a CLI. A monorepo root with a React app
+    // shouldn't be tagged "cli" just because a build tool ships commander.
+    const runtimeDeps = pkg.dependencies ?? {};
+    const CLI_DEPS = [
+      "commander", "yargs", "meow", "oclif", "@oclif/core",
+      "cac", "sade", "minimist", "arg",
+    ];
+    if (CLI_DEPS.some((d) => runtimeDeps[d])) return "cli";
+  }
+
+  // src/cli{.ts,.js,.mjs} entry point (case-insensitive)
+  const cliEntryCandidates = [
+    "cli.ts", "cli.js", "cli.mjs", "cli.cts",
+    "src/cli.ts", "src/cli.js", "src/cli.mjs", "src/cli.cts",
+  ];
+  for (const candidate of cliEntryCandidates) {
+    if (await fileExists(path.join(projectDir, candidate))) return "cli";
+  }
+
+  // Python CLI heuristics
+  if (profile.languages.includes("python")) {
+    const pyprojectPath = path.join(projectDir, "pyproject.toml");
+    if (await fileExists(pyprojectPath)) {
+      const content = await readFileSafe(pyprojectPath);
+      if (content) {
+        // [project.scripts] or [tool.poetry.scripts] → CLI entrypoint
+        if (/\[project\.scripts\]|\[tool\.poetry\.scripts\]/.test(content)) {
+          return "cli";
+        }
+        // click/typer/argparse as direct deps strongly suggests CLI
+        if (/(?:^|\n)\s*(?:click|typer|rich-click)\s*[=<>~]/.test(content)) {
+          return "cli";
+        }
+      }
+    }
+  }
+
+  // 3. Service (API/backend) — framework detection
+  if (profile.frameworks.some((f) => SERVICE_FRAMEWORKS.has(f))) {
+    return "service";
+  }
+
+  // 4. Library heuristic: package.json has entrypoints but no bin/server
+  if (pkg) {
+    const hasEntryPoints = Boolean(
+      pkg.main || pkg.module || pkg.exports || pkg.types,
+    );
+    if (hasEntryPoints) return "library";
+  }
+
+  // 5. Python library: pyproject.toml with no CLI/service signals (already checked above)
+  if (profile.languages.includes("python")) {
+    if (await fileExists(path.join(projectDir, "pyproject.toml"))) {
+      return "library";
+    }
+  }
+
+  return "other";
 }
 
 // ============================================================
@@ -721,6 +835,15 @@ function getLintCommand(
 interface PackageJson {
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+}
+
+/** Extended package.json shape used by archetype detection. */
+interface PackageJsonWithBin extends PackageJson {
+  bin?: string | Record<string, string>;
+  main?: string;
+  module?: string;
+  exports?: unknown;
+  types?: string;
 }
 
 // ============================================================

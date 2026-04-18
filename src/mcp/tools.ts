@@ -290,7 +290,7 @@ export async function handlePostUpdate(
   // Validate input size limits (#16 - DoS prevention)
   const sizeValidation = PostUpdateInputSchema.safeParse(input);
   if (!sizeValidation.success) {
-    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+    return { error: sizeValidation.error.issues.map((e: { message: string }) => e.message).join("; ") };
   }
 
   const dir = messagesDir();
@@ -590,7 +590,7 @@ export async function handleCompleteTask(
   if (!sizeValidation.success) {
     return {
       success: false,
-      error: sizeValidation.error.errors.map(e => e.message).join("; "),
+      error: sizeValidation.error.issues.map((e: { message: string }) => e.message).join("; "),
     };
   }
 
@@ -740,7 +740,7 @@ export async function handleRegisterContract(
   // Validate input size limits (#16 - DoS prevention)
   const sizeValidation = RegisterContractInputSchema.safeParse(input);
   if (!sizeValidation.success) {
-    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+    return { error: sizeValidation.error.issues.map((e: { message: string }) => e.message).join("; ") };
   }
 
   // Validate contract_id to prevent path traversal (#14)
@@ -850,7 +850,7 @@ export async function handleRecordDecision(
   // Validate input size limits (#16 - DoS prevention)
   const sizeValidation = RecordDecisionInputSchema.safeParse(input);
   if (!sizeValidation.success) {
-    return { error: sizeValidation.error.errors.map(e => e.message).join("; ") };
+    return { error: sizeValidation.error.issues.map((e: { message: string }) => e.message).join("; ") };
   }
 
   const filePath = decisionsPath();

@@ -13,9 +13,12 @@ import path from "node:path";
 import {
   RULES_EXTRACTOR_MAX_TURNS,
   RULES_EXTRACTOR_TIMEOUT_MS,
+  DEFAULT_ROLE_CONFIG,
 } from "./constants.js";
+import { specToSdkArgs } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
+import type { RoleModelSpec } from "./types.js";
 
 /** Well-known guidance file locations to search for. */
 const GUIDANCE_FILE_PATTERNS = [
@@ -28,7 +31,7 @@ const GUIDANCE_FILE_PATTERNS = [
   ".github/copilot-instructions.md",
 ];
 
-const EXTRACTION_PROMPT = `You are a project rules extractor for a multi-agent code orchestration system called "Conductor". Your job is to read this project's existing guidance files and synthesize them into a single, actionable rules document that will be injected into every worker agent's prompt.
+const EXTRACTION_PROMPT = `You are a project rules extractor for a multi-agent code orchestration system called "Conductor". Your job is to read this project's existing guidance files AND verify against the actual source code, then synthesize the result into a single, actionable rules document that will be injected into every worker agent's prompt.
 
 ## Step 1: Find guidance files
 
@@ -53,7 +56,50 @@ From all guidance files you find, extract rules that would be relevant to a code
 7. **Off-limits** — Things that must NOT be done (e.g., "never use any type", "do not modify shared components")
 8. **Build/deploy rules** — Build commands, CI requirements, deployment constraints
 
-## Step 3: Output
+## Step 3: VERIFY against the source — the rules MUST match the code
+
+Guidance files drift. Code is ground truth. For every rule that references a
+specific value, list, or constant, you MUST verify it against the actual
+source before writing it down. **Where guidance and code disagree, the code wins.**
+
+### 3a. Autonomous verification
+
+As you extract rules, identify any concrete reference and verify it against
+the source. Examples of references to verify:
+- "Valid X are: A, B, C" (is the union/enum literal really {A, B, C}?)
+- "Workers can use tools T1, T2" (is the allowlist exactly that?)
+- "Default value is N" (is the constant really N?)
+- "Maximum is M" (is the limit really M?)
+- "We use library L" (is L actually in package.json dependencies?)
+
+Use Read, Grep, and LSP to find the authoritative definition. Prefer LSP
+goToDefinition when a symbol is named.
+
+### 3b. Mandatory verification list (always check these)
+
+Even if guidance doesn't mention them, ALWAYS verify these specific items
+when present in this codebase, because they are foundational to worker
+behavior and easy to drift on:
+
+- **TaskType union** — open \`src/utils/types.ts\` and find \`export type TaskType\`. List EVERY member literally (no abbreviation). If any task type is not in your output, fix it.
+- **Worker tool allowlists** — open \`src/utils/constants.ts\` and find \`WORKER_ALLOWED_TOOLS\`, \`PLANNER_ALLOWED_TOOLS\`, \`FLOW_TRACING_READ_ONLY_TOOLS\`. Reflect them accurately.
+- **AgentRole union** (if present) — same treatment as TaskType.
+- **Numeric thresholds** — \`DEFAULT_CONCURRENCY\`, \`DEFAULT_MAX_CYCLES\`, \`MAX_DISAGREEMENT_ROUNDS\`, \`DEFAULT_WORKER_TIMEOUT_MS\`. Cite exact values.
+- **Effort levels** (if present) — \`type EffortLevel\` should list every level.
+- **Branch / commit conventions** — \`BRANCH_PREFIX\`, \`COMMIT_PREFIX_TASK\`, etc.
+
+If the codebase doesn't have these constants, skip them — don't fabricate.
+
+### 3c. Drift reporting
+
+If you find ANY discrepancy between guidance and code, surface it as an
+inline annotation in the corresponding rule, e.g.:
+
+\`- Valid task types: backend_api, frontend_ui, database, security, testing, infrastructure, reverse_engineering, integration, general (CLAUDE.md was missing reverse_engineering and integration — code is authoritative)\`
+
+This makes drift visible to humans reading the rules later.
+
+## Step 4: Output
 
 Output a markdown document with clear, imperative rules organized by category. Each rule should be a single line starting with a dash. Rules must be specific and actionable — not vague guidance like "write clean code".
 
@@ -69,12 +115,15 @@ Output a markdown document with clear, imperative rules organized by category. E
 - Naming conventions specific to this project
 - Security invariants (e.g., "all RLS policies must use (select auth.uid())")
 - Styling rules (e.g., "use OKLCH colors: bg-primary-10 not bg-primary/10")
+- Verified concrete values (the actual TaskType members, the actual numeric thresholds)
+- Inline drift annotations where guidance and code disagreed (so future maintainers know)
 
 Output the rules document between these markers:
 
 \`\`\`rules
 # Conductor Worker Rules
 # Extracted from project guidance files by conduct init.
+# Cross-referenced against source code — code-derived values are authoritative.
 # These rules are injected into every worker prompt.
 
 ## Architecture Rules
@@ -94,10 +143,14 @@ If no guidance files exist, output an empty template with section headers only.`
  */
 export async function extractProjectRules(
   projectDir: string,
-  model?: string,
+  spec?: RoleModelSpec | string,
   logger?: Logger,
 ): Promise<string> {
   const warn = (msg: string) => (logger ? logger.warn(msg) : process.stderr.write(msg + "\n"));
+
+  const sdkArgs = typeof spec === "string"
+    ? { model: spec, effort: DEFAULT_ROLE_CONFIG.rules_extractor.effort }
+    : specToSdkArgs(spec ?? DEFAULT_ROLE_CONFIG.rules_extractor);
 
   // Quick check: are there any guidance files to read?
   const hasGuidance = await hasGuidanceFiles(projectDir);
@@ -114,7 +167,8 @@ export async function extractProjectRules(
         allowedTools: ["Read", "Glob", "Grep", "Bash"],
         cwd: projectDir,
         maxTurns: RULES_EXTRACTOR_MAX_TURNS,
-        model,
+        model: sdkArgs.model,
+        effort: sdkArgs.effort,
         settingSources: ["project"],
       },
       RULES_EXTRACTOR_TIMEOUT_MS,

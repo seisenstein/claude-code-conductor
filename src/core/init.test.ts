@@ -22,6 +22,7 @@ import type { DesignSpec, ProjectProfile } from "../utils/types.js";
 
 vi.mock("./project-detector.js", () => ({
   detectProjectWithCache: vi.fn(),
+  cacheProfile: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../utils/design-spec-analyzer.js", () => ({
@@ -30,6 +31,17 @@ vi.mock("../utils/design-spec-analyzer.js", () => ({
 
 vi.mock("../utils/flow-config-generator.js", () => ({
   generateFlowConfig: vi.fn(),
+}));
+
+// v0.7.1: flow-config-analyzer runs an LLM-based refinement. In tests we
+// stub it to pass the seed through unchanged so we can still assert on the
+// seed flow-config generator's output.
+vi.mock("../utils/flow-config-analyzer.js", () => ({
+  analyzeFlowConfig: vi.fn().mockImplementation(async (_projectDir, seed) => ({
+    flowConfig: seed,
+    analyzed: false,
+    warnings: [],
+  })),
 }));
 
 vi.mock("../utils/rules-extractor.js", () => ({
@@ -55,6 +67,7 @@ import { runInit } from "./init.js";
 import { detectProjectWithCache } from "./project-detector.js";
 import { analyzeDesignSystem } from "../utils/design-spec-analyzer.js";
 import { generateFlowConfig } from "../utils/flow-config-generator.js";
+import { analyzeFlowConfig } from "../utils/flow-config-analyzer.js";
 import { extractProjectRules } from "../utils/rules-extractor.js";
 import { ensureGitignore } from "../utils/gitignore.js";
 import { DEFAULT_FLOW_CONFIG } from "../utils/flow-config.js";
@@ -147,6 +160,11 @@ describe("runInit", () => {
     vi.mocked(detectProjectWithCache).mockResolvedValue(MOCK_PROFILE_FRONTEND);
     vi.mocked(generateFlowConfig).mockReturnValue(MOCK_FLOW_CONFIG);
     vi.mocked(analyzeDesignSystem).mockResolvedValue(MOCK_DESIGN_SPEC);
+    vi.mocked(analyzeFlowConfig).mockImplementation(async (_projectDir, seed) => ({
+      flowConfig: seed,
+      analyzed: false,
+      warnings: [],
+    }));
     vi.mocked(extractProjectRules).mockResolvedValue("# Conductor Worker Rules\n\n## Architecture Rules\n- Use secureHandler for all API routes\n");
     vi.mocked(ensureGitignore).mockResolvedValue();
 

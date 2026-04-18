@@ -40,16 +40,24 @@ Use the AskUserQuestion tool to confirm configuration. Use a **two-step flow**:
 
 **First**, ask a single question:
 - "Do you want to use all default conductor settings, or customize?"
-- Options: "Use all defaults" (description: "2 workers, Claude runtime, 5 max cycles, Codex reviews on, 15-min status checks") and "Customize" (description: "I want to change one or more settings")
+- Options: "Use all defaults" (description: "2 workers, Claude runtime, per-role model defaults, 5 max cycles, Codex reviews on, 15-min status checks") and "Customize" (description: "I want to change one or more settings")
 
 **If the user selects "Use all defaults"**, proceed with defaults. Do not ask further config questions.
+
+**Per-role defaults** (v0.7.0+, from `DEFAULT_ROLE_CONFIG` in `src/utils/constants.ts`):
+- planner, security worker, sentinel → **opus-4-7 xhigh** (reasoning/security wins)
+- frontend_ui worker → **opus-4-7 high** (better frontend)
+- backend / database / infrastructure / integration / testing / reverse_engineering / general workers → **opus-4-6 high** (avoids 4.7 stub-code regressions on backend)
+- flow tracer / conventions extractor / rules extractor / design-spec analyzer / design-spec updater → **sonnet-4-6 medium**
+
+Users can edit `.conductor/models.json` to override any role, or pass `--<group>-model` / `--<group>-effort` CLI flags at launch.
 
 **If the user selects "Customize"**, ask **two** follow-up multiSelect questions (AskUserQuestion allows max 4 options each):
 
 **Question 1**: "Which core settings do you want to change?" with options:
   - **Concurrency** (default: 2 parallel workers)
   - **Worker runtime** (default: Claude workers; switch to Codex CLI workers)
-  - **Model selection** (default: opus for workers, sonnet for subagents)
+  - **Model selection** (default: per-role defaults above; customize per-group or use legacy two-tier)
   - **Max cycles** (default: 5 cycles before escalating)
 
 **Question 2**: "Any other settings to change?" with options:
@@ -64,10 +72,26 @@ Both questions can be asked in a single AskUserQuestion call (the tool supports 
 - **Dry run**: "Enable dry run mode? (only generate the plan, don't execute)" Options: Yes, No. Default: No.
 - **Monitor interval**: "How often should I check on the conductor?" Options: 5 minutes (frequent updates, good for short runs), 10 minutes, 15 minutes (default, good balance), 30 minutes (less frequent, good for long runs). Default: 15 minutes.
 
-**If "Model selection" is chosen**, ask:
-- **Worker model**: "Which model for workers (planner, execution, flow tracing)?" Options: opus (most capable, highest cost), sonnet (balanced), haiku (fastest, cheapest). Default: opus.
-- **Subagent model**: "Which model for subagents spawned by workers?" Options: same as worker, opus, sonnet, haiku. Default: sonnet.
-- **Extended context** (only if worker is sonnet): "Use extended 1M token context window? (billed as extra usage)" Options: Yes, No. Default: No. Note: Opus 4.6 always includes 1M context at no extra cost.
+**If "Model selection" is chosen**, ask which override style the user wants:
+
+**Q: "How do you want to override model selection?"** Options:
+- **Per-group flags (recommended)** — override a specific group of roles (planner, security, frontend, backend, analyzer) while the rest keep their per-role defaults. Use `--<group>-model <tier>` / `--<group>-effort <level>`.
+- **Edit `.conductor/models.json`** — full per-role granularity; run `conduct init` first to materialize the file.
+- **Legacy two-tier** — one tier for all execution workers, one for all analyzers (pre-0.7.0 behavior). Uses `--worker-model` / `--subagent-model`.
+
+Follow-up questions depend on the choice:
+
+**If "Per-group flags"**, ask for the groups the user wants to change (multiSelect): **planner**, **security** (worker_security + sentinel), **frontend** (worker_frontend_ui), **backend** (backend_api + database + infrastructure + integration), **analyzer** (flow tracer + rules + conventions + design-spec). Then for each chosen group ask:
+- **Tier** (single-select): `opus-4-7` (Jan 2026, strongest reasoning, adaptive thinking only), `opus-4-6` (still has /fast, recommended for backend), `sonnet-4-6` (balanced), `haiku-4-5` (fastest/cheapest). Default: whatever the per-role default is for that group.
+- **Effort** (single-select): `low` | `medium` | `high` | `xhigh` (Opus 4.7 only) | `max`. Default: per-role default.
+- Optionally **default-effort** for any role without a group-specific effort set.
+
+**If "Legacy two-tier"**, ask:
+- **Worker tier**: Options: `opus-4-7`, `opus-4-6`, `sonnet-4-6`, `haiku-4-5` (aliases `opus`/`sonnet`/`haiku` still accepted). Default: opus-4-6.
+- **Subagent tier**: same options. Default: sonnet-4-6.
+- **Extended context** (only if worker is sonnet): "Use 1M token context window? (billed as extra usage)" Default: No. Note: Opus variants always include 1M at no extra cost.
+
+**If "Edit `.conductor/models.json`"**, tell the user to quit, run `conduct init` (which writes the file materialized with per-role defaults), edit the file, and re-invoke `/conduct`.
 
 ## Phase 2: Write Context File & Launch
 
@@ -100,9 +124,18 @@ A2: <answer>
 
 Concurrency: <n>
 Worker Runtime: <claude|codex>
-Worker Model: <opus|sonnet|haiku>
-Subagent Model: <opus|sonnet|haiku>
-Extended Context: <yes/no>
+Model Selection Mode: <per-role-defaults | per-group-flags | legacy-two-tier | models-json>
+<only if per-group-flags:>
+  Planner Model/Effort: <tier>/<level>
+  Security Model/Effort: <tier>/<level>
+  Frontend Model/Effort: <tier>/<level>
+  Backend Model/Effort: <tier>/<level>
+  Analyzer Model/Effort: <tier>/<level>
+  Default Effort: <level>
+<only if legacy-two-tier:>
+  Worker Tier: <opus-4-7|opus-4-6|sonnet-4-6|haiku-4-5|opus|sonnet|haiku>
+  Subagent Tier: <same options>
+  Extended Context: <yes/no>
 Max Cycles: <n>
 Usage Threshold: <n>%
 Skip Codex: <yes/no>
@@ -119,15 +152,21 @@ Then write the context file using your Write tool to `<project>/.conductor/conte
 
 ### Step 5: Launch the conductor
 
-Run it as a background process:
+Run it as a background process. Include only the flags that match the user's choices:
+
 ```bash
 conduct start "<feature description>" \
   --project "$(pwd)" \
   --context-file "$(pwd)/.conductor/context.md" \
   [--worker-runtime <claude|codex>] \
-  [--worker-model <opus|sonnet|haiku>] \
-  [--subagent-model <opus|sonnet|haiku>] \
-  [--extended-context] \
+  [--worker-model <tier> --subagent-model <tier>] \        # legacy two-tier (v0.6.x compat)
+  [--extended-context] \                                   # only with --worker-model sonnet
+  [--planner-model <tier>] [--planner-effort <level>] \    # per-group overrides (v0.7.0)
+  [--security-model <tier>] [--security-effort <level>] \
+  [--frontend-model <tier>] [--frontend-effort <level>] \
+  [--backend-model <tier>] [--backend-effort <level>] \
+  [--analyzer-model <tier>] [--analyzer-effort <level>] \
+  [--default-effort <level>] \                             # applies to roles w/o group flag
   --concurrency <n> \
   --max-cycles <n> \
   --usage-threshold <threshold> \
@@ -138,6 +177,9 @@ conduct start "<feature description>" \
   --verbose \
   2>&1 | tee "$(pwd)/.conductor/logs/conductor-stdout.log" &
 ```
+
+**Valid tiers:** `opus-4-7`, `opus-4-6`, `sonnet-4-6`, `haiku-4-5` (legacy aliases `opus`/`sonnet`/`haiku` still accepted → 4.6/4.6/4.5).
+**Valid effort levels:** `low` | `medium` | `high` | `xhigh` (Opus 4.7 only) | `max`.
 
 Tell the user the conductor has launched and give them these commands to monitor:
 - **Status**: `conduct status --project "$(pwd)"`

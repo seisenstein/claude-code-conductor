@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { McpServerConfig, PermissionMode, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./logger.js";
+import type { EffortLevel } from "./types.js";
 
 /**
  * Options passed to the Agent SDK `query()` call.
@@ -12,6 +13,12 @@ export interface QueryOptions {
   mcpServers?: Record<string, McpServerConfig>;
   /** Claude model ID to use. If omitted, uses the CLI default. */
   model?: string;
+  /**
+   * Reasoning effort level (low/medium/high/xhigh/max). Forwarded to the
+   * SDK's `effort` option, which maps to `output_config.effort` on the
+   * Claude API and guides adaptive-thinking depth. xhigh requires Opus 4.7.
+   */
+  effort?: EffortLevel;
   /** Settings sources to load (e.g. ["project"] for .claude/settings.json). */
   settingSources?: SettingSource[];
   /**
@@ -64,6 +71,7 @@ export async function queryWithTimeout(
           : {}),
         ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
         ...(options.model ? { model: options.model } : {}),
+        ...(options.effort ? { effort: options.effort } : {}),
         ...(options.settingSources ? { settingSources: options.settingSources } : {}),
         ...(options.abortController ? { abortController: options.abortController } : {}),
       },
