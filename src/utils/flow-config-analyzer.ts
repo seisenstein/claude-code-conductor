@@ -18,11 +18,10 @@ import path from "node:path";
 import {
   FLOW_CONFIG_ANALYZER_MAX_TURNS,
   FLOW_CONFIG_ANALYZER_TIMEOUT_MS,
-  DEFAULT_ROLE_CONFIG,
   READ_ONLY_DISALLOWED_TOOLS,
   getFlowConfigPath,
 } from "./constants.js";
-import { specToSdkArgs } from "./models-config.js";
+import { resolveLooseModelArg } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import { mkdirSecure } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
@@ -276,9 +275,8 @@ export async function analyzeFlowConfig(
   const warn = (msg: string) => (logger ? logger.warn(msg) : process.stderr.write(msg + "\n"));
   const warnings: string[] = [];
 
-  const sdkArgs = typeof modelSpec === "string"
-    ? { model: modelSpec, effort: DEFAULT_ROLE_CONFIG.flow_config_analyzer.effort }
-    : specToSdkArgs(modelSpec ?? DEFAULT_ROLE_CONFIG.flow_config_analyzer);
+  // H-11: route tier shorthands through MODEL_TIER_TO_ID.
+  const sdkArgs = resolveLooseModelArg(modelSpec, "flow_config_analyzer", warn);
 
   // Cache check (skipped when caller manages persistence themselves)
   const cachePath = getFlowConfigPath(projectDir);

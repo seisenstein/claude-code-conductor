@@ -13,10 +13,9 @@ import path from "node:path";
 import {
   RULES_EXTRACTOR_MAX_TURNS,
   RULES_EXTRACTOR_TIMEOUT_MS,
-  DEFAULT_ROLE_CONFIG,
   READ_ONLY_DISALLOWED_TOOLS,
 } from "./constants.js";
-import { specToSdkArgs } from "./models-config.js";
+import { resolveLooseModelArg } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
 import type { Logger } from "./logger.js";
 import type { RoleModelSpec } from "./types.js";
@@ -149,9 +148,8 @@ export async function extractProjectRules(
 ): Promise<string> {
   const warn = (msg: string) => (logger ? logger.warn(msg) : process.stderr.write(msg + "\n"));
 
-  const sdkArgs = typeof spec === "string"
-    ? { model: spec, effort: DEFAULT_ROLE_CONFIG.rules_extractor.effort }
-    : specToSdkArgs(spec ?? DEFAULT_ROLE_CONFIG.rules_extractor);
+  // H-11: route tier shorthands through MODEL_TIER_TO_ID.
+  const sdkArgs = resolveLooseModelArg(spec, "rules_extractor", warn);
 
   // Quick check: are there any guidance files to read?
   const hasGuidance = await hasGuidanceFiles(projectDir);
