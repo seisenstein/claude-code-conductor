@@ -211,11 +211,34 @@ export class StateManager {
         stale: 5000, // Consider locks stale after 5 seconds
       });
 
-      // Write to temp file first with secure permissions (mode 0o600)
-      await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+      // H-6: write tmp file and fsync BEFORE rename. Without the fsync, on
+      // power-loss the rename can complete while tmp data is still only in
+      // page cache, leaving state.json pointing at zero-length or garbage.
+      const tmpFh = await fs.open(tmpPath, "w", 0o600);
+      try {
+        await tmpFh.writeFile(content, { encoding: "utf-8" });
+        await tmpFh.sync(); // flush file data to disk before rename
+      } finally {
+        await tmpFh.close();
+      }
 
       // Atomic rename (prevents partial writes from being read)
       await fs.rename(tmpPath, statePath);
+
+      // H-6: fsync parent directory for full power-loss durability. Without
+      // this, the rename itself can be lost on power loss even though the
+      // file data was fsynced. Wrapped in try/catch because some filesystems
+      // (network mounts, certain FUSE FSs) return EINVAL on dir fsync.
+      try {
+        const dirFh = await fs.open(path.dirname(statePath), "r");
+        try {
+          await dirFh.sync();
+        } finally {
+          await dirFh.close();
+        }
+      } catch (err) {
+        warnStateManager(`Parent-dir fsync after state.json rename failed: ${String(err)}`);
+      }
 
       // H-5: update .bak AFTER successful main rename. Crash-mid-bak is
       // safe because the main state.json is already good — we'd just have
