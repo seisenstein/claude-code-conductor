@@ -499,7 +499,8 @@ describe("Orchestrator Integration - Happy Path", () => {
     await stateManager.resume();
 
     const state = stateManager.get();
-    expect(state.status).toBe("executing");
+    // H-13: resume() sets transient "initializing", not "executing".
+    expect(state.status).toBe("initializing");
     expect(state.paused_at).toBeNull();
   });
 });
@@ -811,7 +812,8 @@ describe("Orchestrator Integration - Pause and Resume", () => {
     await stateManager.resume();
 
     const state = stateManager.get();
-    expect(state.status).toBe("executing");
+    // H-13: resume() sets transient "initializing"; phases transition it.
+    expect(state.status).toBe("initializing");
     expect(state.paused_at).toBeNull();
     expect(state.resume_after).toBeNull();
   });
@@ -861,8 +863,8 @@ describe("Orchestrator Integration - Pause and Resume", () => {
     expect(completedTasks.length).toBe(1);
     expect(pendingTasks.length).toBe(1);
 
-    // Status should be executing, ready to continue
-    expect(stateManager.get().status).toBe("executing");
+    // H-13: resume() leaves status as "initializing"; phases transition it.
+    expect(stateManager.get().status).toBe("initializing");
   });
 
   // ============================================================
@@ -914,9 +916,10 @@ describe("Orchestrator Integration - Pause and Resume", () => {
     expect(state.status).toBe("paused");
     expect(state.paused_at).not.toBeNull();
 
-    // Resume goes back to executing
+    // H-13: resume() sets "initializing" regardless of pre-pause status.
+    // The phase that runs after resume is responsible for its own setStatus.
     await stateManager.resume();
-    expect(stateManager.get().status).toBe("executing");
+    expect(stateManager.get().status).toBe("initializing");
   });
 
   // ============================================================
@@ -1216,12 +1219,12 @@ describe("Orchestrator Integration - Force Resume Crash Recovery", () => {
     // Verify we're in executing state
     expect(stateManager.get().status).toBe("executing");
 
-    // Simulate force-resume: call resume() which sets status back to executing
-    // (In the orchestrator, this happens after the forceResume check in CLI)
+    // H-13: resume() sets status to transient "initializing" so a crash
+    // between here and the first real phase doesn't falsely claim execution
+    // was in progress.
     await stateManager.resume();
 
-    // Status should still be executing after resume
-    expect(stateManager.get().status).toBe("executing");
+    expect(stateManager.get().status).toBe("initializing");
     expect(stateManager.get().paused_at).toBeNull();
     expect(stateManager.get().resume_after).toBeNull();
   });
@@ -1238,10 +1241,11 @@ describe("Orchestrator Integration - Force Resume Crash Recovery", () => {
 
     expect(stateManager.get().status).toBe("planning");
 
-    // Force-resume sets status to executing
+    // H-13: resume() sets transient "initializing"; the orchestrator's
+    // next phase transitions to its own status on entry.
     await stateManager.resume();
 
-    expect(stateManager.get().status).toBe("executing");
+    expect(stateManager.get().status).toBe("initializing");
   });
 
   // ============================================================
@@ -1256,10 +1260,11 @@ describe("Orchestrator Integration - Force Resume Crash Recovery", () => {
 
     expect(stateManager.get().status).toBe("reviewing");
 
-    // Force-resume sets status to executing
+    // H-13: resume() sets transient "initializing"; the orchestrator's
+    // next phase transitions to its own status on entry.
     await stateManager.resume();
 
-    expect(stateManager.get().status).toBe("executing");
+    expect(stateManager.get().status).toBe("initializing");
   });
 
   // ============================================================
@@ -1274,10 +1279,11 @@ describe("Orchestrator Integration - Force Resume Crash Recovery", () => {
 
     expect(stateManager.get().status).toBe("checkpointing");
 
-    // Force-resume sets status to executing
+    // H-13: resume() sets transient "initializing"; the orchestrator's
+    // next phase transitions to its own status on entry.
     await stateManager.resume();
 
-    expect(stateManager.get().status).toBe("executing");
+    expect(stateManager.get().status).toBe("initializing");
   });
 
   // ============================================================
@@ -1293,10 +1299,11 @@ describe("Orchestrator Integration - Force Resume Crash Recovery", () => {
 
     expect(stateManager.get().status).toBe("flow_tracing");
 
-    // Force-resume sets status to executing
+    // H-13: resume() sets transient "initializing"; the orchestrator's
+    // next phase transitions to its own status on entry.
     await stateManager.resume();
 
-    expect(stateManager.get().status).toBe("executing");
+    expect(stateManager.get().status).toBe("initializing");
   });
 
   // ============================================================
@@ -1494,7 +1501,8 @@ describe("Orchestrator Integration - Force Resume Crash Recovery", () => {
     // Resume with different runtime
     await stateManager.resume("codex");
 
-    expect(stateManager.get().status).toBe("executing");
+    // H-13: resume() sets "initializing"; runtime update still applies.
+    expect(stateManager.get().status).toBe("initializing");
     expect(stateManager.get().worker_runtime).toBe("codex");
   });
 

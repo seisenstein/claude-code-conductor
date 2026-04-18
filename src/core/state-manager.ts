@@ -800,7 +800,12 @@ export class StateManager {
    */
   async resume(workerRuntime?: "claude" | "codex"): Promise<void> {
     this.ensureState();
-    this.state!.status = "executing";
+    // H-13: use the transient "initializing" status rather than "executing".
+    // resume() runs before any phase has actually started work; if the
+    // conductor crashes between here and the first real phase, a re-resume
+    // must not assume execution was in progress. Each phase calls setStatus
+    // itself when it actually begins.
+    this.state!.status = "initializing";
     this.state!.paused_at = null;
     this.state!.resume_after = null;
     if (workerRuntime) {
