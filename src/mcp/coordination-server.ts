@@ -17,6 +17,7 @@ import {
   handleGetDecisions,
   handleRunTests,
   VALID_DECISION_CATEGORIES,
+  MAX_READ_UPDATES_HARD_CAP,
 } from "./tools.js";
 
 // ============================================================
@@ -93,14 +94,18 @@ async function main(): Promise<void> {
   // ----------------------------------------------------------
   server.tool(
     "read_updates",
-    "Read messages from the orchestrator and other sessions. Returns messages addressed to this session or broadcast messages. Optionally filter by timestamp.",
+    "Read messages from the orchestrator and other sessions. Returns messages addressed to this session or broadcast messages. Optionally filter by timestamp or cap the number of returned messages.",
     {
       since: z.string().optional().describe(
         "ISO 8601 timestamp. Only return messages newer than this. If omitted, returns all messages."
       ),
+      // H-19: optional cap on returned messages. Clamped at handler level.
+      limit: z.number().int().positive().max(MAX_READ_UPDATES_HARD_CAP).optional().describe(
+        `Maximum number of messages to return (most recent first by timestamp). Omit to get all matching messages. Max ${MAX_READ_UPDATES_HARD_CAP}.`,
+      ),
     },
-    wrapToolHandler("read_updates", async (args: { since?: string }) => {
-      const messages = await handleReadUpdates({ since: args.since });
+    wrapToolHandler("read_updates", async (args: { since?: string; limit?: number }) => {
+      const messages = await handleReadUpdates({ since: args.since, limit: args.limit });
       return {
         content: [
           {
