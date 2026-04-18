@@ -271,6 +271,7 @@ export function createMockCodexReviewer(
       presumed_rate_limits: 0,
       last_presumed_rate_limit_at: null,
       output_too_large_failures: 0, // CR-2
+      execution_errors: 0, // H-16
     },
   } = options;
 

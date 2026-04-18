@@ -235,6 +235,14 @@ export interface CodexUsageMetrics {
    * see it distinctly in ops dashboards.
    */
   output_too_large_failures: number;
+  /**
+   * H-16: second-attempt execution errors with NO rate-limit signal
+   * (timeout/crash/no-output, but stderr doesn't match any provider
+   * rate-limit pattern). Previously these were blanket-classified as
+   * RATE_LIMITED and retried for up to 16 minutes. Now classified as
+   * ERROR so ops can distinguish them from real rate limits.
+   */
+  execution_errors: number;
 }
 
 export interface CodexReviewResult {
