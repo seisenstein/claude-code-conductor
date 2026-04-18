@@ -62,8 +62,18 @@ export class Logger {
     mkdirSecureSync(logDir, { recursive: true });
 
     this.logFilePath = path.join(logDir, `${name}.log`);
-    // Use mode 0o600 for owner-only read/write access (security requirement #15)
+    // Use mode 0o600 for owner-only read/write access (security requirement #15).
+    // Note: createWriteStream's `mode` only applies to newly-created files —
+    // existing files keep their pre-existing mode. After the stream opens,
+    // chmod unconditionally to defeat both umask AND pre-existing broad modes.
     this.logStream = fs.createWriteStream(this.logFilePath, { flags: "a", mode: 0o600 });
+    this.logStream.on("open", () => {
+      try {
+        fs.chmodSync(this.logFilePath, 0o600);
+      } catch {
+        // Best-effort: file may not exist yet in edge cases; ignore.
+      }
+    });
 
     // Safety net: close stream on process exit to prevent file descriptor leak (task-010).
     // Store reference so we can remove it in close() to avoid listener accumulation.

@@ -166,18 +166,31 @@ async function spawnCodexWithStdin(
     let overflowed = false;
     let timedOut = false;
     let settled = false;
+    let exited = false; // child actually emitted 'close' — distinct from proc.killed
+                        // (proc.killed flips true the moment we CALL kill(), not when the OS reaps)
+
+    proc.on("close", () => {
+      exited = true;
+    });
 
     const killChild = () => {
-      if (!proc.killed) {
-        try {
-          proc.kill("SIGTERM");
-          setTimeout(() => {
-            if (!proc.killed) proc.kill("SIGKILL");
-          }, 2000).unref();
-        } catch {
-          // ignore — process may already be gone
-        }
+      if (exited) return;
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // ignore — process may already be gone
       }
+      // Unconditional SIGKILL fallback after 2s. `proc.killed` is already true
+      // post-SIGTERM even if the child is still alive, so we gate on `exited`
+      // (set by the 'close' listener) instead.
+      setTimeout(() => {
+        if (exited) return;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }, 2000).unref();
     };
 
     const settle = (fn: () => void) => {
@@ -295,8 +308,30 @@ async function spawnCodexWithStdin(
       killChild();
     }, opts.timeoutMs);
 
-    // Write prompt to stdin and close. If stdin is unavailable (rare), the
-    // 'error' event above will fire with EPIPE; treat as crash.
+    // EPIPE defense: if codex exits before we finish writing, the stdin
+    // stream emits 'error' (EPIPE). Without a listener, Node treats this as
+    // an unhandled error and terminates the process. The proc-level 'error'
+    // handler does NOT catch stdin stream errors. EPIPE specifically is not
+    // fatal to us — the 'close' event will still run and report whatever
+    // stdout/stderr we got. For other stdin errors, treat as crash.
+    proc.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EPIPE") {
+        opts.logger.debug(
+          "codex stdin closed before write completed (EPIPE) — child exited early",
+        );
+        return;
+      }
+      settle(() =>
+        reject(
+          new CodexExecutionError(
+            `Codex stdin error: ${err.message}`,
+            "crash",
+          ),
+        ),
+      );
+    });
+
+    // Write prompt to stdin and close.
     try {
       proc.stdin?.write(stdinPayload);
       proc.stdin?.end();
@@ -639,17 +674,20 @@ export class CodexReviewer {
     let capReached = false;
 
     for (const p of readPaths) {
+      // Check cap BEFORE reading. Previously `readFilePrefix` ran first and
+      // its result was discarded post-cap — bounded but wasteful (100K chars
+      // × N files of pointless I/O). Fix: short-circuit here.
+      if (capReached) {
+        skippedAfterCap++;
+        continue;
+      }
+
       try {
         const { content, fullByteLength, wasTruncated } = await readFilePrefix(
           p,
           MAX_CODEX_PROMPT_FILE_CHARS,
         );
         const basename = path.basename(p);
-
-        if (capReached) {
-          skippedAfterCap++;
-          continue;
-        }
 
         const remaining = MAX_CODEX_PROMPT_AGGREGATE_CHARS - aggregateChars;
         if (remaining <= 0) {
