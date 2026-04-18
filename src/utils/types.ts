@@ -559,8 +559,15 @@ export interface ExecutionWorkerManager {
    * @param sessionId - New session ID for the retry worker
    * @param taskId - The task ID being retried
    * @param correctivePrompt - Optional prompt explaining what went wrong
+   * @param taskTypeHint - Optional task type for role-based model selection
+   *                      on the retry worker (H-10).
    */
-  spawnWorkerForRetry?(sessionId: string, taskId: string, correctivePrompt?: string): Promise<void>;
+  spawnWorkerForRetry?(
+    sessionId: string,
+    taskId: string,
+    correctivePrompt?: string,
+    taskTypeHint?: TaskType | null,
+  ): Promise<void>;
 
   /**
    * Get a preserved thread ID for a task (for session resumption).

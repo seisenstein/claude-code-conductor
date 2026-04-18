@@ -435,11 +435,15 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
    * @param sessionId - New session ID for the retry worker
    * @param taskId - The task ID being retried
    * @param correctivePrompt - Optional corrective prompt explaining what went wrong
+   * @param _taskTypeHint - H-10 parity with Claude WorkerManager. Codex
+   *   infers role from the preserved thread, so this hint is ignored here;
+   *   accepted for interface conformance.
    */
   async spawnWorkerForRetry(
     sessionId: string,
     taskId: string,
     correctivePrompt?: string,
+    _taskTypeHint?: import("../utils/types.js").TaskType | null,
   ): Promise<void> {
     if (this.activeWorkers.has(sessionId)) {
       this.logger.warn(`Worker ${sessionId} is already active; skipping spawn`);

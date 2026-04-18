@@ -1659,7 +1659,13 @@ export class Orchestrator {
               const correctivePrompt = retryTask.last_error
                 ? `Previous attempt failed: ${retryTask.last_error}. Please fix this and complete the task.`
                 : undefined;
-              await this.workers.spawnWorkerForRetry(sessionId, retryTask.id, correctivePrompt);
+              // H-10: pass task_type so retries keep role-specific model/effort.
+              await this.workers.spawnWorkerForRetry(
+                sessionId,
+                retryTask.id,
+                correctivePrompt,
+                retryTask.task_type ?? null,
+              );
             } else {
               await this.workers.spawnWorker(sessionId, hint);
             }
