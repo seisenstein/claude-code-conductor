@@ -182,6 +182,19 @@ describe("validateStateJsonLenient (backfill)", () => {
     }
   });
 
+  it("backfills consecutive_flow_tracing_failures to 0 (A-7, v0.7.4)", () => {
+    const state = minimalValidState();
+    // minimalValidState() does not set this field, so deletion is a no-op,
+    // but keep the explicit delete so the intent survives if someone adds
+    // it to minimalValidState later.
+    delete state.consecutive_flow_tracing_failures;
+    const result = validateStateJsonLenient(JSON.stringify(state));
+    expect(result.valid).toBe(true);
+    if (result.valid) {
+      expect(result.state.consecutive_flow_tracing_failures).toBe(0);
+    }
+  });
+
   it("also rejects malformed JSON in lenient mode", () => {
     const result = validateStateJsonLenient("not json at all");
     expect(result.valid).toBe(false);

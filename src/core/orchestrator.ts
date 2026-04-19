@@ -112,6 +112,24 @@ function slugify(text: string): string {
     .substring(0, 60);
 }
 
+/**
+ * A-7 (v0.7.4): Detects the synthetic FlowFinding we inject when flowReview()
+ * rejects with an infrastructure error (git-diff failure, tracer subprocess
+ * crash, etc.). Uses a three-marker check (actor + file_path + flow_id prefix)
+ * so a future change to any single marker can't silently break the detection.
+ *
+ * Synthetic infra findings should NOT produce fix tasks — no worker can repair
+ * the conductor's own git/flow-tracer pipeline — and after repeated occurrences
+ * the conductor escalates instead of looping forever.
+ */
+export function isSyntheticFlowInfraFinding(f: FlowFinding): boolean {
+  return (
+    f.actor === "conductor" &&
+    f.file_path === "<flow-tracing-infrastructure>" &&
+    f.flow_id.startsWith("flow-tracing-failure-")
+  );
+}
+
 // ============================================================
 // Orchestrator
 // ============================================================
@@ -464,8 +482,23 @@ export class Orchestrator {
         // On rejection, synthesize a high-severity finding so the checkpoint
         // logic below forces another cycle instead of silently passing.
         let flowReport: FlowTracingReport | null;
+        // A-7: track whether the user asked us to stop during escalation.
+        // Set below if consecutive infra failures trigger escalation and the
+        // user chooses "stop". Propagated after the checkpoint block so we
+        // still record the cycle before exiting.
+        let flowInfraEscalationStop = false;
         if (settled[1].status === "fulfilled") {
           flowReport = settled[1].value; // may legitimately be null
+          // A-7: Reset the streak ONLY on actual trace success (non-null).
+          // null is an intentional skip (--skip-flow-review, empty diff,
+          // capacity defer) and must not mask consecutive infra failures.
+          if (flowReport !== null) {
+            const currentState = this.state.get();
+            if (currentState.consecutive_flow_tracing_failures > 0) {
+              currentState.consecutive_flow_tracing_failures = 0;
+              await this.state.save();
+            }
+          }
         } else {
           const reason = String(settled[1].reason);
           this.logger.error(
@@ -488,6 +521,27 @@ export class Orchestrator {
             findings: [syntheticFinding],
             summary: { critical: 0, high: 1, medium: 0, low: 0, total: 1, cross_boundary_count: 0 },
           };
+
+          // A-7: increment the repeat-failure counter. If we've hit the
+          // threshold (2), escalate instead of silently looping forever on
+          // infrastructure failures that no worker can fix.
+          const currentState = this.state.get();
+          currentState.consecutive_flow_tracing_failures += 1;
+          await this.state.save();
+          if (currentState.consecutive_flow_tracing_failures >= 2) {
+            const decision = await this.escalateToUser(
+              "Flow-tracing infrastructure failed repeatedly",
+              `Flow tracing threw an exception ${currentState.consecutive_flow_tracing_failures} cycles in a row. ` +
+              `Most recent error: ${reason}. Investigate git-diff / FlowTracer subprocess health.`,
+            );
+            // Mirror the existing escalation handling below (see the
+            // post-checkpoint block): "stop" -> complete+return from run();
+            // "redirect" sets redirectGuidance for next cycle (done inside
+            // escalateToUser); "continue" falls through.
+            if (decision === "stop") {
+              flowInfraEscalationStop = true;
+            }
+          }
         }
 
         // Leg 2: design spec (non-gating). Warn on rejection but do not block.
@@ -561,6 +615,16 @@ export class Orchestrator {
           blast_radius: blastRadius,
         };
         await this.state.recordCycle(cycleRecord);
+
+        // A-7: If the user chose "stop" during the repeated-flow-infra
+        // escalation earlier in this cycle, honor that now that we've
+        // recorded the cycle. Mirrors the existing escalate-branch handling
+        // below (complete + return from run()).
+        if (flowInfraEscalationStop) {
+          this.logger.info("User requested stop after repeated flow-tracing failures. Finishing up.");
+          await this.complete();
+          return;
+        }
 
         if (result === "complete") {
           await this.complete();
@@ -2833,7 +2897,19 @@ export class Orchestrator {
     const existingIds = new Set(allTasks.map((t) => t.id));
     let nextTaskNum = 1;
 
+    let syntheticSkipped = 0;
     for (const finding of criticalAndHigh) {
+      // A-7: Synthetic flow-infra findings describe a conductor-side
+      // infrastructure failure (git/tracer) that no worker can fix.
+      // Skip task creation — the counter-based escalation handles repeats.
+      if (isSyntheticFlowInfraFinding(finding)) {
+        syntheticSkipped++;
+        this.logger.warn(
+          `Skipping fix-task creation for synthetic flow-infra finding (${finding.flow_id}). See A-7.`,
+        );
+        continue;
+      }
+
       let taskId: string;
       do {
         taskId = `task-fix-${String(nextTaskNum).padStart(3, "0")}`;
@@ -2866,8 +2942,9 @@ export class Orchestrator {
       this.logger.debug(`Created fix task ${taskId}: ${taskDef.subject}`);
     }
 
-    if (criticalAndHigh.length > 0) {
-      this.logger.info(`Created ${criticalAndHigh.length} fix task(s) from flow-tracing findings.`);
+    const tasksCreated = criticalAndHigh.length - syntheticSkipped;
+    if (tasksCreated > 0) {
+      this.logger.info(`Created ${tasksCreated} fix task(s) from flow-tracing findings.`);
     }
   }
 

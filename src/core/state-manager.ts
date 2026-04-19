@@ -77,6 +77,8 @@ export class StateManager {
       current_cycle: 0,
       max_cycles: options.maxCycles,
       concurrency: options.concurrency,
+      // A-7 (v0.7.4): counter for repeated flow-tracing infra failures
+      consecutive_flow_tracing_failures: 0,
       started_at: now,
       updated_at: now,
       paused_at: null,

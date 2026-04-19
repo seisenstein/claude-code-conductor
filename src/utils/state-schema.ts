@@ -199,6 +199,9 @@ export const OrchestratorStateSchema = z.object({
   current_cycle: z.number().int().nonnegative(),
   max_cycles: z.number().int().positive(),
   concurrency: z.number().int().positive(),
+  // A-7: v0.7.4 addition. .default(0) keeps older state.json valid
+  // on resume — field backfills to 0 if missing.
+  consecutive_flow_tracing_failures: z.number().int().nonnegative().default(0),
   started_at: z.string(),
   updated_at: z.string(),
   paused_at: z.string().nullable(),

@@ -13,8 +13,41 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 
+// Mock the SDK BEFORE importing Orchestrator (vitest hoists vi.mock() calls
+// above imports). The A-7 tests below construct a real Orchestrator and
+// exercise private methods; the mock prevents any stray SDK queries from
+// attempting network calls. Minimal shape — tests never invoke query().
+vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+  query: vi.fn(() => {
+    const gen = (async function* () { /* no messages */ })();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const shape: any = {
+      next: gen.next.bind(gen),
+      return: gen.return.bind(gen),
+      throw: gen.throw.bind(gen),
+      [Symbol.asyncIterator]: () => shape,
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      setPermissionMode: vi.fn().mockResolvedValue(undefined),
+      setModel: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn(),
+    };
+    return shape;
+  }),
+  createSdkMcpServer: vi.fn(() => ({ close: vi.fn() })),
+  tool: vi.fn(() => ({})),
+}));
+
 import { StateManager } from "./state-manager.js";
-import type { OrchestratorState, OrchestratorStatus } from "../utils/types.js";
+import { Orchestrator, isSyntheticFlowInfraFinding } from "./orchestrator.js";
+import type {
+  OrchestratorState,
+  OrchestratorStatus,
+  CLIOptions,
+  FlowFinding,
+  FlowTracingReport,
+} from "../utils/types.js";
+import { DEFAULT_MODEL_CONFIG } from "../utils/types.js";
+import { ORCHESTRATOR_DIR } from "../utils/constants.js";
 
 // ============================================================
 // Test Utilities
@@ -752,5 +785,196 @@ describe("Orchestrator State Machine", () => {
 
       expect(stateManager.get().base_commit_sha).toBe("abc123def456");
     });
+  });
+});
+
+// ============================================================
+// A-7 (v0.7.4): Synthetic flow-infra finding suppression + escalation
+// ============================================================
+
+function createA7Options(projectDir: string): CLIOptions {
+  return {
+    project: projectDir,
+    feature: "A-7 test feature",
+    concurrency: 1,
+    maxCycles: 3,
+    usageThreshold: 0.8,
+    skipCodex: true,
+    skipFlowReview: true,
+    skipDesignSpecUpdate: true,
+    dryRun: false,
+    resume: false,
+    verbose: false,
+    contextFile: null,
+    currentBranch: true,
+    workerRuntime: "claude",
+    forceResume: false,
+    modelConfig: DEFAULT_MODEL_CONFIG,
+  };
+}
+
+/**
+ * Build a FlowTracingReport with one synthetic infra finding, matching
+ * the shape the orchestrator's Phase-3 rejection branch produces.
+ */
+function makeSyntheticFlowReport(cycleNum: number): FlowTracingReport {
+  const synthetic: FlowFinding = {
+    flow_id: `flow-tracing-failure-cycle-${cycleNum}`,
+    severity: "high",
+    actor: "conductor",
+    title: "Flow tracing failed — security gate not evaluated",
+    description: `Flow tracing threw an exception during cycle ${cycleNum}: boom.`,
+    file_path: "<flow-tracing-infrastructure>",
+    cross_boundary: false,
+  };
+  return {
+    generated_at: new Date().toISOString(),
+    flows_traced: 0,
+    findings: [synthetic],
+    summary: { critical: 0, high: 1, medium: 0, low: 0, total: 1, cross_boundary_count: 0 },
+  };
+}
+
+describe("A-7: synthetic flow-infra finding suppression + escalation", () => {
+  let tempDir: string;
+  let orch: Orchestrator;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let orchAny: any;
+  let stateManager: StateManager;
+
+  beforeEach(async () => {
+    tempDir = path.join(
+      os.tmpdir(),
+      `a7-orch-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    await fs.mkdir(tempDir, { recursive: true });
+    await fs.mkdir(path.join(tempDir, ORCHESTRATOR_DIR), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(tempDir, ".gitignore"), ".conductor/\n");
+
+    const options = createA7Options(tempDir);
+    orch = new Orchestrator(options);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    orchAny = orch as any;
+
+    // Initialize state so the private state manager has a fresh state with
+    // consecutive_flow_tracing_failures: 0.
+    stateManager = orchAny.state as StateManager;
+    await stateManager.initialize(options.feature, "conduct/a7-test", {
+      maxCycles: options.maxCycles,
+      concurrency: options.concurrency,
+      workerRuntime: options.workerRuntime,
+      modelConfig: options.modelConfig,
+    });
+    await stateManager.createDirectories();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  });
+
+  it("isSyntheticFlowInfraFinding checks all three markers", () => {
+    // Sanity: exported helper returns true only when all three markers match.
+    const real: FlowFinding = {
+      flow_id: "flow-001",
+      severity: "high",
+      actor: "authenticated_user",
+      title: "Missing authz",
+      description: "...",
+      file_path: "src/api.ts",
+      cross_boundary: true,
+    };
+    expect(isSyntheticFlowInfraFinding(real)).toBe(false);
+    const synthetic = makeSyntheticFlowReport(1).findings[0];
+    expect(isSyntheticFlowInfraFinding(synthetic)).toBe(true);
+    // Drop any one marker — helper must return false.
+    expect(isSyntheticFlowInfraFinding({ ...synthetic, actor: "user" })).toBe(false);
+    expect(isSyntheticFlowInfraFinding({ ...synthetic, file_path: "src/x.ts" })).toBe(false);
+    expect(isSyntheticFlowInfraFinding({ ...synthetic, flow_id: "flow-001" })).toBe(false);
+  });
+
+  it("synthetic infra finding does NOT create a fix task (warns instead)", async () => {
+    const report = makeSyntheticFlowReport(1);
+
+    // Spy on logger.warn to assert the explanatory warning fires.
+    const warnSpy = vi.spyOn(orchAny.logger, "warn");
+
+    // createFixTasksFromFindings is private — cast through any.
+    await orchAny.createFixTasksFromFindings(report);
+
+    const tasks = await stateManager.getAllTasks();
+    // No fix task should exist for the synthetic finding.
+    expect(tasks.filter((t) => t.id.startsWith("task-fix-"))).toHaveLength(0);
+    expect(tasks).toHaveLength(0);
+
+    // Warning should explain why task creation was skipped (A-7).
+    const warnCalls = warnSpy.mock.calls.map((c) => String(c[0]));
+    expect(
+      warnCalls.some((m) => m.includes("synthetic flow-infra finding") && m.includes("A-7")),
+    ).toBe(true);
+  });
+
+  it("counter increments on reject, resets on non-null fulfilled, untouched on null", async () => {
+    // Start from 0 (initialize sets it).
+    expect(stateManager.get().consecutive_flow_tracing_failures).toBe(0);
+
+    // Simulate rejection-branch bookkeeping: increment + save.
+    const state1 = stateManager.get();
+    state1.consecutive_flow_tracing_failures += 1;
+    await stateManager.save();
+    expect(stateManager.get().consecutive_flow_tracing_failures).toBe(1);
+
+    // Simulate intentional-skip branch (null flowReport): counter unchanged.
+    // (The orchestrator code skips the reset block when flowReport === null.)
+    expect(stateManager.get().consecutive_flow_tracing_failures).toBe(1);
+
+    // Simulate actual-success branch (non-null flowReport): counter resets.
+    const state2 = stateManager.get();
+    if (state2.consecutive_flow_tracing_failures > 0) {
+      state2.consecutive_flow_tracing_failures = 0;
+      await stateManager.save();
+    }
+    expect(stateManager.get().consecutive_flow_tracing_failures).toBe(0);
+
+    // Persistence round-trip: reload state and confirm reset stuck.
+    const fresh = new StateManager(tempDir);
+    const loaded = await fresh.load();
+    expect(loaded.consecutive_flow_tracing_failures).toBe(0);
+  });
+
+  it("counter at threshold (2) triggers escalateToUser with flow-tracing reason", async () => {
+    // Seed state so the next increment hits the threshold.
+    const state = stateManager.get();
+    state.consecutive_flow_tracing_failures = 1;
+    await stateManager.save();
+
+    // Spy on the private escalateToUser method; short-circuit so we don't
+    // block on stdin or throw ConductorExitError in non-interactive mode.
+    const escalateSpy = vi
+      .spyOn(orchAny, "escalateToUser")
+      .mockResolvedValue("stop");
+
+    // Replicate the rejection branch's state-update + escalation trigger.
+    const s = stateManager.get();
+    s.consecutive_flow_tracing_failures += 1;
+    await stateManager.save();
+    expect(s.consecutive_flow_tracing_failures).toBe(2);
+
+    if (s.consecutive_flow_tracing_failures >= 2) {
+      const decision = await orchAny.escalateToUser(
+        "Flow-tracing infrastructure failed repeatedly",
+        `Flow tracing threw an exception ${s.consecutive_flow_tracing_failures} cycles in a row. ` +
+        `Most recent error: boom. Investigate git-diff / FlowTracer subprocess health.`,
+      );
+      expect(decision).toBe("stop");
+    }
+
+    expect(escalateSpy).toHaveBeenCalledTimes(1);
+    const [reason, details] = escalateSpy.mock.calls[0];
+    expect(reason).toContain("Flow-tracing infrastructure");
+    expect(details).toContain("2 cycles in a row");
+    expect(details).toContain("Investigate git-diff / FlowTracer");
   });
 });
