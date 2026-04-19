@@ -14,7 +14,7 @@ import {
   MAX_CODEX_STDOUT_BYTES,
 } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
-import { mkdirSecure } from "../utils/secure-fs.js";
+import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
 
 /** Timeout for each codex review invocation: 5 minutes. */
@@ -959,8 +959,11 @@ export class CodexReviewer {
     ].join("\n");
 
     try {
-      // Use secure permissions: mode 0o600 for file (owner rw only)
-      await fs.writeFile(filePath, content, { encoding: "utf-8", mode: 0o600 });
+      // A-R1 (v0.7.5): atomic write via writeJsonAtomic — tmp + fsync +
+      // rename + chmod to 0o600. Previously fs.writeFile which could lose
+      // review content on crash mid-save. writeJsonAtomic is content-agnostic
+      // despite the name; works for the Markdown content here.
+      await writeJsonAtomic(filePath, content);
       this.logger.info(`Saved review to ${filePath}`);
     } catch (err) {
       this.logger.error(`Failed to save review to ${filePath}: ${String(err)}`);
