@@ -18,6 +18,23 @@ import {
   ORCHESTRATOR_DIR,
 } from "../utils/constants.js";
 import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
+import { redactSecrets } from "../utils/logger.js";
+
+/**
+ * A-3: Apply redactSecrets to any string `error` field on an event.
+ * Worker failure events (worker_fail, task_failed, worker_timeout) commonly
+ * carry stderr/stack-trace text that may contain API keys, bearer tokens,
+ * etc. This sanitizer runs on every event before it's persisted to disk.
+ */
+function sanitizeEvent<T extends StructuredEvent>(event: T): T {
+  if (!("error" in event) || typeof (event as { error?: unknown }).error !== "string") {
+    return event;
+  }
+  return {
+    ...event,
+    error: redactSecrets((event as unknown as { error: string }).error),
+  };
+}
 
 // ============================================================
 // Types
@@ -194,7 +211,13 @@ export class EventLog {
         // File doesn't exist yet, that's fine
       }
 
-      const lines = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+      // A-3: redact likely secrets (API keys, bearer tokens, etc.) from any
+      // string `error` field before persisting. Worker failure events
+      // (worker_fail, task_failed, worker_timeout) commonly carry stderr or
+      // stack-trace text that may include credentials; this is defense in
+      // depth alongside the logger-level redaction in Logger.writeToFile.
+      const sanitized = events.map(sanitizeEvent);
+      const lines = sanitized.map((e) => JSON.stringify(e)).join("\n") + "\n";
       const newSize = currentSize + Buffer.byteLength(lines, "utf-8");
 
       if (newSize > MAX_EVENT_LOG_SIZE_BYTES) {
@@ -217,6 +240,12 @@ export class EventLog {
    * A-1/A-2: Uses writeJsonAtomic for tmp+fsync+rename. If rotation fails,
    * we propagate the error rather than truncating the log — leaving the
    * existing file intact is strictly better than silently losing everything.
+   *
+   * A-3: Re-parse each kept line and re-sanitize the `error` field before
+   * re-serializing. This closes the gap where events persisted by earlier
+   * (pre-A-3) versions still carry unredacted secrets on disk — the first
+   * rotation after upgrade will clean them. Lines that don't parse as JSON
+   * are preserved as-is (same behavior as readAll's corruption tolerance).
    */
   private async rotate(): Promise<void> {
     const content = await fs.readFile(this.logPath, "utf-8");
@@ -224,7 +253,20 @@ export class EventLog {
 
     // Keep the most recent half
     const keepLines = lines.slice(Math.floor(lines.length / 2));
-    const newContent = keepLines.join("\n") + "\n";
+
+    // A-3: re-sanitize each kept line. If a line fails to parse as JSON
+    // (e.g. an earlier corrupted write), keep it verbatim — readAll will
+    // skip it on next load, and we don't want rotation to drop data.
+    const sanitizedLines = keepLines.map((line) => {
+      if (!line) return line;
+      try {
+        const parsed = JSON.parse(line) as StructuredEvent;
+        return JSON.stringify(sanitizeEvent(parsed));
+      } catch {
+        return line;
+      }
+    });
+    const newContent = sanitizedLines.join("\n") + "\n";
 
     await writeJsonAtomic(this.logPath, newContent);
   }

@@ -889,3 +889,77 @@ describe("EventLog A-1/A-2: rotation atomicity", () => {
     expect(after).toBe(before);
   });
 });
+
+// ============================================================
+// A-3: event-log secret redaction
+// ============================================================
+
+describe("A-3: event-log secret redaction", () => {
+  let tempDir: string;
+  let eventLog: EventLog;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "conductor-a3-test-"));
+    await fs.mkdir(path.join(tempDir, ORCHESTRATOR_DIR), { recursive: true });
+    eventLog = new EventLog(tempDir);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    if (eventLog.isRunning()) {
+      await eventLog.stop();
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("redacts Bearer tokens in error fields before writing to disk", async () => {
+    eventLog.record({
+      type: "worker_fail",
+      session_id: "worker-secret",
+      error: "Bearer sk-ant-abcdefghijklmnop fetch failed",
+    });
+
+    await eventLog.flush();
+
+    const logPath = path.join(tempDir, ORCHESTRATOR_DIR, EVENTS_FILE);
+    const raw = await fs.readFile(logPath, "utf-8");
+
+    // The plaintext token must not survive to disk.
+    expect(raw).not.toContain("sk-ant-abcdefghijklmnop");
+    expect(raw).not.toContain("Bearer sk-ant-abcdefghijklmnop");
+
+    // A redaction marker from logger.ts must be present. Both the
+    // sk-ant-*** and Bearer *** patterns emit "***REDACTED***".
+    expect(raw).toContain("***REDACTED***");
+
+    // Event shape is otherwise preserved.
+    const events = await eventLog.readAll();
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("worker_fail");
+    const fail = events[0] as Extract<StructuredEvent, { type: "worker_fail" }>;
+    expect(fail.session_id).toBe("worker-secret");
+    expect(fail.error).not.toContain("sk-ant-abcdefghijklmnop");
+    expect(fail.error).toContain("***REDACTED***");
+  });
+
+  it("leaves benign events without an error field byte-for-byte identical", async () => {
+    const input = {
+      type: "task_claimed" as const,
+      task_id: "task-benign",
+      session_id: "worker-benign",
+      timestamp: "2024-06-15T12:00:00.000Z",
+    };
+
+    eventLog.record(input);
+    await eventLog.flush();
+
+    const logPath = path.join(tempDir, ORCHESTRATOR_DIR, EVENTS_FILE);
+    const raw = await fs.readFile(logPath, "utf-8");
+    const line = raw.trim();
+
+    // Round-trip: the parsed event deep-equals the input (no redaction side
+    // effects for events that never had an `error` field).
+    const parsed = JSON.parse(line);
+    expect(parsed).toEqual(input);
+  });
+});
