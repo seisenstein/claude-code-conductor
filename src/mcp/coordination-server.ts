@@ -297,7 +297,7 @@ async function main(): Promise<void> {
     "register_contract",
     "Register a contract (API endpoint, type definition, event schema, or database schema) so other workers can discover and depend on it.",
     {
-      contract_id: z.string().describe("Unique identifier for the contract (e.g. 'POST /api/users', 'UserProfile type')"),
+      contract_id: z.string().describe("Unique identifier for the contract. Must not contain path separators (/, \\, :). Use underscores for compound names: 'post_api_users', 'UserProfile_type'."),
       contract_type: z.enum(["api_endpoint", "type_definition", "event_schema", "database_schema"]).describe("The kind of contract being registered"),
       spec: z.string().describe("The contract specification (e.g. TypeScript interface, OpenAPI snippet, SQL DDL)"),
       task_id: z.string().optional().describe("The task ID that owns this contract. If omitted, defaults to the session ID."),

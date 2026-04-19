@@ -23,7 +23,7 @@ import {
   DECISIONS_FILE,
 } from "../utils/constants.js";
 import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
-import { validateFileName, validateFileNames } from "../utils/validation.js";
+import { validateFileName, validateFileNames, validateIdentifier } from "../utils/validation.js";
 import { appendJsonlLocked, mkdirSecure } from "../utils/secure-fs.js";
 
 const execFileAsync = promisify(execFile);
@@ -272,6 +272,15 @@ export async function handleReadUpdates(
     // H-19: mtime pre-filter. If `since` is supplied and the file hasn't
     // been modified since then, no message inside could be newer than
     // `since`. Invisible optimization — output is identical to pre-H-19.
+    //
+    // TOCTOU residual (A-8, v0.7.4): this mtime check and the subsequent
+    // readJsonlFile are not atomic. A concurrent appendFile between the
+    // two can add a message that mtime-based skip reasoned around. The
+    // observable effect is a transient delivery delay — the message
+    // shows up on a subsequent read_updates call rather than this one.
+    // Never data loss. Fully fixing the race would require file-level
+    // locking coordinated with every writer, which is heavier than the
+    // bug warrants. Tracked for v0.8.0 if ever needed.
     if (sinceTs > 0) {
       try {
         const stat = await fs.stat(filePath);
@@ -437,8 +446,8 @@ export interface ClaimTaskInput {
 export async function handleClaimTask(
   input: ClaimTaskInput
 ): Promise<ClaimTaskResult> {
-  // Validate task_id to prevent path traversal (#28)
-  const taskIdValidation = validateFileName(input.task_id);
+  // Validate task_id to prevent path traversal (#28, A-4 v0.7.4)
+  const taskIdValidation = validateIdentifier(input.task_id);
   if (!taskIdValidation.valid) {
     return { success: false, error: `Invalid task_id: ${taskIdValidation.reason}` };
   }
@@ -477,8 +486,8 @@ export async function handleClaimTask(
     // Verify all dependencies are completed
     if (task.depends_on.length > 0) {
       for (const depId of task.depends_on) {
-        // Validate dep ID to prevent path traversal (#30)
-        const depValidation = validateFileName(depId);
+        // Validate dep ID to prevent path traversal (#30, A-4 v0.7.4)
+        const depValidation = validateIdentifier(depId);
         if (!depValidation.valid) {
           return { success: false, error: `Invalid dependency ID "${depId}": ${depValidation.reason}` };
         }
@@ -612,8 +621,8 @@ export interface CompleteTaskResult {
 export async function handleCompleteTask(
   input: CompleteTaskInput
 ): Promise<CompleteTaskResult> {
-  // Validate task_id to prevent path traversal (#28)
-  const taskIdValidation = validateFileName(input.task_id);
+  // Validate task_id to prevent path traversal (#28, A-4 v0.7.4)
+  const taskIdValidation = validateIdentifier(input.task_id);
   if (!taskIdValidation.valid) {
     return { success: false, error: `Invalid task_id: ${taskIdValidation.reason}` };
   }
@@ -739,8 +748,8 @@ export interface GetSessionStatusResult {
 export async function handleGetSessionStatus(
   input: GetSessionStatusInput
 ): Promise<GetSessionStatusResult> {
-  // Validate session_id to prevent path traversal (#29)
-  const sessionIdValidation = validateFileName(input.session_id);
+  // Validate session_id to prevent path traversal (#29, A-4 v0.7.4)
+  const sessionIdValidation = validateIdentifier(input.session_id);
   if (!sessionIdValidation.valid) {
     return { found: false };
   }
@@ -776,8 +785,8 @@ export async function handleRegisterContract(
     return { error: sizeValidation.error.issues.map((e: { message: string }) => e.message).join("; ") };
   }
 
-  // Validate contract_id to prevent path traversal (#14)
-  const validation = validateFileName(input.contract_id);
+  // Validate contract_id to prevent path traversal (#14, A-4 v0.7.4)
+  const validation = validateIdentifier(input.contract_id);
   if (!validation.valid) {
     return { error: `Invalid contract_id: ${validation.reason}` };
   }

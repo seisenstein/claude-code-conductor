@@ -149,6 +149,26 @@ export function assertValidFileName(filename: string): void {
 }
 
 /**
+ * Validates an identifier that becomes part of a filesystem path (task_id,
+ * session_id, contract_id, dependency task_id). Stricter than validateFileName:
+ * rejects all path separators to ensure the resulting path does not traverse.
+ *
+ * NOT for: files_changed (intentional relative paths); any free-form
+ * content field.
+ */
+export function validateIdentifier(id: string): FileNameValidationResult {
+  const base = validateFileName(id);
+  if (!base.valid) return base;
+  if (id.includes("/") || id.includes("\\") || id.includes(":")) {
+    return {
+      valid: false,
+      reason: "Identifier cannot contain path separators (/, \\, :)",
+    };
+  }
+  return { valid: true };
+}
+
+/**
  * Validates multiple filenames and returns all validation failures.
  *
  * @param filenames - Array of filenames to validate
