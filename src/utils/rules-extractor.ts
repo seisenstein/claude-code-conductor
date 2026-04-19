@@ -164,7 +164,7 @@ export async function extractProjectRules(
     resultText = await queryWithTimeout(
       EXTRACTION_PROMPT,
       {
-        allowedTools: ["Read", "Glob", "Grep", "Bash"],
+        allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"],
         disallowedTools: READ_ONLY_DISALLOWED_TOOLS, // CR-1
         cwd: projectDir,
         maxTurns: RULES_EXTRACTOR_MAX_TURNS,
