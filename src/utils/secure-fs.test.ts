@@ -270,6 +270,29 @@ describe("secure-fs", () => {
       expect(destExists).toBe(false);
     });
 
+    it("swallows unlink error when fs.open itself throws (no tmp was created)", async () => {
+      const dest = path.join(tmpDir, "fail-open.json");
+
+      // Force fs.open to throw. No tmp file will exist; the finally's
+      // unlink attempt should swallow the ENOENT gracefully so the caller
+      // sees the original open error and not a confusing unlink error.
+      const openSpy = vi.spyOn(fs, "open").mockImplementation(async () => {
+        throw new Error("simulated open failure (EACCES)");
+      });
+
+      try {
+        await expect(writeJsonAtomic(dest, "whatever")).rejects.toThrow("simulated open failure (EACCES)");
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // No tmp, no dest
+      const tmpExists = await fs.access(dest + ".tmp").then(() => true).catch(() => false);
+      const destExists = await fs.access(dest).then(() => true).catch(() => false);
+      expect(tmpExists).toBe(false);
+      expect(destExists).toBe(false);
+    });
+
     it("cleans up .tmp when the rename phase throws", async () => {
       const dest = path.join(tmpDir, "fail-rename.json");
 
