@@ -205,20 +205,38 @@ export async function writeJsonAtomic(
   const mode = options?.mode ?? SECURE_FILE_MODE;
   const wantFsync = options?.fsync !== false;
   const tmpPath = destPath + ".tmp";
-  const fh = await fs.open(tmpPath, "w", mode);
+  let renamed = false;
   try {
-    await fh.writeFile(content, { encoding: "utf-8" });
-    if (wantFsync) await fh.sync();
+    const fh = await fs.open(tmpPath, "w", mode);
+    try {
+      await fh.writeFile(content, { encoding: "utf-8" });
+      if (wantFsync) await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await fs.rename(tmpPath, destPath);
+    renamed = true;
+    // Enforce secure permissions if the destination already existed with looser
+    // perms (fs.open's mode only applies on creation).
+    try {
+      await fs.chmod(destPath, mode);
+    } catch {
+      // Non-fatal — rename succeeded, file exists at destPath; chmod failure
+      // is typically a permissions issue not worth failing the write over.
+    }
   } finally {
-    await fh.close();
-  }
-  await fs.rename(tmpPath, destPath);
-  // Enforce secure permissions if the destination already existed with looser
-  // perms (fs.open's mode only applies on creation).
-  try {
-    await fs.chmod(destPath, mode);
-  } catch {
-    // Non-fatal — rename succeeded, file exists at destPath; chmod failure
-    // is typically a permissions issue not worth failing the write over.
+    // A-R2-prereq (v0.7.5): clean up the tmp file if we never successfully
+    // renamed it. A successful rename consumes tmp (POSIX atomic rename), so
+    // skip in that case. On failure the tmp might exist (write/sync/close
+    // succeeded but rename failed) or not (fs.open itself failed); either way,
+    // swallow the unlink error — there's nothing useful to do with it and the
+    // caller's original error is more informative.
+    if (!renamed) {
+      try {
+        await fs.unlink(tmpPath);
+      } catch {
+        // tmp might not exist; ignore
+      }
+    }
   }
 }

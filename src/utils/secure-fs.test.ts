@@ -241,5 +241,55 @@ describe("secure-fs", () => {
       const stat = await fs.stat(dest);
       expect(stat.mode & 0o777).toBe(SECURE_FILE_MODE);
     });
+
+    // A-R2-prereq (v0.7.5): tmp-cleanup on failure paths.
+    it("cleans up .tmp when the write phase throws", async () => {
+      const dest = path.join(tmpDir, "fail-write.json");
+
+      // Force FileHandle.writeFile to throw, leaving a tmp file on disk.
+      const realOpen = fs.open.bind(fs);
+      const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+        const fh = await realOpen(...args);
+        fh.writeFile = async () => {
+          throw new Error("simulated write failure");
+        };
+        return fh;
+      });
+
+      try {
+        await expect(writeJsonAtomic(dest, "whatever")).rejects.toThrow("simulated write failure");
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      // .tmp must not remain after the failed write
+      const tmpExists = await fs.access(dest + ".tmp").then(() => true).catch(() => false);
+      expect(tmpExists).toBe(false);
+      // destination must not exist either (nothing was renamed)
+      const destExists = await fs.access(dest).then(() => true).catch(() => false);
+      expect(destExists).toBe(false);
+    });
+
+    it("cleans up .tmp when the rename phase throws", async () => {
+      const dest = path.join(tmpDir, "fail-rename.json");
+
+      // Let open/write/sync succeed; force rename to throw.
+      const realRename = fs.rename.bind(fs);
+      const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (oldP, newP) => {
+        if (newP === dest) {
+          throw new Error("simulated rename failure");
+        }
+        return realRename(oldP, newP);
+      });
+
+      try {
+        await expect(writeJsonAtomic(dest, "whatever")).rejects.toThrow("simulated rename failure");
+      } finally {
+        renameSpy.mockRestore();
+      }
+
+      const tmpExists = await fs.access(dest + ".tmp").then(() => true).catch(() => false);
+      expect(tmpExists).toBe(false);
+    });
   });
 });
