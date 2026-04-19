@@ -51,7 +51,7 @@ The central class that drives the lifecycle through phases: init check -> plan -
 
 ### Planning System
 - **Planner** (`src/core/planner.ts`) -- Decomposes features into typed tasks with dependencies, security requirements, performance requirements, and acceptance criteria. Generates STRIDE threat models before task decomposition. Identifies anchor tasks (shared foundations that must execute first). Asks security-focused clarifying questions (auth, authorization, data sensitivity, rate limiting, audit logging).
-- **Task types**: `backend_api`, `frontend_ui`, `database`, `security`, `testing`, `infrastructure`, `general`. Each type gets specific worker guidance.
+- **Task types**: `backend_api`, `frontend_ui`, `database`, `security`, `testing`, `infrastructure`, `reverse_engineering`, `integration`, `general`. Each type gets specific worker guidance.
 - **CodexReviewer** (`src/core/codex-reviewer.ts`) -- Calls external `codex` CLI for plan discussion (up to 5 rounds) and code review (up to 5 rounds).
 
 ### Worker System
@@ -100,7 +100,7 @@ The central class that drives the lifecycle through phases: init check -> plan -
 - **Worker tool allowlists**: Workers get `WORKER_ALLOWED_TOOLS` (constants.ts) including the 6 new coordination tools. Flow-tracing and sentinel workers are restricted to read-only tools.
 - **Rich task definitions**: Tasks carry `task_type`, `security_requirements`, `performance_requirements`, `acceptance_criteria`, `risk_level`, and `review_feedback`. The planner generates all of these.
 - **Cross-worker coordination**: Contracts (API schemas, type defs) and architectural decisions are shared through MCP tools. `claim_task` returns dependency context so workers know what predecessors produced.
-- **Parallel review + flow tracing + design spec update**: Code review, flow tracing, and design spec update run via `Promise.all()` since all three are independent post-execution operations.
+- **Parallel review + flow tracing + design spec update**: Code review, flow tracing, and design spec update run via `Promise.allSettled()` (v0.7.3 H-4). If flow-tracing rejects, a synthetic `FlowTracingReport` (marked with `actor: "conductor"`, `file_path: "<flow-tracing-infrastructure>"`) is injected to force another cycle; `createFixTasksFromFindings` skips synthetic findings via `isSyntheticFlowInfraFinding`. After 2 consecutive flow-tracing rejections (`consecutive_flow_tracing_failures` counter on `OrchestratorState`), the orchestrator escalates to the user.
 - **Checkpoint gating**: If flow tracing finds critical/high issues or code review fails, the checkpoint auto-generates fix tasks and forces another cycle. The system does not ship known-bad code.
 - **Known issues registry**: Findings from any source (Codex, flow tracing, semgrep, sentinel) persist across cycles and feed back into replanning.
 - **Escalation model**: After `MAX_DISAGREEMENT_ROUNDS` (2) or `DEFAULT_MAX_CYCLES` (5), the conductor writes `escalation.json` and pauses for human guidance.
@@ -108,3 +108,72 @@ The central class that drives the lifecycle through phases: init check -> plan -
 - **Design spec integration**: Frontend design system analysis from `conduct init` is injected into `frontend_ui` worker prompts. Workers see shared primitives, variant patterns, and theming — preventing them from modifying shared component base styles. Post-cycle updater keeps the spec fresh.
 - **Existing-file-safe init**: `conduct init` never overwrites existing config files. If a file already exists, the new version goes to `.conductor/recommended-configs/` for manual comparison.
 - **Configurable per-project**: `.conductor/rules.md` for worker rules, `.conductor/flow-config.json` for flow-tracing layers/actors/edge-cases, `.conductor/design-spec.json` for frontend design system context.
+
+## Patterns added v0.7.2 – v0.7.5
+
+Security and reliability patterns introduced across recent patch cycles. Use these when touching the affected code paths.
+
+### Filesystem writes
+
+- **`writeJsonAtomic(destPath, content, options?)`** from `src/utils/secure-fs.ts` — tmp + fsync + atomic rename + chmod to 0o600, with automatic tmp cleanup on failure. Content-agnostic (the name is historical; works for JSON, Markdown, or any string). Use for any persistence write where a crash mid-save must not corrupt the target. Currently used at 11+ sites (all task/contract/decision/review/event-log writes). v0.7.4 A-1 / v0.7.5 A-R1 + A-R2 + A-R2-prereq.
+- **`mkdirSecure(dir, { recursive })`** from `src/utils/secure-fs.ts` — mkdir with post-mkdir chmod to 0o700 to defeat umask (v0.7.2 H-2). Always pair with `writeJsonAtomic` or `writeFileSecure` for full directory+file security.
+
+### Identifier validation
+
+- **`validateFileName(id)`** — permits relative paths (forward slash allowed). Use for `files_changed` and similar path-shaped values.
+- **`validateIdentifier(id)`** from `src/utils/validation.ts` (v0.7.4 A-4) — stricter: rejects forward slash, backslash, colon, AND their URL-encoded forms (%2F, %5C, %3A). Use for any value that becomes a filesystem path segment: `task_id`, `session_id`, `contract_id`, dep task IDs. The pre-existing assumption that `contract_id` supported endpoint-style values like `"POST /api/users"` was broken in code (would ENOENT); v0.7.4 corrected both the code and the tool schema description.
+
+### Prompt sanitization
+
+- **`sanitizePromptSection(content, maxLength?)`** from `src/utils/sanitize.ts` — strips role markers (`Human:`, `Assistant:`), length-caps, neutralizes injection patterns. Apply to any user-ish text before interpolating into a worker prompt.
+- Used in `worker-manager.buildWorkerPrompt` (v0.7.4 A-6, Claude side) and `CodexWorkerManager.buildCorrectiveRetryText` (v0.7.5 N-1, Codex side — covers 3 retry paths including the previously-gapped Path C concurrency fallback).
+
+### Logging / observability
+
+- **`redactSecrets(text)`** from `src/utils/logger.ts` (v0.7.2 H-1) — pattern-matches and redacts API keys, bearer tokens, JWT-shaped secrets. The logger applies this on disk writes automatically.
+- **Event log also redacts** (v0.7.4 A-3) — `event-log.ts` runs `redactSecrets()` on each event's `error` field on both append and rotation paths. Worker failure messages containing stderr/stack-traces can carry credentials; this closes that leak.
+- **Event log rotation is now atomic and non-destructive** (v0.7.4 A-2 folded into A-1): rotation uses `writeJsonAtomic`; a failed rotation propagates the error instead of truncating the log to empty.
+
+### State persistence
+
+- **`state.json.bak` recovery** (v0.7.3 H-5) — every successful save writes a `.bak` sibling. On load failure, falls back to `.bak` and renames the corrupt primary to `state.json.corrupt-<ts>` for forensics.
+- **fsync before rename** (v0.7.3 H-6) — `StateManager.save()` fsyncs the tmp file AND the parent directory before the atomic rename, for power-loss durability.
+- **`resume()` uses transient "initializing" status** (v0.7.3 H-13) — prevents a crash-after-resume from falsely claiming execution was in progress.
+- **State-schema backfill via `.default(0)`** — three counter fields use this pattern so pre-upgrade state.json files load cleanly:
+  - `codex_metrics.output_too_large_failures` (v0.7.2)
+  - `codex_metrics.execution_errors` (v0.7.3)
+  - `consecutive_flow_tracing_failures` on `OrchestratorState` (v0.7.4 A-7)
+
+### MCP tools
+
+- **`record_decision` uses `z.enum(VALID_DECISION_CATEGORIES)`** at the schema layer (v0.7.3 H-18) to match the handler's validator.
+- **`read_updates` has an opt-in `limit`** and an invisible **mtime pre-filter** (v0.7.3 H-19). The TOCTOU residual is documented in code at `handleReadUpdates`; on coarse-mtime filesystems, callers should advance `since` by the max-returned-timestamp each call.
+
+### Codex reviewer
+
+- **Rate-limit detection via `detectProviderRateLimit()`** (v0.7.3 H-16) — second-attempt errors are classified as RATE_LIMITED only if the message matches a provider rate-limit pattern; otherwise they're classified as ERROR and counted under `execution_errors`.
+- **Model threading** (v0.7.2 CR-3) — `CodexReviewer` accepts a `ModelConfig` and passes the resolved model to every `codex exec` invocation.
+
+### Worker tool restriction
+
+- **`disallowedTools: READ_ONLY_DISALLOWED_TOOLS`** is the SDK-enforced restriction for read-only workers (v0.7.2 CR-1). Applied at 9+ call sites: sentinel, flow-tracing extraction + per-flow trace, planner question-gen, prompt-compactor, rules-extractor, conventions-extractor, design-spec-analyzer, design-spec-updater, flow-config-analyzer. Execution workers still use `allowedTools`; full SDK-enforced restriction for execution workers is tracked as H-3 for v0.8.0.
+
+### New test files added post-v0.7.2
+
+- `src/utils/sanitize.test.ts` (v0.7.2)
+- `src/utils/secure-fs.test.ts` (v0.7.2, extended v0.7.4 for writeJsonAtomic + v0.7.5 for tmp cleanup)
+- `src/utils/logger.test.ts` (v0.7.2, includes redactSecrets patterns)
+- `src/utils/sdk-timeout.test.ts` (v0.7.3 CR-4)
+- `src/utils/state-schema.test.ts` (v0.7.3 CR-4)
+- `src/utils/rules-extractor-verify.test.ts` (v0.7.4 T-3)
+- `src/core/orchestrator-parallel-review.test.ts` (v0.7.4 T-1)
+
+### Specs
+
+Patch-level specs and implementation plans live at `.claude/specs/*.md`:
+- `v0.7.2-critical-fixes.md`
+- `v0.7.3-high-fixes.md`
+- `v0.7.4-remaining-highs.md` (+ `v0.7.4-implementation-plan.md`)
+- `v0.7.5-follow-ups.md`
+
+Each is the authoritative record of what that patch shipped and which Codex review rounds shaped the design.

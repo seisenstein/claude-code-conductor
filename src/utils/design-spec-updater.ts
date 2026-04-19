@@ -1,4 +1,3 @@
-import fs from "node:fs/promises";
 import path from "node:path";
 import type { DesignSpec, DesignSpecUpdateResult, RoleModelSpec } from "./types.js";
 import {
@@ -9,7 +8,7 @@ import {
 } from "./constants.js";
 import { resolveLooseModelArg } from "./models-config.js";
 import { queryWithTimeout } from "./sdk-timeout.js";
-import { mkdirSecure } from "./secure-fs.js";
+import { mkdirSecure, writeJsonAtomic } from "./secure-fs.js";
 import type { Logger } from "./logger.js";
 
 /** Frontend file extensions to watch for design spec changes. */
@@ -196,20 +195,15 @@ async function parseUpdateResult(
     updatedSpec.generated_at = new Date().toISOString();
 
     const specPath = getDesignSpecPath(projectDir);
-    const tmpPath = specPath + ".tmp";
     try {
       await mkdirSecure(path.dirname(specPath), { recursive: true }); // H-2
-      await fs.writeFile(tmpPath, JSON.stringify(updatedSpec, null, 2), { encoding: "utf-8", mode: 0o600 });
-      await fs.rename(tmpPath, specPath);
+      // A-R2 (v0.7.5): use writeJsonAtomic — adds fsync + post-rename chmod
+      // over the previous manual tmp+rename, and Fix 3a hardened the helper
+      // to clean up the tmp file on failure, so we no longer need the
+      // caller-side finally/unlink block.
+      await writeJsonAtomic(specPath, JSON.stringify(updatedSpec, null, 2));
     } catch (err) {
       warn(`Failed to write updated design spec: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      // Clean up temp file if it still exists (in case rename failed)
-      try {
-        await fs.unlink(tmpPath);
-      } catch {
-        // Temp file may not exist if rename succeeded
-      }
     }
   }
 

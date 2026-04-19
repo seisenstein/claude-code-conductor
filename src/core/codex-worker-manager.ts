@@ -23,6 +23,7 @@ import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
+import { sanitizePromptSection } from "../utils/sanitize.js";
 import { appendJsonlLocked, writeFileSecure, mkdirSecure } from "../utils/secure-fs.js";
 // H-9 FIX: Import resilience trackers for heartbeat-based stale detection
 // H-10 FIX: Import TaskRetryTracker for retry tracking with session resumption
@@ -497,7 +498,9 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     const canUseResume = hasResumeCapability && this.concurrency === 1;
 
     if (canUseResume) {
-      const resumePrompt = correctivePrompt ?? "Continue working on this task. The previous attempt did not complete successfully.";
+      // N-1 (v0.7.5): route through buildCorrectiveRetryText so correctivePrompt
+      // is sanitized before being embedded in the Codex CLI resume args at line ~1094.
+      const resumePrompt = this.buildCorrectiveRetryText(correctivePrompt);
       handle.promise = this.runCodexSessionWithResume(
         sessionId,
         handle,
@@ -513,11 +516,16 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
           `Skipping session resume to avoid cross-task contamination. Falling back to fresh worker.`,
         );
       }
-      // Fall back to regular spawn - worker will claim the task via MCP
+      // Fall back to regular spawn - worker will claim the task via MCP.
+      // N-1 (v0.7.5): Path C previously dropped correctivePrompt entirely here.
+      // Now route through the central helper so concurrent retries get the
+      // same quality of retry context as single-worker retries.
+      const pathCPrompt =
+        `${this.buildWorkerPrompt(sessionId)}\n\n## Retry Context\n\n${this.buildCorrectiveRetryText(correctivePrompt)}`;
       handle.promise = this.runCodexSession(
         sessionId,
         handle,
-        this.buildWorkerPrompt(sessionId),
+        pathCPrompt,
         "workspace-write",
         "Codex worker running (retry)...",
       );
@@ -720,7 +728,9 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     if (!resumeArgs) {
       // No preserved thread ID - fall back to fresh start with corrective context
       this.logger.info(`No resume capability for task ${taskId}, using fresh start`);
-      const freshPrompt = `${this.buildWorkerPrompt(sessionId)}\n\n## Retry Context\n\nThis is a retry of a previously failed task. ${correctivePrompt}`;
+      // N-1 (v0.7.5): route through buildCorrectiveRetryText for sanitization.
+      const freshPrompt =
+        `${this.buildWorkerPrompt(sessionId)}\n\n## Retry Context\n\n${this.buildCorrectiveRetryText(correctivePrompt)}`;
       return this.runCodexSession(sessionId, handle, freshPrompt, sandbox, progress);
     }
 
@@ -1141,6 +1151,25 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       subagentModel: this.modelConfig.subagent,
       ...this.workerContext,
     });
+  }
+
+  /**
+   * N-1 (v0.7.5): central retry-context builder for all three Codex retry
+   * paths. Sanitizes the caller-supplied correctivePrompt via
+   * sanitizePromptSection (role-marker stripping + length cap) and returns
+   * the string to interpolate into the prompt or append as a CLI arg.
+   *
+   * Used at:
+   *  - spawnWorkerForRetry resume path (Path A) — feeds resume CLI args
+   *  - spawnWorkerForRetry concurrency-fallback (Path C) — previously
+   *    dropped corrective context entirely; now includes it
+   *  - runCodexSessionWithResume fresh fallback (Path B)
+   */
+  private buildCorrectiveRetryText(correctivePrompt?: string): string {
+    if (!correctivePrompt) {
+      return "Continue working on this task. The previous attempt did not complete successfully.";
+    }
+    return `This is a retry of a previously failed task.\n\n${sanitizePromptSection(correctivePrompt)}`;
   }
 
   private buildSentinelPrompt(): string {
