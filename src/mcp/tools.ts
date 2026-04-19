@@ -277,10 +277,28 @@ export async function handleReadUpdates(
     // readJsonlFile are not atomic. A concurrent appendFile between the
     // two can add a message that mtime-based skip reasoned around. The
     // observable effect is a transient delivery delay — the message
-    // shows up on a subsequent read_updates call rather than this one.
-    // Never data loss. Fully fixing the race would require file-level
-    // locking coordinated with every writer, which is heavier than the
-    // bug warrants. Tracked for v0.8.0 if ever needed.
+    // typically shows up on a subsequent read_updates call rather than
+    // this one.
+    //
+    // Residual edge cases (Codex code-review round 1):
+    //
+    // 1. On filesystems with coarse mtime granularity (some Linux FSs
+    //    expose 1-second resolution; macOS default is ns), if an
+    //    append lands in the same mtime bucket as the pinned `sinceTs`,
+    //    the `<=` comparison can keep skipping that file. Callers
+    //    polling with a constant `sinceTs` should advance `since` using
+    //    the max-returned-timestamp each call so that `sinceTs` always
+    //    moves forward — this keeps the "delayed, not dropped" invariant
+    //    intact. With that caller discipline, mtime-bucket collisions
+    //    resolve on the next poll.
+    //
+    // 2. The comment previously claimed "never data loss"; that's too
+    //    strong. On pathological combinations of (coarse mtime FS +
+    //    static sinceTs + writers that fail to bump mtime), a message
+    //    CAN be skipped indefinitely. The realistic worker pattern
+    //    does advance `since` each call, so this is a documented edge
+    //    case, not a practical concern. Full guarantee requires
+    //    file-level locking — heavier than warranted; tracked for v0.8.0.
     if (sinceTs > 0) {
       try {
         const stat = await fs.stat(filePath);

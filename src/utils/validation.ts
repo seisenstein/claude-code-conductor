@@ -159,10 +159,30 @@ export function assertValidFileName(filename: string): void {
 export function validateIdentifier(id: string): FileNameValidationResult {
   const base = validateFileName(id);
   if (!base.valid) return base;
-  if (id.includes("/") || id.includes("\\") || id.includes(":")) {
+  // Codex code-review round 1 [SUGGESTION]: also check URL-decoded form so
+  // that %2F / %5C / %3A don't bypass the separator check. validateFileName
+  // decodes for its own traversal check but permits slashes at the string
+  // level; we must explicitly decode-then-check for identifiers.
+  let decoded = id;
+  try {
+    // Decode up to 3 times to catch double/triple encoding, matching the
+    // pattern used in validateFileName for its traversal checks.
+    for (let i = 0; i < 3; i++) {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    }
+  } catch {
+    // Malformed URL encoding — validateFileName would have caught this,
+    // but fall through defensively.
+  }
+  if (
+    id.includes("/") || id.includes("\\") || id.includes(":") ||
+    decoded.includes("/") || decoded.includes("\\") || decoded.includes(":")
+  ) {
     return {
       valid: false,
-      reason: "Identifier cannot contain path separators (/, \\, :)",
+      reason: "Identifier cannot contain path separators (/, \\, :), including URL-encoded forms",
     };
   }
   return { valid: true };

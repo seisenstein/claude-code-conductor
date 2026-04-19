@@ -248,7 +248,24 @@ export class EventLog {
    * are preserved as-is (same behavior as readAll's corruption tolerance).
    */
   private async rotate(): Promise<void> {
-    const content = await fs.readFile(this.logPath, "utf-8");
+    // Codex code-review round 1 [CRITICAL]: rotate() is invoked from
+    // writeEvents whenever the pending-write would exceed MAX_EVENT_LOG_SIZE_BYTES.
+    // On a fresh process where the very first flush is oversized (e.g., a
+    // backlog of events written before the file exists), readFile would
+    // throw ENOENT, writeEvents would requeue, and the flush loop would
+    // fail forever. Treat a missing file as empty content so rotation is
+    // a no-op on first-run oversized flushes.
+    let content: string;
+    try {
+      content = await fs.readFile(this.logPath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        // No existing log to rotate — nothing to do. The subsequent
+        // writeEvents append will create the file normally.
+        return;
+      }
+      throw err;
+    }
     const lines = content.trim().split("\n");
 
     // Keep the most recent half
