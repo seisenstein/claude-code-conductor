@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { lock } from "proper-lockfile";
 import { getKnownIssuesPath } from "./constants.js";
-import { writeFileSecure, mkdirSecure, SECURE_FILE_MODE } from "./secure-fs.js";
+import { mkdirSecure, writeJsonAtomic, SECURE_FILE_MODE } from "./secure-fs.js";
 import type { KnownIssue } from "./types.js";
 import type { Logger } from "./logger.js";
 
@@ -46,7 +46,8 @@ export async function loadKnownIssues(projectDir: string, logger?: Logger): Prom
 export async function saveKnownIssues(projectDir: string, issues: KnownIssue[]): Promise<void> {
   const issuesPath = getKnownIssuesPath(projectDir);
   await mkdirSecure(path.dirname(issuesPath), { recursive: true }); // H-2
-  await writeFileSecure(issuesPath, JSON.stringify(issues, null, 2) + "\n");
+  // A-1: writeJsonAtomic provides tmp+fsync+rename + chmod 0o600.
+  await writeJsonAtomic(issuesPath, JSON.stringify(issues, null, 2) + "\n");
 }
 
 /**

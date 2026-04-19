@@ -5,6 +5,7 @@ import {
   validateBounds,
   assertValidFileName,
   validateFileNames,
+  validateIdentifier,
 } from "./validation.js";
 
 describe("validateFileName", () => {
@@ -217,6 +218,40 @@ describe("assertValidFileName", () => {
 
   it("includes the reason in the error message", () => {
     expect(() => assertValidFileName("..")).toThrow(/path traversal/i);
+  });
+});
+
+describe("validateIdentifier", () => {
+  it("accepts a plain identifier", () => {
+    expect(validateIdentifier("task-001")).toEqual({ valid: true });
+  });
+
+  it("rejects forward slash with 'path separators' reason", () => {
+    const result = validateIdentifier("subdir/task-001");
+    expect(result.valid).toBe(false);
+    expect(result.reason).toContain("path separators");
+  });
+
+  it("rejects backslash", () => {
+    const result = validateIdentifier("path\\task");
+    expect(result.valid).toBe(false);
+    // validateFileName catches backslash first with its own message; either
+    // rejection is acceptable as long as the identifier is rejected.
+    expect(result.reason).toBeTruthy();
+  });
+
+  it("rejects colon", () => {
+    const result = validateIdentifier("C:task");
+    expect(result.valid).toBe(false);
+    // Could be caught either by the Windows-drive-letter check in
+    // validateFileName or by the new path-separator check.
+    expect(result.reason).toBeTruthy();
+  });
+
+  it("still applies existing validateFileName rejections (e.g. '..')", () => {
+    const result = validateIdentifier("..");
+    expect(result.valid).toBe(false);
+    expect(result.reason).toMatch(/path traversal/i);
   });
 });
 

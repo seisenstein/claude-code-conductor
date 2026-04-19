@@ -149,6 +149,46 @@ export function assertValidFileName(filename: string): void {
 }
 
 /**
+ * Validates an identifier that becomes part of a filesystem path (task_id,
+ * session_id, contract_id, dependency task_id). Stricter than validateFileName:
+ * rejects all path separators to ensure the resulting path does not traverse.
+ *
+ * NOT for: files_changed (intentional relative paths); any free-form
+ * content field.
+ */
+export function validateIdentifier(id: string): FileNameValidationResult {
+  const base = validateFileName(id);
+  if (!base.valid) return base;
+  // Codex code-review round 1 [SUGGESTION]: also check URL-decoded form so
+  // that %2F / %5C / %3A don't bypass the separator check. validateFileName
+  // decodes for its own traversal check but permits slashes at the string
+  // level; we must explicitly decode-then-check for identifiers.
+  let decoded = id;
+  try {
+    // Decode up to 3 times to catch double/triple encoding, matching the
+    // pattern used in validateFileName for its traversal checks.
+    for (let i = 0; i < 3; i++) {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    }
+  } catch {
+    // Malformed URL encoding — validateFileName would have caught this,
+    // but fall through defensively.
+  }
+  if (
+    id.includes("/") || id.includes("\\") || id.includes(":") ||
+    decoded.includes("/") || decoded.includes("\\") || decoded.includes(":")
+  ) {
+    return {
+      valid: false,
+      reason: "Identifier cannot contain path separators (/, \\, :), including URL-encoded forms",
+    };
+  }
+  return { valid: true };
+}
+
+/**
  * Validates multiple filenames and returns all validation failures.
  *
  * @param filenames - Array of filenames to validate

@@ -14,9 +14,10 @@ import {
   specToSdkArgs,
   describeResolvedRoles,
   expandLegacyTiers,
+  mergeRoleMaps,
 } from "./models-config.js";
 import { DEFAULT_ROLE_CONFIG, MODELS_CONFIG_FILE, ORCHESTRATOR_DIR } from "./constants.js";
-import type { ModelConfig, AgentRole } from "./types.js";
+import type { ModelConfig, AgentRole, RoleModelSpec } from "./types.js";
 
 async function makeTempProject(): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "models-config-test-"));
@@ -347,5 +348,53 @@ describe("resolveLooseModelArg (H-11)", () => {
     // not 4.7 — users must opt in explicitly with "opus-4-7".
     const out = resolveLooseModelArg("opus", "planner");
     expect(out.model).toBe("claude-opus-4-6");
+  });
+});
+
+// ============================================================
+// mergeRoleMaps — H-8 field-level merge helper
+// ============================================================
+
+describe("mergeRoleMaps field-level merge [H-8]", () => {
+  it("file tier-only preserves seed effort", () => {
+    const base: Partial<Record<AgentRole, RoleModelSpec>> = {
+      planner: { tier: "opus-4-7", effort: "xhigh" },
+    };
+    const patch = { planner: { tier: "sonnet-4-6" as const } };  // tier-only
+    const result = mergeRoleMaps(base, patch);
+    expect(result.planner).toEqual({ tier: "sonnet-4-6", effort: "xhigh" });
+  });
+
+  it("legacy expansion tier-only preserves file effort", () => {
+    const base: Partial<Record<AgentRole, RoleModelSpec>> = {
+      worker_backend_api: { tier: "opus-4-6", effort: "medium" },
+    };
+    const patch = { worker_backend_api: { tier: "haiku-4-5" as const } };
+    const result = mergeRoleMaps(base, patch);
+    expect(result.worker_backend_api).toEqual({ tier: "haiku-4-5", effort: "medium" });
+  });
+
+  it("CLI patches layer on top (full precedence chain)", () => {
+    // Simulate: seed(default) → file(override1) → patches(override2)
+    const seed: Partial<Record<AgentRole, RoleModelSpec>> = {
+      planner: { tier: "opus-4-7", effort: "xhigh" },
+    };
+    const fileOverride = { planner: { effort: "high" as const } };  // effort-only
+    const patches = { planner: { tier: "sonnet-4-6" as const } };
+
+    let merged = mergeRoleMaps(seed, fileOverride);
+    expect(merged.planner).toEqual({ tier: "opus-4-7", effort: "high" });
+
+    merged = mergeRoleMaps(merged, patches);
+    expect(merged.planner).toEqual({ tier: "sonnet-4-6", effort: "high" });
+  });
+
+  it("new role in patch — missing fields default from DEFAULT_ROLE_CONFIG", () => {
+    const base: Partial<Record<AgentRole, RoleModelSpec>> = {};
+    const patch = { worker_security: { tier: "opus-4-7" as const } };  // no effort
+    const result = mergeRoleMaps(base, patch);
+    expect(result.worker_security?.tier).toBe("opus-4-7");
+    // effort should default from DEFAULT_ROLE_CONFIG.worker_security
+    expect(result.worker_security?.effort).toBe(DEFAULT_ROLE_CONFIG.worker_security.effort);
   });
 });

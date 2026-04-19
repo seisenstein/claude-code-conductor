@@ -36,6 +36,7 @@ import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
 import type { Logger } from "../utils/logger.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
+import { sanitizePromptSection } from "../utils/sanitize.js";
 import { appendJsonlLocked, mkdirSecure, writeFileSecure } from "../utils/secure-fs.js";
 
 // ============================================================
@@ -930,7 +931,7 @@ export class WorkerManager implements ExecutionWorkerManager {
       `You are retrying task **${retryContext.taskId}**.`,
       "",
       retryContext.correctivePrompt
-        ? `### What went wrong last time\n\n${retryContext.correctivePrompt}\n`
+        ? `### What went wrong last time\n\n${sanitizePromptSection(retryContext.correctivePrompt)}\n`
         : "The previous attempt did not complete successfully. Investigate before re-doing any work.",
       "",
       "When you claim this task, read its full history (in-progress artifacts, prior commits, `known-issues.json`) before making changes.",

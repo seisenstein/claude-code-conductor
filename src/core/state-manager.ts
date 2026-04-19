@@ -28,7 +28,7 @@ import {
   getStatePath,
   getTaskPath,
 } from "../utils/constants.js";
-import { mkdirSecure } from "../utils/secure-fs.js";
+import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
 
 // Local warn sink — StateManager has no logger dependency and we don't want
 // to add one for a narrow fix (H-5, H-6). Writes to stderr so CLI output
@@ -77,6 +77,8 @@ export class StateManager {
       current_cycle: 0,
       max_cycles: options.maxCycles,
       concurrency: options.concurrency,
+      // A-7 (v0.7.4): counter for repeated flow-tracing infra failures
+      consecutive_flow_tracing_failures: 0,
       started_at: now,
       updated_at: now,
       paused_at: null,
@@ -380,10 +382,7 @@ export class StateManager {
 
     // Write the task file with secure permissions (mode 0o600)
     const taskPath = getTaskPath(this.projectDir, id);
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
+    await writeJsonAtomic(taskPath, JSON.stringify(task, null, 2) + "\n");
 
     // Now compute `blocks` for all existing tasks:
     // If this new task depends on task X, then task X blocks this new task.
@@ -410,10 +409,7 @@ export class StateManager {
         const depTask = await this.getTask(depId);
         if (depTask && !depTask.blocks.includes(id)) {
           depTask.blocks.push(id);
-          await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", {
-            encoding: "utf-8",
-            mode: 0o600,
-          });
+          await writeJsonAtomic(depPath, JSON.stringify(depTask, null, 2) + "\n");
         }
       } finally {
         if (release) {
@@ -647,10 +643,7 @@ export class StateManager {
             resetCount++;
           }
 
-          await fs.writeFile(taskPath, JSON.stringify(freshTask, null, 2) + "\n", {
-            encoding: "utf-8",
-            mode: 0o600,
-          });
+          await writeJsonAtomic(taskPath, JSON.stringify(freshTask, null, 2) + "\n");
         } finally {
           if (release) {
             try {

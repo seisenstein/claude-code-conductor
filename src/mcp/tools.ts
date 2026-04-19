@@ -23,8 +23,8 @@ import {
   DECISIONS_FILE,
 } from "../utils/constants.js";
 import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
-import { validateFileName, validateFileNames } from "../utils/validation.js";
-import { appendJsonlLocked, mkdirSecure } from "../utils/secure-fs.js";
+import { validateFileName, validateFileNames, validateIdentifier } from "../utils/validation.js";
+import { appendJsonlLocked, mkdirSecure, writeJsonAtomic, SECURE_FILE_MODE } from "../utils/secure-fs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -272,6 +272,33 @@ export async function handleReadUpdates(
     // H-19: mtime pre-filter. If `since` is supplied and the file hasn't
     // been modified since then, no message inside could be newer than
     // `since`. Invisible optimization — output is identical to pre-H-19.
+    //
+    // TOCTOU residual (A-8, v0.7.4): this mtime check and the subsequent
+    // readJsonlFile are not atomic. A concurrent appendFile between the
+    // two can add a message that mtime-based skip reasoned around. The
+    // observable effect is a transient delivery delay — the message
+    // typically shows up on a subsequent read_updates call rather than
+    // this one.
+    //
+    // Residual edge cases (Codex code-review round 1):
+    //
+    // 1. On filesystems with coarse mtime granularity (some Linux FSs
+    //    expose 1-second resolution; macOS default is ns), if an
+    //    append lands in the same mtime bucket as the pinned `sinceTs`,
+    //    the `<=` comparison can keep skipping that file. Callers
+    //    polling with a constant `sinceTs` should advance `since` using
+    //    the max-returned-timestamp each call so that `sinceTs` always
+    //    moves forward — this keeps the "delayed, not dropped" invariant
+    //    intact. With that caller discipline, mtime-bucket collisions
+    //    resolve on the next poll.
+    //
+    // 2. The comment previously claimed "never data loss"; that's too
+    //    strong. On pathological combinations of (coarse mtime FS +
+    //    static sinceTs + writers that fail to bump mtime), a message
+    //    CAN be skipped indefinitely. The realistic worker pattern
+    //    does advance `since` each call, so this is a documented edge
+    //    case, not a practical concern. Full guarantee requires
+    //    file-level locking — heavier than warranted; tracked for v0.8.0.
     if (sinceTs > 0) {
       try {
         const stat = await fs.stat(filePath);
@@ -437,8 +464,8 @@ export interface ClaimTaskInput {
 export async function handleClaimTask(
   input: ClaimTaskInput
 ): Promise<ClaimTaskResult> {
-  // Validate task_id to prevent path traversal (#28)
-  const taskIdValidation = validateFileName(input.task_id);
+  // Validate task_id to prevent path traversal (#28, A-4 v0.7.4)
+  const taskIdValidation = validateIdentifier(input.task_id);
   if (!taskIdValidation.valid) {
     return { success: false, error: `Invalid task_id: ${taskIdValidation.reason}` };
   }
@@ -477,8 +504,8 @@ export async function handleClaimTask(
     // Verify all dependencies are completed
     if (task.depends_on.length > 0) {
       for (const depId of task.depends_on) {
-        // Validate dep ID to prevent path traversal (#30)
-        const depValidation = validateFileName(depId);
+        // Validate dep ID to prevent path traversal (#30, A-4 v0.7.4)
+        const depValidation = validateIdentifier(depId);
         if (!depValidation.valid) {
           return { success: false, error: `Invalid dependency ID "${depId}": ${depValidation.reason}` };
         }
@@ -499,7 +526,7 @@ export async function handleClaimTask(
     task.owner = sessionId;
     task.started_at = new Date().toISOString();
 
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
+    await writeJsonAtomic(taskPath, JSON.stringify(task, null, 2));
 
     // Gather dependency context (dep IDs already validated above)
     const dependency_context: { task_id: string; result_summary: string | null; files_changed: string[] }[] = [];
@@ -612,8 +639,8 @@ export interface CompleteTaskResult {
 export async function handleCompleteTask(
   input: CompleteTaskInput
 ): Promise<CompleteTaskResult> {
-  // Validate task_id to prevent path traversal (#28)
-  const taskIdValidation = validateFileName(input.task_id);
+  // Validate task_id to prevent path traversal (#28, A-4 v0.7.4)
+  const taskIdValidation = validateIdentifier(input.task_id);
   if (!taskIdValidation.valid) {
     return { success: false, error: `Invalid task_id: ${taskIdValidation.reason}` };
   }
@@ -685,7 +712,7 @@ export async function handleCompleteTask(
       task.files_changed = input.files_changed;
     }
 
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
+    await writeJsonAtomic(taskPath, JSON.stringify(task, null, 2));
 
     // Post a task_completed message to the orchestrator message log
     const msgDir = messagesDir();
@@ -739,8 +766,8 @@ export interface GetSessionStatusResult {
 export async function handleGetSessionStatus(
   input: GetSessionStatusInput
 ): Promise<GetSessionStatusResult> {
-  // Validate session_id to prevent path traversal (#29)
-  const sessionIdValidation = validateFileName(input.session_id);
+  // Validate session_id to prevent path traversal (#29, A-4 v0.7.4)
+  const sessionIdValidation = validateIdentifier(input.session_id);
   if (!sessionIdValidation.valid) {
     return { found: false };
   }
@@ -776,8 +803,8 @@ export async function handleRegisterContract(
     return { error: sizeValidation.error.issues.map((e: { message: string }) => e.message).join("; ") };
   }
 
-  // Validate contract_id to prevent path traversal (#14)
-  const validation = validateFileName(input.contract_id);
+  // Validate contract_id to prevent path traversal (#14, A-4 v0.7.4)
+  const validation = validateIdentifier(input.contract_id);
   if (!validation.valid) {
     return { error: `Invalid contract_id: ${validation.reason}` };
   }
@@ -801,14 +828,17 @@ export async function handleRegisterContract(
   // M-37: Use file locking for concurrency safety when writing contracts
   let release: (() => Promise<void>) | undefined;
   try {
-    // Ensure file exists for locking (create empty if needed)
+    // Ensure file exists for locking (proper-lockfile requires it).
+    // Use open() with "a" flag (same pattern as appendJsonlLocked) so we don't
+    // truncate a concurrent writer's content.
     try {
       await fs.access(filePath);
     } catch {
-      await fs.writeFile(filePath, "{}", { encoding: "utf-8", mode: 0o600 });
+      const fh = await fs.open(filePath, "a", SECURE_FILE_MODE);
+      await fh.close();
     }
     release = await lock(filePath, { retries: { retries: 3, minTimeout: 100 } });
-    await fs.writeFile(filePath, JSON.stringify(contract, null, 2), { encoding: "utf-8", mode: 0o600 });
+    await writeJsonAtomic(filePath, JSON.stringify(contract, null, 2));
   } finally {
     if (release) {
       try {

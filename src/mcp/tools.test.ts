@@ -33,6 +33,8 @@ import {
   handleRecordDecision,
   handlePostUpdate,
   handleRunTests,
+  handleReadUpdates,
+  MAX_READ_UPDATES_HARD_CAP,
 } from "./tools.js";
 
 // ============================================================
@@ -141,6 +143,18 @@ describe("handleClaimTask - path traversal prevention", () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain("not found");
     expect(result.error).not.toContain("Invalid task_id");
+  });
+});
+
+// ============================================================
+// A-4: validateIdentifier rejects path separators in task_id
+// ============================================================
+
+describe("A-4: handleClaimTask rejects path separators in task_id", () => {
+  it("rejects task_id containing a forward slash with 'path separators' reason", async () => {
+    const result = await handleClaimTask({ task_id: "subdir/task-001" });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("path separators");
   });
 });
 
@@ -844,5 +858,305 @@ describe("handleRegisterContract - H-12 task_id parameter", () => {
 
     // H-12: owner_task_id should use task_id with fallback
     expect(source).toMatch(/owner_task_id:\s*input\.task_id\s*\?\?/);
+  });
+});
+
+// ============================================================
+// A-8: read_updates mtime TOCTOU residual (v0.7.4)
+// ============================================================
+
+describe("A-8: read_updates mtime TOCTOU residual", () => {
+  // The mtime pre-filter in handleReadUpdates and the subsequent readJsonlFile
+  // are not atomic. A concurrent write between the two could, in principle,
+  // land a message that the mtime skip reasoned around. The guaranteed
+  // behavior is only that the new message shows up eventually (no data loss):
+  // it may arrive in this call, or in a subsequent call. This test documents
+  // that contract.
+  it("eventually delivers a message written concurrently with a read", async () => {
+    const dir = path.join(tempDir, ".conductor", "messages");
+    const sessionId = "other-session";
+    const filePath = path.join(dir, `${sessionId}.jsonl`);
+
+    const now = Date.now();
+    const oldTs = new Date(now - 100_000).toISOString();
+    const sinceTs = new Date(now - 50_000).toISOString();
+    const newTs = new Date(now + 100_000).toISOString();
+
+    // Seed the file with 1 old message addressed to this session
+    const oldMsg = {
+      id: `${sessionId}-old-1`,
+      from: sessionId,
+      to: "test-session-123",
+      type: "status",
+      content: "old",
+      timestamp: oldTs,
+    };
+    await fs.writeFile(filePath, JSON.stringify(oldMsg) + "\n", {
+      encoding: "utf-8",
+    });
+
+    // Give the filesystem a moment so mtime of the initial write is settled.
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Concurrently: (a) read messages since `sinceTs`, (b) append a new msg.
+    const newMsg = {
+      id: `${sessionId}-new-1`,
+      from: sessionId,
+      to: "test-session-123",
+      type: "status",
+      content: "new",
+      timestamp: newTs,
+    };
+    const [firstRead] = await Promise.all([
+      handleReadUpdates({ since: sinceTs }),
+      fs.appendFile(filePath, JSON.stringify(newMsg) + "\n", {
+        encoding: "utf-8",
+      }),
+    ]);
+
+    // Check whether the new message made it into the first read.
+    const gotNewOnFirstRead = firstRead.some((m) => m.id === newMsg.id);
+
+    if (!gotNewOnFirstRead) {
+      // TOCTOU hit: the mtime pre-filter skipped the file before the append
+      // landed. The contract is that the message must appear on a
+      // subsequent read_updates call.
+      const secondRead = await handleReadUpdates({ since: sinceTs });
+      expect(secondRead.some((m) => m.id === newMsg.id)).toBe(true);
+    } else {
+      // Fast path: the append landed before the mtime pre-filter ran, so
+      // the new message was delivered on the first read. Either outcome is
+      // acceptable — we only care that the message is eventually delivered.
+      expect(gotNewOnFirstRead).toBe(true);
+    }
+  });
+});
+
+// ============================================================
+// T-4: record_decision enum validation [H-18]
+// ============================================================
+
+describe("T-4: record_decision enum validation [H-18]", () => {
+  it("accepts a valid category", async () => {
+    const result = await handleRecordDecision({
+      category: "auth",
+      decision: "Use JWT",
+      rationale: "Stateless auth for our service",
+    });
+    expect("error" in result).toBe(false);
+  });
+
+  it("rejects an invalid category with enum-aware error", async () => {
+    const result = await handleRecordDecision({
+      category: "not-a-category",
+      decision: "Some decision",
+      rationale: "Some rationale",
+    });
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      // Zod's enum error mentions at least one of the valid values.
+      // We don't over-constrain on exact wording of zod's message, but
+      // at least one known category should show up in the rejection.
+      const err = result.error;
+      const mentionsValidValue =
+        err.includes("auth") ||
+        err.includes("naming") ||
+        err.includes("data_model") ||
+        err.includes("error_handling") ||
+        err.includes("api_design") ||
+        err.includes("testing") ||
+        err.includes("performance") ||
+        err.includes("other");
+      expect(mentionsValidValue).toBe(true);
+    }
+  });
+});
+
+// ============================================================
+// T-4: read_updates mtime + limit semantics [H-19]
+// ============================================================
+
+describe("T-4: read_updates mtime + limit semantics [H-19]", () => {
+  const sessionId = "test-session-123";
+
+  /**
+   * Helper: write a jsonl file of messages addressed to the current session.
+   * Writes atomically with a single writeFile call.
+   */
+  async function writeJsonlFile(
+    filePath: string,
+    messages: Array<{
+      id: string;
+      timestamp: string;
+      from?: string;
+      to?: string;
+      type?: string;
+      content?: string;
+    }>,
+  ): Promise<void> {
+    const lines = messages
+      .map((m) =>
+        JSON.stringify({
+          from: "writer-session",
+          to: sessionId,
+          type: "status",
+          content: "msg",
+          ...m,
+        }),
+      )
+      .join("\n");
+    await fs.writeFile(filePath, lines + "\n", { encoding: "utf-8" });
+  }
+
+  it("mtime pre-filter skips files with mtime <= since", async () => {
+    const dir = path.join(tempDir, ".conductor", "messages");
+    const oldFile = path.join(dir, "writer-old.jsonl");
+    const newFile = path.join(dir, "writer-new.jsonl");
+
+    const now = Date.now();
+    const oldTs = new Date(now - 1_000_000).toISOString();
+    const newTs = new Date(now + 10_000).toISOString();
+
+    await writeJsonlFile(oldFile, [
+      { id: "msg-old-1", timestamp: oldTs },
+    ]);
+    await writeJsonlFile(newFile, [
+      { id: "msg-new-1", timestamp: newTs },
+    ]);
+
+    // Force the old file's mtime to be older than `since`.
+    const sinceDate = new Date(now - 500_000);
+    const olderDate = new Date(now - 900_000);
+    await fs.utimes(oldFile, olderDate, olderDate);
+
+    const result = await handleReadUpdates({ since: sinceDate.toISOString() });
+
+    // Old file should be skipped by mtime pre-filter; new file's message
+    // should come through (and pass the timestamp > since filter).
+    const ids = result.map((m) => m.id);
+    expect(ids).toContain("msg-new-1");
+    expect(ids).not.toContain("msg-old-1");
+  });
+
+  it("limit caps results to the N most recent when supplied", async () => {
+    const dir = path.join(tempDir, ".conductor", "messages");
+    const now = Date.now();
+    // Spread 1000 messages across 5 files.
+    const perFile = 200;
+    const totalFiles = 5;
+    const allTimestamps: string[] = [];
+    for (let f = 0; f < totalFiles; f++) {
+      const filePath = path.join(dir, `writer-${f}.jsonl`);
+      const msgs = [];
+      for (let i = 0; i < perFile; i++) {
+        const idx = f * perFile + i;
+        const ts = new Date(now - 1_000_000 + idx * 100).toISOString();
+        allTimestamps.push(ts);
+        msgs.push({ id: `msg-${idx}`, timestamp: ts });
+      }
+      await writeJsonlFile(filePath, msgs);
+    }
+
+    const since = new Date(now - 2_000_000).toISOString();
+    const result = await handleReadUpdates({ since, limit: 100 });
+
+    expect(result.length).toBe(100);
+    // Must be ascending by timestamp within the returned window.
+    for (let i = 1; i < result.length; i++) {
+      const prev = new Date(result[i - 1].timestamp).getTime();
+      const curr = new Date(result[i].timestamp).getTime();
+      expect(curr).toBeGreaterThanOrEqual(prev);
+    }
+    // Must be the most recent 100 (by timestamp).
+    const expectedLast = allTimestamps
+      .slice()
+      .sort()
+      .slice(-100);
+    expect(result.map((m) => m.timestamp)).toEqual(expectedLast);
+  });
+
+  it("returns all matching messages when limit is omitted (pre-H-19 parity)", async () => {
+    const dir = path.join(tempDir, ".conductor", "messages");
+    const filePath = path.join(dir, "writer-all.jsonl");
+    const now = Date.now();
+    const total = 250;
+    const msgs = [];
+    for (let i = 0; i < total; i++) {
+      const ts = new Date(now - 1_000_000 + i * 100).toISOString();
+      msgs.push({ id: `msg-${i}`, timestamp: ts });
+    }
+    await writeJsonlFile(filePath, msgs);
+
+    const since = new Date(now - 2_000_000).toISOString();
+    const result = await handleReadUpdates({ since });
+
+    expect(result.length).toBe(total);
+  });
+
+  it("hard-cap clamps explicit limit to MAX_READ_UPDATES_HARD_CAP", async () => {
+    const dir = path.join(tempDir, ".conductor", "messages");
+    const now = Date.now();
+    const total = 10_500; // > MAX_READ_UPDATES_HARD_CAP
+    // Spread across a few files to exercise the multi-file path.
+    const fileCount = 3;
+    const perFile = Math.ceil(total / fileCount);
+
+    let idx = 0;
+    for (let f = 0; f < fileCount; f++) {
+      const filePath = path.join(dir, `writer-${f}.jsonl`);
+      const msgs = [];
+      const count = Math.min(perFile, total - idx);
+      for (let i = 0; i < count; i++) {
+        const ts = new Date(now - 10_000_000 + idx * 10).toISOString();
+        msgs.push({ id: `msg-${idx}`, timestamp: ts });
+        idx++;
+      }
+      await writeJsonlFile(filePath, msgs);
+    }
+
+    const since = new Date(now - 20_000_000).toISOString();
+    const result = await handleReadUpdates({ since, limit: 1_000_000 });
+
+    // When limit exceeds the cap, it clamps to exactly MAX_READ_UPDATES_HARD_CAP.
+    expect(result.length).toBe(MAX_READ_UPDATES_HARD_CAP);
+  }, 30_000);
+
+  it("since + limit compose: returns N most recent AFTER since", async () => {
+    const dir = path.join(tempDir, ".conductor", "messages");
+    const filePath = path.join(dir, "writer-compose.jsonl");
+    const now = Date.now();
+    const total = 100;
+    const msgs = [];
+    for (let i = 0; i < total; i++) {
+      const ts = new Date(now - 1_000_000 + i * 1_000).toISOString();
+      msgs.push({ id: `msg-${i}`, timestamp: ts });
+    }
+    await writeJsonlFile(filePath, msgs);
+
+    // `since` that includes the newest 80 of the 100 messages.
+    // msg-i timestamps are now - 1_000_000 + i*1_000.
+    // We want 80 to pass `since`, i.e. i in [20, 99].
+    // Since filter uses msgTs > sinceTs strictly, pick sinceTs strictly less
+    // than the timestamp of msg-20.
+    const sinceMs = now - 1_000_000 + 19 * 1_000 + 500;
+    const since = new Date(sinceMs).toISOString();
+
+    const result = await handleReadUpdates({ since, limit: 30 });
+
+    expect(result.length).toBe(30);
+    // All returned messages must be strictly newer than `since`.
+    for (const m of result) {
+      expect(new Date(m.timestamp).getTime()).toBeGreaterThan(sinceMs);
+    }
+    // Must be ascending.
+    for (let i = 1; i < result.length; i++) {
+      const prev = new Date(result[i - 1].timestamp).getTime();
+      const curr = new Date(result[i].timestamp).getTime();
+      expect(curr).toBeGreaterThanOrEqual(prev);
+    }
+    // Must be the 30 most recent among those that pass `since`.
+    // The 80 passing are msg-20..msg-99; the 30 most recent are msg-70..msg-99.
+    const expectedIds = Array.from({ length: 30 }, (_, k) => `msg-${70 + k}`);
+    expect(result.map((m) => m.id)).toEqual(expectedIds);
   });
 });

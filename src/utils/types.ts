@@ -33,6 +33,15 @@ export interface OrchestratorState {
   current_cycle: number;
   max_cycles: number;
   concurrency: number;
+  /**
+   * A-7 (v0.7.4): Counts consecutive cycles where flowReview() threw an
+   * exception (i.e., the Phase-3 flow-tracing leg rejected). Reset to 0
+   * when flowReview() returns a non-null FlowTracingReport (actual trace
+   * success). Intentional skips (null return) leave the counter unchanged.
+   * When this reaches 2, the conductor escalates instead of looping
+   * forever on flow-tracing infrastructure failures.
+   */
+  consecutive_flow_tracing_failures: number;
   started_at: string;
   updated_at: string;
   paused_at: string | null;
