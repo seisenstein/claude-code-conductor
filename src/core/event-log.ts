@@ -17,7 +17,7 @@ import {
   MAX_EVENT_LOG_SIZE_BYTES,
   ORCHESTRATOR_DIR,
 } from "../utils/constants.js";
-import { mkdirSecure } from "../utils/secure-fs.js";
+import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
 
 // ============================================================
 // Types
@@ -213,21 +213,20 @@ export class EventLog {
   /**
    * Rotates the log file when it exceeds the size limit.
    * Keeps the most recent half of the file.
+   *
+   * A-1/A-2: Uses writeJsonAtomic for tmp+fsync+rename. If rotation fails,
+   * we propagate the error rather than truncating the log — leaving the
+   * existing file intact is strictly better than silently losing everything.
    */
   private async rotate(): Promise<void> {
-    try {
-      const content = await fs.readFile(this.logPath, "utf-8");
-      const lines = content.trim().split("\n");
+    const content = await fs.readFile(this.logPath, "utf-8");
+    const lines = content.trim().split("\n");
 
-      // Keep the most recent half
-      const keepLines = lines.slice(Math.floor(lines.length / 2));
-      const newContent = keepLines.join("\n") + "\n";
+    // Keep the most recent half
+    const keepLines = lines.slice(Math.floor(lines.length / 2));
+    const newContent = keepLines.join("\n") + "\n";
 
-      await fs.writeFile(this.logPath, newContent, { encoding: "utf-8", mode: 0o600 });
-    } catch {
-      // If rotation fails, just truncate
-      await fs.writeFile(this.logPath, "", { encoding: "utf-8", mode: 0o600 });
-    }
+    await writeJsonAtomic(this.logPath, newContent);
   }
 
   /**

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -10,6 +10,7 @@ import {
   appendFileSecure,
   chmodSecure,
   appendJsonlLocked,
+  writeJsonAtomic,
   SECURE_FILE_MODE,
   SECURE_DIR_MODE,
 } from "./secure-fs.js";
@@ -161,6 +162,84 @@ describe("secure-fs", () => {
       for (const line of lines) {
         expect(() => JSON.parse(line)).not.toThrow();
       }
+    });
+  });
+
+  describe("writeJsonAtomic [T-5]", () => {
+    it("writes via tmp + rename and leaves no .tmp sibling", async () => {
+      const dest = path.join(tmpDir, "atomic.json");
+      await writeJsonAtomic(dest, "content");
+
+      expect(await fs.readFile(dest, "utf-8")).toBe("content");
+
+      // No .tmp sibling remains after a successful rename
+      const tmpExists = await fs
+        .access(dest + ".tmp")
+        .then(() => true)
+        .catch(() => false);
+      expect(tmpExists).toBe(false);
+    });
+
+    it("calls FileHandle.sync() exactly once by default (fsync for durability)", async () => {
+      const dest = path.join(tmpDir, "fsync-default.json");
+
+      // Spy by wrapping fs.open: return a proxy that records sync() calls,
+      // then delegates the real call. This is the cleanest seam — we can't
+      // spy on FileHandle.prototype directly because FileHandle instances
+      // don't share a prototype that vi.spyOn can see (they're bound to the
+      // individual handle object per open()).
+      const realOpen = fs.open.bind(fs);
+      const syncSpy = vi.fn();
+      const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+        const fh = await realOpen(...args);
+        const origSync = fh.sync.bind(fh);
+        fh.sync = async () => {
+          syncSpy();
+          return origSync();
+        };
+        return fh;
+      });
+
+      try {
+        await writeJsonAtomic(dest, "content-default");
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      expect(syncSpy).toHaveBeenCalledTimes(1);
+      expect(await fs.readFile(dest, "utf-8")).toBe("content-default");
+    });
+
+    it("skips FileHandle.sync() when { fsync: false }", async () => {
+      const dest = path.join(tmpDir, "fsync-false.json");
+
+      const realOpen = fs.open.bind(fs);
+      const syncSpy = vi.fn();
+      const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+        const fh = await realOpen(...args);
+        const origSync = fh.sync.bind(fh);
+        fh.sync = async () => {
+          syncSpy();
+          return origSync();
+        };
+        return fh;
+      });
+
+      try {
+        await writeJsonAtomic(dest, "content-no-fsync", { fsync: false });
+      } finally {
+        openSpy.mockRestore();
+      }
+
+      expect(syncSpy).not.toHaveBeenCalled();
+      expect(await fs.readFile(dest, "utf-8")).toBe("content-no-fsync");
+    });
+
+    it("defaults mode to 0o600", async () => {
+      const dest = path.join(tmpDir, "mode-default.json");
+      await writeJsonAtomic(dest, "x");
+      const stat = await fs.stat(dest);
+      expect(stat.mode & 0o777).toBe(SECURE_FILE_MODE);
     });
   });
 });

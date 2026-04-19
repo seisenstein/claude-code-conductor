@@ -24,7 +24,7 @@ import {
 } from "../utils/constants.js";
 import { rankClaimableTasks, type RankedTask } from "../core/task-scheduler.js";
 import { validateFileName, validateFileNames, validateIdentifier } from "../utils/validation.js";
-import { appendJsonlLocked, mkdirSecure } from "../utils/secure-fs.js";
+import { appendJsonlLocked, mkdirSecure, writeJsonAtomic, SECURE_FILE_MODE } from "../utils/secure-fs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -508,7 +508,7 @@ export async function handleClaimTask(
     task.owner = sessionId;
     task.started_at = new Date().toISOString();
 
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
+    await writeJsonAtomic(taskPath, JSON.stringify(task, null, 2));
 
     // Gather dependency context (dep IDs already validated above)
     const dependency_context: { task_id: string; result_summary: string | null; files_changed: string[] }[] = [];
@@ -694,7 +694,7 @@ export async function handleCompleteTask(
       task.files_changed = input.files_changed;
     }
 
-    await fs.writeFile(taskPath, JSON.stringify(task, null, 2), { encoding: "utf-8", mode: 0o600 });
+    await writeJsonAtomic(taskPath, JSON.stringify(task, null, 2));
 
     // Post a task_completed message to the orchestrator message log
     const msgDir = messagesDir();
@@ -810,14 +810,17 @@ export async function handleRegisterContract(
   // M-37: Use file locking for concurrency safety when writing contracts
   let release: (() => Promise<void>) | undefined;
   try {
-    // Ensure file exists for locking (create empty if needed)
+    // Ensure file exists for locking (proper-lockfile requires it).
+    // Use open() with "a" flag (same pattern as appendJsonlLocked) so we don't
+    // truncate a concurrent writer's content.
     try {
       await fs.access(filePath);
     } catch {
-      await fs.writeFile(filePath, "{}", { encoding: "utf-8", mode: 0o600 });
+      const fh = await fs.open(filePath, "a", SECURE_FILE_MODE);
+      await fh.close();
     }
     release = await lock(filePath, { retries: { retries: 3, minTimeout: 100 } });
-    await fs.writeFile(filePath, JSON.stringify(contract, null, 2), { encoding: "utf-8", mode: 0o600 });
+    await writeJsonAtomic(filePath, JSON.stringify(contract, null, 2));
   } finally {
     if (release) {
       try {

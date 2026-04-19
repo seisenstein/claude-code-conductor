@@ -833,3 +833,59 @@ describe("EventLog H-4 fix: flush race condition", () => {
     expect(flushBody).toContain("this.flushPromise = null");
   });
 });
+
+// ============================================================
+// A-1 / A-2: rotate() uses writeJsonAtomic and propagates errors
+// ============================================================
+
+describe("EventLog A-1/A-2: rotation atomicity", () => {
+  let tempDir: string;
+  let eventLog: EventLog;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "conductor-rotate-test-"));
+    await fs.mkdir(path.join(tempDir, ORCHESTRATOR_DIR), { recursive: true });
+    eventLog = new EventLog(tempDir);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    if (eventLog.isRunning()) {
+      await eventLog.stop();
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("rotation failure leaves the existing log intact (no truncate)", async () => {
+    // Seed the log with real JSONL content
+    const logPath = path.join(tempDir, ORCHESTRATOR_DIR, EVENTS_FILE);
+    const seed =
+      JSON.stringify({ type: "phase_start", phase: "seed-a", timestamp: "2024-01-01T00:00:00.000Z" }) +
+      "\n" +
+      JSON.stringify({ type: "phase_end", phase: "seed-a", duration_ms: 100, timestamp: "2024-01-01T00:00:01.000Z" }) +
+      "\n" +
+      JSON.stringify({ type: "phase_start", phase: "seed-b", timestamp: "2024-01-01T00:00:02.000Z" }) +
+      "\n";
+    await fs.writeFile(logPath, seed, { encoding: "utf-8", mode: 0o600 });
+    const before = await fs.readFile(logPath, "utf-8");
+
+    // Force the atomic rename step inside writeJsonAtomic to fail.
+    // writeJsonAtomic calls fs.rename(tmp, dest) after writing the tmp file;
+    // making rename throw propagates through rotate().
+    const renameSpy = vi.spyOn(fs, "rename").mockRejectedValue(
+      new Error("simulated rotation failure"),
+    );
+
+    // Invoke the private rotate() via cast — the scenario we want is "rotate
+    // runs, its atomic write fails." Prior to A-1/A-2, the catch branch would
+    // truncate the log to empty; now, the error must propagate and the log
+    // must be byte-for-byte unchanged.
+    const rotate = (eventLog as unknown as { rotate: () => Promise<void> }).rotate.bind(eventLog);
+    await expect(rotate()).rejects.toThrow(/simulated rotation failure/);
+
+    renameSpy.mockRestore();
+
+    const after = await fs.readFile(logPath, "utf-8");
+    expect(after).toBe(before);
+  });
+});
