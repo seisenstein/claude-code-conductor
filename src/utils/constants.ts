@@ -33,6 +33,29 @@ export const PAUSE_SIGNAL_FILE = "pause.signal";
 export const CLI_LOCK_FILE = "conductor.lock"; // Process lock file (#10)
 export const TASKS_DRAFT_FILE = "tasks-draft.json"; // Planner writes task definitions here (#4)
 export const MODELS_CONFIG_FILE = "models.json"; // Per-role model + effort overrides (v0.7.0)
+export const FLOW_CONFIG_FILE = "flow-config.json";
+
+// ============================================================
+// Archive (v0.7.6)
+// ============================================================
+
+export const ARCHIVE_DIR = "archive";
+export const ARCHIVE_META_FILE = "_archive-meta.json";
+export const ARCHIVE_IN_PROGRESS_MARKER = ".archive-in-progress";
+export const ARCHIVE_PARTIAL_SUFFIX = "-PARTIAL";
+/** Matches quarantine dir names: `<slug>-PARTIAL`, `<slug>-PARTIAL-2`, etc.
+ *  Used by finalizePartialArchive to skip entries that are already quarantined. */
+export const ARCHIVE_PARTIAL_REGEX = /-PARTIAL(?:-\d+)?$/;
+export const ARCHIVE_VERSION = 1;
+/** Glob-like special: any file matching /^plan-v\d+\.md$/ at `.conductor/`
+ *  root is archived. Captures plan-v1.md, plan-v10.md, etc., including gaps. */
+export const ARCHIVE_PLAN_GLOB = /^plan-v\d+\.md$/;
+/** Max total length of an archive slug (filesystem-safe across FAT/APFS/ext4). */
+export const MAX_ARCHIVE_SLUG_LENGTH = 80;
+/** Max length of the slug-core (branch-slug or feature-slug) before suffixes. */
+export const MAX_ARCHIVE_SLUG_CORE_LENGTH = 40;
+/** Upper bound on collision suffixes (<slug>-2, -3, ..., -99). */
+export const ARCHIVE_COLLISION_LIMIT = 99;
 
 // ============================================================
 // Default Configuration
@@ -526,4 +549,80 @@ export function getEventsPath(projectDir: string): string {
 
 export function getProjectProfilePath(projectDir: string): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, PROJECT_PROFILE_FILE);
+}
+
+// ============================================================
+// Archive Helpers (v0.7.6)
+// ============================================================
+
+/**
+ * Exhaustive list of run artifacts moved into an archive. Paths are
+ * relative to `.conductor/`. Missing entries are silently skipped.
+ *
+ * The archive algorithm ALSO scans `.conductor/` root for files matching
+ * `ARCHIVE_PLAN_GLOB` (plan-v*.md) and adds them to the work-list, so they
+ * do not need to be enumerated here.
+ */
+export const FILES_TO_ARCHIVE: readonly string[] = [
+  STATE_FILE,
+  STATE_FILE + ".bak",
+  "context.md",
+  TASKS_DIR,
+  MESSAGES_DIR,
+  SESSIONS_DIR,
+  CONTRACTS_DIR,
+  CODEX_REVIEWS_DIR,
+  FLOW_TRACING_DIR,
+  LOGS_DIR,
+  DECISIONS_FILE,
+  EVENTS_FILE,
+  PROGRESS_LOG_FILE,
+  KNOWN_ISSUES_FILE,
+  TASKS_DRAFT_FILE,
+  ESCALATION_FILE,
+  RESUME_INFO_FILE,
+  RESULT_FILE,
+  SESSION_STATUS_FILE, // legacy root location; per-session status.json under sessions/<id>/ is carried with sessions/
+] as const;
+
+/**
+ * Files/dirs that stay at `.conductor/` root after archival. Documentation
+ * only — the archiver does NOT iterate this list; it only moves entries in
+ * FILES_TO_ARCHIVE (+ ARCHIVE_PLAN_GLOB matches) and everything else stays.
+ */
+export const FILES_TO_KEEP_AT_ROOT: readonly string[] = [
+  FLOW_CONFIG_FILE,
+  RULES_FILE,
+  WORKER_RULES_FILE,
+  MODELS_CONFIG_FILE,
+  DESIGN_SPEC_FILE,
+  PROJECT_PROFILE_FILE,
+  CONVENTIONS_FILE,
+  RECOMMENDED_CONFIGS_DIR,
+  ARCHIVE_DIR,
+] as const;
+
+/**
+ * Transient files deleted (not archived) on archival. Lock files are
+ * intentionally NOT here — they may still be held by the CLI process
+ * running the archival; releaseLock() handles them.
+ */
+export const FILES_TO_DELETE_ON_ARCHIVE: readonly string[] = [
+  PAUSE_SIGNAL_FILE,
+] as const;
+
+export function getArchiveDir(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, ARCHIVE_DIR);
+}
+
+export function getArchivePath(projectDir: string, slug: string): string {
+  return path.join(getArchiveDir(projectDir), slug);
+}
+
+export function getArchiveMetaPath(projectDir: string, slug: string): string {
+  return path.join(getArchivePath(projectDir, slug), ARCHIVE_META_FILE);
+}
+
+export function getArchiveInProgressMarkerPath(projectDir: string, slug: string): string {
+  return path.join(getArchivePath(projectDir, slug), ARCHIVE_IN_PROGRESS_MARKER);
 }

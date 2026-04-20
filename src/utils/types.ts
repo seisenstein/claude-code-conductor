@@ -73,6 +73,51 @@ export type OrchestratorStatus =
   | "failed"
   | "escalated";
 
+// ============================================================
+// Archive Types (v0.7.6)
+// ============================================================
+
+/**
+ * Origin of an archive. Written into `_archive-meta.json.archived_by` to help
+ * operators understand why a given archive exists.
+ */
+export type ArchivedBy =
+  | "auto-on-completion"
+  | "auto-on-failure"
+  | "auto-stale-on-start"
+  | "manual";
+
+/**
+ * Summary of a run, embedded inside `_archive-meta.json`. Allows
+ * `conduct archive list` and `conduct archive inspect` to render a status
+ * view without reading anything else inside the archive directory.
+ */
+export interface ArchiveSummary {
+  cycles_run: number;
+  max_cycles: number;
+  tasks_completed: number;
+  tasks_failed: number;
+  feature: string;
+  branch: string;
+  started_at: string;
+  completed_at: string;
+}
+
+/**
+ * The `_archive-meta.json` file shape. Tolerant-read: legacy archives
+ * (v0.7.x pre-0.7.6 manual archives) are represented with
+ * `archive_version: 0`, `final_status: "unknown"`, `summary: null`.
+ */
+export interface ArchiveMeta {
+  archive_version: number;
+  archived_at: string; // ISO-8601 UTC
+  archived_by: ArchivedBy | "unknown";
+  original_slug: string;
+  final_status: "completed" | "failed" | "unknown";
+  summary: ArchiveSummary | null;
+  conductor_version: string;
+}
+
 export interface PhaseDurations {
   planning_ms?: number;
   conventions_ms?: number;

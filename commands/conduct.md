@@ -255,6 +255,7 @@ If the user says "status", "resume", "pause", "logs", or similar instead of desc
 - Execution workers default to Claude Code sessions. If the user wants Codex CLI to generate code, launch with `--worker-runtime codex`.
 - Usage is monitored via the OAuth endpoint -- auto-pauses at the threshold, auto-resumes when the window resets.
 - All state lives in `.conductor/` inside the project. Runs survive crashes and can be resumed.
+- **Run archival (v0.7.6+)**: when a run reaches `completed` or `failed`, artifacts are auto-archived to `.conductor/archive/<slug>-[FAILED-]<YYYYMMDD-HHMMSS>/`. Persistent configs (`flow-config.json`, `rules.md`, `models.json`, `design-spec.json`, `project-profile.json`, `conventions.json`, `recommended-configs/`) stay at `.conductor/` root. Browse history via `conduct archive list`, `conduct archive inspect <slug>`, and clean up with `conduct archive prune`. If you re-run `conduct start` while a prior completed/failed run is still at root, it auto-archives first; paused/escalated runs refuse the start until you explicitly resume or `conduct archive --force --yes`.
 - Code goes on a `conduct/<feature-slug>` git branch. Use `--current-branch` to work on the current branch instead.
 - Flow-tracing security review runs after code review each cycle. Use `--skip-flow-review` to disable it for faster iterations.
 - If `conduct` is not found, the user needs to run `npm link` inside the `claude-code-conductor` package directory.

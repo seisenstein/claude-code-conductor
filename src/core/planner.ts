@@ -174,7 +174,7 @@ export class Planner {
           effort: this.effort,
           settingSources: ["project"],
         },
-        15 * 60 * 1000, // 15 min
+        60 * 60 * 1000, // 60 min — xhigh/high effort planning on mid-to-large codebases routinely needs >15 min
         "plan-creation",
         this.logger,
       );
@@ -258,7 +258,7 @@ export class Planner {
           effort: this.effort,
           settingSources: ["project"],
         },
-        15 * 60 * 1000, // 15 min
+        60 * 60 * 1000, // 60 min — matches createPlan; replan can be as expensive as initial planning
         "replan",
         this.logger,
       );

@@ -71,6 +71,7 @@ import { Planner } from "./planner.js";
 import { WorkerManager } from "./worker-manager.js";
 import { CodexWorkerManager } from "./codex-worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
+import { archiveCurrentRun } from "./archiver.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadDesignSpec } from "../utils/design-spec-analyzer.js";
 import { updateDesignSpec } from "../utils/design-spec-updater.js";
@@ -180,6 +181,11 @@ export class Orchestrator {
 
   // Tracks whether a user-requested pause was detected
   private userPauseRequested: boolean = false;
+
+  // v0.7.6: set in complete() / run()-catch to signal that the run
+  // reached a terminal status and should be archived by the run().finally
+  // block (after eventLog.stop + logger.close).
+  private terminalArchivalReason: "auto-on-completion" | "auto-on-failure" | null = null;
 
   // Tracks provider rate-limit signals emitted by execution workers
   private executionRateLimit: { provider: WorkerRuntime; detail: string; resetsAt: string | null } | null = null;
@@ -685,10 +691,34 @@ export class Orchestrator {
       } catch {
         // Best effort
       }
+      // v0.7.6: mark for archival. Actual archival runs in the finally
+      // block AFTER eventLog.stop() and logger.close() have flushed/closed
+      // all writers — otherwise a trailing flush could recreate root
+      // .conductor/events.jsonl after archival moved it out.
+      this.terminalArchivalReason = "auto-on-failure";
       throw err;
     } finally {
-      // V2: Stop event logging and flush remaining events
-      await this.eventLog.stop();
+      // V2: Stop event logging and flush remaining events.
+      // v0.7.6: archival must run AFTER both writers are shut.
+      try { await this.eventLog.stop(); } catch { /* best effort */ }
+      try { await this.logger.close(); } catch { /* best effort */ }
+
+      // v0.7.6: Auto-archive on terminal status. Archival failure here
+      // must NOT override the in-flight error from the try/catch — it's
+      // wrapped in its own try. Uses console directly since logger is
+      // closed.
+      if (this.terminalArchivalReason) {
+        try {
+          const result = await archiveCurrentRun(this.options.project, {
+            archivedBy: this.terminalArchivalReason,
+          });
+          console.log(chalk.gray(`\n  Run archived to .conductor/archive/${result.slug}/\n`));
+        } catch (archiveErr) {
+          console.warn(chalk.yellow(
+            `Auto-archival failed (terminal state already recorded): ${archiveErr instanceof Error ? archiveErr.message : String(archiveErr)}`
+          ));
+        }
+      }
     }
   }
 
@@ -1272,12 +1302,12 @@ export class Orchestrator {
             {
               allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "LSP"],
               cwd: this.options.project,
-              maxTurns: 20,
+              maxTurns: 60,
               model: planInvSpec.model,
               ...(planInvSpec.effort ? { effort: planInvSpec.effort } : {}),
               settingSources: ["project"],
             },
-            10 * 60 * 1000, // 10 min
+            30 * 60 * 1000, // 30 min — matches planning budget; investigator edits the plan + re-reads codebase
             `plan-investigator-round-${discussionRound}`,
             this.logger,
           );
@@ -1930,12 +1960,12 @@ export class Orchestrator {
         {
           allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"],
           cwd: this.options.project,
-          maxTurns: 30,
+          maxTurns: 80,
           model: codeInvSpec.model,
           ...(codeInvSpec.effort ? { effort: codeInvSpec.effort } : {}),
           settingSources: ["project"],
         },
-        10 * 60 * 1000, // 10 min
+        30 * 60 * 1000, // 30 min — investigator may edit many files in response to code review
         `code-review-investigator-round-${reviewRound}`,
         this.logger,
       );
@@ -2359,9 +2389,10 @@ export class Orchestrator {
       // Best effort
     }
 
-    // Close logger to prevent file descriptor leak (task-010)
+    // Close logger to prevent file descriptor leak (task-010).
+    // v0.7.6: close() now returns Promise<void> — await the flush barrier.
     try {
-      this.logger.close();
+      await this.logger.close();
     } catch {
       // Best effort
     }
@@ -2375,6 +2406,10 @@ export class Orchestrator {
     await logProgress(this.options.project, "completed", `${completedCount} tasks completed in ${cycleCount} cycles`);
     await this.state.setStatus("completed");
     this.logger.info("Conductor complete!");
+    // v0.7.6: mark for archival. Actual archival runs in run().finally
+    // AFTER eventLog.stop() and logger.close() — see the trailing
+    // finally block on run().
+    this.terminalArchivalReason = "auto-on-completion";
 
     // Final git commit
     try {

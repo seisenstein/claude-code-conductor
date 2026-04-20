@@ -8,7 +8,17 @@ import { lock, unlock, check } from "proper-lockfile";
 
 import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
-import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig, EffortLevel, AgentRole, RoleModelSpec } from "./utils/types.js";
+import {
+  archiveCurrentRun,
+  detectStaleTerminalState,
+  finalizePartialArchive,
+  listArchives,
+  pruneArchives,
+  readArchive,
+  ArchiveNotFoundError,
+  ArchiveRefusedError,
+} from "./core/archiver.js";
+import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig, EffortLevel, AgentRole, RoleModelSpec, OrchestratorStatus } from "./utils/types.js";
 import { DEFAULT_MODEL_CONFIG, ConductorExitError } from "./utils/types.js";
 import { loadModelsConfig, expandLegacyTiers, mergeRoleMaps } from "./utils/models-config.js";
 import { ALL_AGENT_ROLES, DEFAULT_ROLE_CONFIG } from "./utils/constants.js";
@@ -42,18 +52,29 @@ let shutdownInProgress = false;
 // ============================================================
 
 /**
- * Result of reading state.json, distinguishing between missing and invalid states.
+ * Result of reading state.json.
+ *
+ * - `ok`: state file exists and passes Zod validation.
+ * - `missing`: state file does not exist (ENOENT). Only ENOENT counts —
+ *   other filesystem errors are `unreadable` so safety-critical guards
+ *   don't mistake a permission error for "no state" (v0.7.6 Codex round 5).
+ * - `invalid`: state file exists but fails Zod validation (partial write,
+ *   schema drift, etc.).
+ * - `unreadable`: state file exists but `fs.readFile` failed with a non-
+ *   ENOENT error (EACCES, EIO, EBUSY, etc.). Hard-fail at call sites.
  */
 type ReadStateResult =
   | { status: "ok"; state: OrchestratorState }
   | { status: "missing" }
-  | { status: "invalid"; errors: string[] };
+  | { status: "invalid"; errors: string[] }
+  | { status: "unreadable"; error: string };
 
 /**
  * Read and validate state.json using Zod schema.
  *
  * Uses lenient validation to handle backward compatibility with older state files.
- * Returns a typed result distinguishing between missing file, invalid schema, and success.
+ * Returns a typed result distinguishing between missing file, invalid schema,
+ * unreadable file (non-ENOENT fs error), and success.
  *
  * @param projectDir - Project directory path
  * @returns Typed result with state or error information
@@ -63,8 +84,10 @@ async function readState(projectDir: string): Promise<ReadStateResult> {
   let raw: string;
   try {
     raw = await fs.readFile(statePath, "utf-8");
-  } catch {
-    return { status: "missing" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return { status: "missing" };
+    return { status: "unreadable", error: `${code ?? "?"}: ${err instanceof Error ? err.message : String(err)}` };
   }
 
   // Validate with Zod schema (CRITICAL - state.json validation)
@@ -540,7 +563,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.7.5");
+  .version("0.7.6");
 
 // ============================================================
 // init command
@@ -714,6 +737,96 @@ program
       process.exit(1);
     }
 
+    // v0.7.6 Hook 1: post-lock state classification. Only missing /
+    // completed / failed may proceed into StateManager.initialize(). Every
+    // other read-state result aborts with clear recovery guidance.
+    const preStartState = await readState(projectDir);
+    const exitReleasingLock = async (code: number): Promise<never> => {
+      if (releaseLock) { try { await releaseLock(); } catch { /* best effort */ } releaseLock = undefined; }
+      process.exit(code);
+    };
+
+    if (preStartState.status === "unreadable") {
+      console.error(chalk.red(
+        `\nCannot read .conductor/state.json: ${preStartState.error}\n\n` +
+        `This is not a missing-file case — check filesystem permissions,\n` +
+        `disk health, or whether another process has the file open.\n`
+      ));
+      await exitReleasingLock(1);
+    }
+
+    if (preStartState.status === "invalid") {
+      console.error(chalk.red(
+        `\nExisting .conductor/state.json is invalid and cannot be classified:\n` +
+        preStartState.errors.map((e) => `  - ${e}`).join("\n") + "\n\n" +
+        `Options:\n` +
+        `  - Inspect manually: ls .conductor/ && cat .conductor/state.json\n` +
+        `  - Quarantine:       mv .conductor .conductor-corrupt-$(date +%s)\n` +
+        `  - Start fresh (destructive): rm -rf .conductor/ (loses prior run)\n` +
+        `Note: \`conduct archive --force\` does NOT recover invalid state — the archiver re-reads via the same validator.\n`
+      ));
+      await exitReleasingLock(1);
+    }
+
+    if (preStartState.status === "ok") {
+      const s = preStartState.state.status;
+      if (s === "paused" || s === "escalated") {
+        console.error(chalk.red(
+          `\nA prior '${s}' conductor run is present in this project.\n` +
+          `  Feature: ${preStartState.state.feature}\n\n` +
+          `Options:\n` +
+          `  - Resume it:        conduct resume --project "${projectDir}"\n` +
+          `  - Archive + start:  conduct archive --force --yes --project "${projectDir}" && conduct start ...\n`
+        ));
+        await exitReleasingLock(2);
+      }
+      const NON_TERMINAL_STUCK: OrchestratorStatus[] = [
+        "initializing", "questioning", "planning", "executing",
+        "reviewing", "flow_tracing", "checkpointing",
+      ];
+      if (NON_TERMINAL_STUCK.includes(s)) {
+        console.error(chalk.red(
+          `\nA prior conductor run is in '${s}' state but no process is active.\n` +
+          `This usually means a previous run crashed mid-${s}.\n` +
+          `  Feature: ${preStartState.state.feature}\n\n` +
+          `Options:\n` +
+          `  - Force-resume:     conduct resume --force-resume --project "${projectDir}"\n` +
+          `  - Archive + start:  conduct archive --force --yes --project "${projectDir}" && conduct start ...\n`
+        ));
+        await exitReleasingLock(2);
+      }
+      // Only `completed` and `failed` reach here — Hook 2 will auto-archive.
+    }
+    // status === "missing" falls through: nothing to guard.
+
+    // v0.7.6 Hook 2: recover partial archives, then auto-archive stale
+    // terminal (completed/failed) state so the new run starts clean.
+    // Fail-closed — archival failure refuses the start (don't clobber).
+    try {
+      await finalizePartialArchive(projectDir);
+      const detection = await detectStaleTerminalState(projectDir);
+      if (detection.stale && detection.slug) {
+        console.log(chalk.gray(
+          `[conduct] Detected prior ${detection.status} run — archiving to .conductor/archive/${detection.slug}/...`
+        ));
+        const result = await archiveCurrentRun(projectDir, {
+          archivedBy: "auto-stale-on-start",
+        });
+        console.log(chalk.gray(`[conduct] Archived to ${result.archivePath}`));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(
+        `\nStale-state archival failed: ${message}\n\n` +
+        `Refusing to start — proceeding would overwrite the prior run's artifacts.\n\n` +
+        `Options:\n` +
+        `  - Inspect:    ls .conductor/\n` +
+        `  - Retry manually: conduct archive --yes --project "${projectDir}" && conduct start ...\n` +
+        `  - Quarantine: mv .conductor .conductor-archive-failed-$(date +%s)\n`
+      ));
+      await exitReleasingLock(1);
+    }
+
     try {
       const orchestrator = new Orchestrator(options);
 
@@ -777,6 +890,11 @@ program
     if (stateResult.status === "missing") {
       console.log(chalk.yellow("\nNo conductor state found in this project."));
       console.log(chalk.gray(`Looked in: ${getStatePath(projectDir)}\n`));
+      return;
+    }
+    if (stateResult.status === "unreadable") {
+      console.error(chalk.red(`\nCannot read conductor state file: ${stateResult.error}`));
+      console.error(chalk.gray(`File: ${getStatePath(projectDir)}\n`));
       return;
     }
     if (stateResult.status === "invalid") {
@@ -1041,6 +1159,11 @@ program
       console.error(chalk.red("\nNo conductor state found. Nothing to resume.\n"));
       process.exit(1);
     }
+    if (stateResult.status === "unreadable") {
+      console.error(chalk.red(`\nCannot read conductor state file: ${stateResult.error}`));
+      console.error(chalk.gray(`File: ${getStatePath(projectDir)}\n`));
+      process.exit(1);
+    }
     if (stateResult.status === "invalid") {
       console.error(chalk.red("\nConductor state file exists but is invalid:"));
       for (const error of stateResult.errors) {
@@ -1174,6 +1297,17 @@ program
       process.exit(1);
     }
 
+    // v0.7.6: clean up any leftover partial-archive marker before resuming.
+    // Resume never auto-archives — the run being resumed is by definition
+    // non-terminal.
+    try {
+      await finalizePartialArchive(projectDir);
+    } catch (err) {
+      console.warn(chalk.yellow(
+        `[conduct] finalizePartialArchive failed during resume (continuing): ${err instanceof Error ? err.message : String(err)}`
+      ));
+    }
+
     try {
       const orchestrator = new Orchestrator(options);
 
@@ -1235,6 +1369,11 @@ program
     const stateResult = await readState(projectDir);
     if (stateResult.status === "missing") {
       console.error(chalk.red("\nNo conductor state found. Nothing to pause.\n"));
+      process.exit(1);
+    }
+    if (stateResult.status === "unreadable") {
+      console.error(chalk.red(`\nCannot read conductor state file: ${stateResult.error}`));
+      console.error(chalk.gray(`File: ${getStatePath(projectDir)}\n`));
       process.exit(1);
     }
     if (stateResult.status === "invalid") {
@@ -1311,6 +1450,326 @@ program
       );
       process.exit(1);
     }
+  });
+
+// ============================================================
+// archive command group (v0.7.6)
+// ============================================================
+
+/** Parse ISO date or a relative like "7d", "24h", "30m". Returns a Date. */
+function parseDateArg(name: string, v: string): Date {
+  const rel = /^(\d+)([dhm])$/i.exec(v);
+  if (rel) {
+    const n = parseInt(rel[1], 10);
+    const unit = rel[2].toLowerCase();
+    const multiplier = unit === "d" ? 86_400_000 : unit === "h" ? 3_600_000 : 60_000;
+    return new Date(Date.now() - n * multiplier);
+  }
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) {
+    throw new InvalidArgumentError(`--${name} must be ISO date or relative (e.g. 7d/24h/30m), got: ${v}`);
+  }
+  return d;
+}
+
+function parseArchiveStatusArg(v: string): "completed" | "failed" {
+  const t = v.trim().toLowerCase();
+  if (t === "completed" || t === "failed") return t;
+  throw new InvalidArgumentError(`--status must be completed or failed, got: ${v}`);
+}
+
+async function promptYesNo(question: string): Promise<boolean> {
+  const readline = await import("node:readline/promises");
+  const { stdin: input, stdout: output } = await import("node:process");
+  const rl = readline.createInterface({ input, output });
+  try {
+    const answer = await rl.question(question);
+    const t = answer.trim().toLowerCase();
+    return t === "y" || t === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+const archiveCmd = program
+  .command("archive")
+  .description("Archive the current terminal run (also: list / inspect / prune subcommands)")
+  .option("-p, --project <dir>", "Project directory", process.cwd())
+  .option("--slug <name>", "Override auto-derived slug (timestamp is still appended)")
+  .option("--force", "Archive even if run is paused/escalated (destructive)", false)
+  .option("--yes", "Skip confirmation prompts", false)
+  .action(async (opts: Record<string, string | boolean | undefined>) => {
+    const projectDir = path.resolve(opts.project as string);
+
+    // Status-first classification to produce spec-accurate exit codes.
+    const prelim = await readState(projectDir);
+    if (prelim.status === "missing") {
+      console.error(chalk.red("\nNo conductor run found in this project. Nothing to archive.\n"));
+      process.exit(1);
+    }
+    if (prelim.status === "unreadable") {
+      console.error(chalk.red(`\nCannot read conductor state: ${prelim.error}\n`));
+      process.exit(1);
+    }
+    if (prelim.status === "invalid") {
+      console.error(chalk.red("\nConductor state file exists but is invalid:"));
+      for (const e of prelim.errors) console.error(chalk.yellow(`  - ${e}`));
+      console.error(chalk.gray(
+        `\nArchival requires a valid state.json. Inspect or quarantine manually:\n` +
+        `  - mv .conductor .conductor-corrupt-$(date +%s)\n`
+      ));
+      process.exit(1);
+    }
+
+    const classifyActionable = (s: OrchestratorStatus): "terminal" | "resumable" | "active" => {
+      if (s === "completed" || s === "failed") return "terminal";
+      if (s === "paused" || s === "escalated") return "resumable";
+      return "active";
+    };
+
+    let actionable = classifyActionable(prelim.state.status);
+    const force = Boolean(opts.force);
+
+    if (actionable === "active") {
+      console.error(chalk.red(
+        `\nRun is active ('${prelim.state.status}'). Wait for it to finish, or run \`conduct pause\` first.\n`
+      ));
+      process.exit(1);
+    }
+    if (actionable === "resumable" && !force) {
+      console.error(chalk.red(
+        `\nRun is '${prelim.state.status}'. Use \`conduct resume\` to continue, or pass --force --yes to archive anyway.\n`
+      ));
+      process.exit(2);
+    }
+    if (actionable === "resumable" && force && !opts.yes) {
+      const ok = await promptYesNo(
+        chalk.yellow(`Run is '${prelim.state.status}'. Archive it anyway (destructive)? [y/N]: `)
+      );
+      if (!ok) {
+        console.log("Cancelled.");
+        process.exit(0);
+      }
+    }
+
+    // Acquire lock to prevent concurrent mutation during archival.
+    let releaseLock: (() => Promise<void>) | undefined;
+    try {
+      releaseLock = await acquireProcessLock(projectDir);
+    } catch (err) {
+      console.error(chalk.red(`\nCannot archive: ${err instanceof Error ? err.message : String(err)}\n`));
+      process.exit(1);
+    }
+
+    try {
+      // Re-read state AFTER lock to close precheck→lock race window.
+      const postLock = await readState(projectDir);
+      if (postLock.status !== "ok") {
+        console.error(chalk.red(
+          `\nState changed between precheck and lock acquisition (now '${postLock.status}'). Please re-run.\n`
+        ));
+        process.exit(1);
+      }
+      actionable = classifyActionable(postLock.state.status);
+      if (actionable === "active") {
+        console.error(chalk.red(
+          `\nRun transitioned to active ('${postLock.state.status}') after lock. Refuse to archive.\n`
+        ));
+        process.exit(1);
+      }
+      if (actionable === "resumable" && !force) {
+        console.error(chalk.red(
+          `\nRun transitioned to '${postLock.state.status}' after lock. Pass --force --yes to archive.\n`
+        ));
+        process.exit(2);
+      }
+
+      // Recover any prior partial archive first.
+      try {
+        await finalizePartialArchive(projectDir);
+      } catch (err) {
+        console.warn(chalk.yellow(
+          `[conduct] finalizePartialArchive failed (continuing): ${err instanceof Error ? err.message : String(err)}`
+        ));
+      }
+
+      const result = await archiveCurrentRun(projectDir, {
+        archivedBy: "manual",
+        force,
+        slug: (opts.slug as string | undefined) ?? undefined,
+      });
+      console.log(chalk.green(`\nArchived to .conductor/archive/${result.slug}/\n`));
+    } catch (err) {
+      if (err instanceof ArchiveRefusedError) {
+        console.error(chalk.red(`\n${err.message}\n`));
+        process.exit(2);
+      }
+      console.error(chalk.red(`\nArchive failed: ${err instanceof Error ? err.message : String(err)}\n`));
+      process.exit(1);
+    } finally {
+      if (releaseLock) { try { await releaseLock(); } catch { /* best effort */ } }
+    }
+  });
+
+archiveCmd
+  .command("list")
+  .description("List archived runs, sorted by date descending")
+  .option("-p, --project <dir>", "Project directory", process.cwd())
+  .option("--json", "Machine-readable output", false)
+  .option("--status <status>", "Filter to completed|failed", parseArchiveStatusArg)
+  .option("--since <date>", "Show archives since ISO date or relative (e.g. 7d)",
+    (v: string) => parseDateArg("since", v))
+  .action(async (opts: Record<string, string | boolean | Date | undefined>) => {
+    const projectDir = path.resolve(opts.project as string);
+    const all = await listArchives(projectDir);
+    const statusFilter = opts.status as ("completed" | "failed" | undefined);
+    const since = opts.since as (Date | undefined);
+    const filtered = all.filter((e) => {
+      if (statusFilter && e.meta.final_status !== statusFilter) return false;
+      if (since && new Date(e.meta.archived_at) < since) return false;
+      return true;
+    });
+
+    if (opts.json) {
+      // Emit dirSlug alongside the meta so JSON consumers can pass the
+      // unambiguous slug to `archive inspect` / `archive prune`.
+      console.log(JSON.stringify(
+        filtered.map((e) => ({ dir_slug: e.dirSlug, ...e.meta })),
+        null,
+        2,
+      ));
+      return;
+    }
+
+    if (filtered.length === 0) {
+      console.log(chalk.gray("\nNo archived runs found.\n"));
+      return;
+    }
+
+    // Print a simple fixed-column table. SLUG is the actual directory name
+    // (dirSlug), which is what users pass to `inspect` / `prune`.
+    const rows: string[][] = [["SLUG", "DATE", "STATUS", "CYCLES", "TASKS"]];
+    for (const e of filtered) {
+      const m = e.meta;
+      const date = m.archived_at.slice(0, 16).replace("T", " ");
+      const cycles = m.summary ? `${m.summary.cycles_run}/${m.summary.max_cycles}` : "-";
+      const tasks = m.summary
+        ? `${m.summary.tasks_completed} done${m.summary.tasks_failed ? ", " + m.summary.tasks_failed + " failed" : ""}`
+        : "-";
+      rows.push([e.dirSlug, date, m.final_status, cycles, tasks]);
+    }
+    const widths = rows[0].map((_, i) => Math.max(...rows.map((r) => r[i].length)));
+    for (const row of rows) {
+      console.log(row.map((c, i) => c.padEnd(widths[i])).join("  "));
+    }
+    console.log("");
+  });
+
+archiveCmd
+  .command("inspect <slug>")
+  .description("Show details of an archived run (read-only)")
+  .option("-p, --project <dir>", "Project directory", process.cwd())
+  .option("--json", "Machine-readable output", false)
+  .action(async (slug: string, opts: Record<string, string | boolean | undefined>) => {
+    const projectDir = path.resolve(opts.project as string);
+    try {
+      const entry = await readArchive(projectDir, slug);
+      const meta = entry.meta;
+      if (opts.json) {
+        console.log(JSON.stringify({ dir_slug: entry.dirSlug, ...meta }, null, 2));
+        return;
+      }
+      console.log("");
+      console.log(chalk.bold.cyan("=".repeat(60)));
+      console.log(chalk.bold.cyan(`  ARCHIVED RUN: ${entry.dirSlug}`));
+      console.log(chalk.bold.cyan("  (read-only view)"));
+      console.log(chalk.bold.cyan("=".repeat(60)));
+      console.log("");
+      console.log(chalk.white(`  Status:       ${meta.final_status.toUpperCase()}`));
+      console.log(chalk.white(`  Archived:     ${meta.archived_at}`));
+      console.log(chalk.white(`  Archived By:  ${meta.archived_by}`));
+      console.log(chalk.white(`  Version:      archive_version=${meta.archive_version}, conductor_version=${meta.conductor_version}`));
+      if (meta.summary) {
+        console.log(chalk.white(`  Feature:      ${meta.summary.feature}`));
+        console.log(chalk.white(`  Branch:       ${meta.summary.branch}`));
+        console.log(chalk.white(`  Cycles:       ${meta.summary.cycles_run}/${meta.summary.max_cycles}`));
+        console.log(chalk.white(`  Tasks:        ${meta.summary.tasks_completed} completed, ${meta.summary.tasks_failed} failed`));
+        console.log(chalk.white(`  Started:      ${meta.summary.started_at}`));
+        console.log(chalk.white(`  Completed:    ${meta.summary.completed_at}`));
+      } else {
+        console.log(chalk.gray(`  (No summary available — legacy archive or missing metadata.)`));
+      }
+      console.log("");
+    } catch (err) {
+      if (err instanceof ArchiveNotFoundError) {
+        console.error(chalk.red(`\nArchive not found: ${slug}\n`));
+        process.exit(1);
+      }
+      console.error(chalk.red(`\nError: ${err instanceof Error ? err.message : String(err)}\n`));
+      process.exit(1);
+    }
+  });
+
+archiveCmd
+  .command("prune")
+  .description("Delete archived runs matching filters")
+  .option("-p, --project <dir>", "Project directory", process.cwd())
+  .option("--before <date>", "Delete archives older than this date (ISO or relative)",
+    (v: string) => parseDateArg("before", v))
+  .option("--keep-last <n>", "Keep the N most recent, delete the rest", (v: string) => {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 0) {
+      throw new InvalidArgumentError(`--keep-last must be a non-negative integer, got: ${v}`);
+    }
+    return n;
+  })
+  .option("--status <status>", "Only consider archives with this status", parseArchiveStatusArg)
+  .option("--dry-run", "Preview without deleting", false)
+  .option("--yes", "Skip confirmation prompt", false)
+  .action(async (opts: Record<string, string | boolean | number | Date | undefined>) => {
+    const projectDir = path.resolve(opts.project as string);
+
+    const before = opts.before as (Date | undefined);
+    const keepLast = opts.keepLast as (number | undefined);
+    const status = opts.status as ("completed" | "failed" | undefined);
+
+    if (before === undefined && keepLast === undefined) {
+      console.error(chalk.red(
+        "\nprune requires at least one of --before or --keep-last (optionally narrowed by --status).\n"
+      ));
+      process.exit(1);
+    }
+
+    const dryRun = Boolean(opts.dryRun);
+    const filter = { beforeDate: before, keepLast, status };
+
+    // First pass: always collect candidates via a dry-run so we can preview.
+    const preview = await pruneArchives(projectDir, filter, { dryRun: true });
+    if (preview.candidates.length === 0) {
+      console.log(chalk.gray("\nNo archives match the filter.\n"));
+      return;
+    }
+
+    console.log(chalk.white(`\n${dryRun ? "Would delete" : "Will delete"} ${preview.candidates.length} archive(s):`));
+    for (const c of preview.candidates) {
+      console.log(chalk.gray(`  - ${c.slug} (${c.archivedAt.toISOString().slice(0, 16).replace("T", " ")}) — ${c.reason}`));
+    }
+
+    if (dryRun) {
+      console.log(chalk.gray(`\nRe-run without --dry-run to delete.\n`));
+      return;
+    }
+
+    if (!opts.yes) {
+      const ok = await promptYesNo(chalk.yellow("\nProceed with deletion? [y/N]: "));
+      if (!ok) {
+        console.log("Cancelled.");
+        return;
+      }
+    }
+
+    const result = await pruneArchives(projectDir, filter, { dryRun: false });
+    console.log(chalk.green(`\nDeleted ${result.deleted.length} archive(s).\n`));
   });
 
 // ============================================================

@@ -82,18 +82,27 @@ export class Logger {
   }
 
   /**
-   * Close the write stream. Idempotent - safe to call multiple times.
-   * Fixes file descriptor leak when Logger instances are not explicitly closed.
+   * Close the write stream. Idempotent — safe to call multiple times.
+   *
+   * Returns a Promise that resolves when the underlying fs.WriteStream is
+   * fully flushed and closed. Callers that need a flush barrier (e.g.
+   * archival that moves logs/ out from under us) MUST await this. Fire-and-
+   * forget callers remain correct — the returned promise is safe to ignore.
    */
-  close(): void {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closed) return Promise.resolve();
     this.closed = true;
-    this.logStream.end();
     // Remove the process exit listener to prevent listener accumulation
     if (this.exitHandler) {
       process.removeListener("exit", this.exitHandler);
       this.exitHandler = null;
     }
+    return new Promise<void>((resolve) => {
+      // fs.WriteStream.end(cb) fires the callback once the stream is fully
+      // flushed and closed. No reject path — stream errors during close are
+      // not actionable here (file is already on disk or isn't).
+      this.logStream.end(() => resolve());
+    });
   }
 
   /**

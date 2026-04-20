@@ -109,9 +109,20 @@ The central class that drives the lifecycle through phases: init check -> plan -
 - **Existing-file-safe init**: `conduct init` never overwrites existing config files. If a file already exists, the new version goes to `.conductor/recommended-configs/` for manual comparison.
 - **Configurable per-project**: `.conductor/rules.md` for worker rules, `.conductor/flow-config.json` for flow-tracing layers/actors/edge-cases, `.conductor/design-spec.json` for frontend design system context.
 
-## Patterns added v0.7.2 – v0.7.5
+## Patterns added v0.7.2 – v0.7.6
 
 Security and reliability patterns introduced across recent patch cycles. Use these when touching the affected code paths.
+
+### Run archival (v0.7.6)
+
+- **`src/core/archiver.ts`** — source of truth for run archival. Exports `archiveCurrentRun`, `listArchives`, `readArchive`, `pruneArchives`, `detectStaleTerminalState`, `finalizePartialArchive`, `deriveSlug`. All archive paths go through here.
+- **`.conductor/archive/<slug>-[FAILED-]<YYYYMMDD-HHMMSS>/`** is the on-disk layout. Each archive dir contains a moved snapshot of the run's artifacts + `_archive-meta.json` (shape in `ArchiveMeta` type). Legacy manual archives without the meta file are surfaced as `final_status: "unknown"`, `archive_version: 0`.
+- **Archival runs in `orchestrator.run().finally`** after `await this.eventLog.stop()` and `await this.logger.close()` — both writers must be fully flushed before file moves. `complete()` and the `catch(err)` block only SET `this.terminalArchivalReason`; the finally block does the actual archival.
+- **`Logger.close()` is now `Promise<void>`** — it resolves on the WriteStream's `end` callback so archival has a real flush barrier. Callers that don't need the barrier (process-exit handler) can still fire-and-forget.
+- **`readState()` in `src/cli.ts` distinguishes ENOENT from other fs errors** via a new `"unreadable"` branch, so the `conduct start` Hook 1 guard doesn't mistake a permission error for "no state".
+- **`conduct start` Hook 1**: post-lock state classification — only `missing | ok+completed | ok+failed` proceed; `paused/escalated/executing/planning/...` → exit 2 with recovery guidance; `invalid/unreadable` → exit 1. See `src/cli.ts`.
+- **`conduct start` Hook 2**: fail-closed stale-terminal auto-archive. If archival throws, the CLI refuses to start (preserves prior artifacts for manual recovery).
+- **`conduct archive [list|inspect|prune]`** CLI subcommand group. Lock files (`conductor.lock`, `conductor.lock.info`) are NEVER archived or deleted — the CLI holds them during archival and `releaseLock()` handles cleanup.
 
 ### Filesystem writes
 
