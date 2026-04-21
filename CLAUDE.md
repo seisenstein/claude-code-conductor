@@ -109,9 +109,20 @@ The central class that drives the lifecycle through phases: init check -> plan -
 - **Existing-file-safe init**: `conduct init` never overwrites existing config files. If a file already exists, the new version goes to `.conductor/recommended-configs/` for manual comparison.
 - **Configurable per-project**: `.conductor/rules.md` for worker rules, `.conductor/flow-config.json` for flow-tracing layers/actors/edge-cases, `.conductor/design-spec.json` for frontend design system context.
 
-## Patterns added v0.7.2 – v0.7.6
+## Patterns added v0.7.2 – v0.7.7
 
 Security and reliability patterns introduced across recent patch cycles. Use these when touching the affected code paths.
+
+### Codex review convergence (v0.7.7)
+
+- **`src/core/codex-review-gating.ts`** — single source of truth for every layer that decides whether a review issue is "blocking". Exports `CATEGORY_TO_SEVERITY` (free-text taxonomy label → severity bucket; `PRAISE → minor` is defensive), `inferSeverityFromCategory` (parser fallback), `hasBlockingIssues` (treats `[critical]` / `[major]` / `[unknown]` as blocking), `hasOnlyMinorIssues` (requires non-empty + all `[minor]`), and `normalizeIssueKey` (strips severity + category prefix, collapses whitespace, truncates to 80 chars for recurrence tracking). Imported by the prompt builder, the parser, and the orchestrator so the three layers can never drift.
+- **`src/core/codex-review-prompts.ts`** — pure-function prompt composition ported from `/Users/cameron/Documents/ClaudeCodexDiscussion`. Exports `buildAdversarialStance`, `buildFeedbackFraming`, `buildRoundBudget` (three modes: normal / `FINAL PLANNED ROUND` at `current === softCap` / `OVERTIME` past `softCap`), `buildSeverityTaxonomy` (mapping table sourced from `CATEGORY_TO_SEVERITY`), `buildCoordinatorMcpParagraph` (full, for code reviews), `buildCoordinatorMcpParagraphReplan` (trimmed — contracts + decisions only — for cycle-2+ plan reviews). Each of the four reviewer methods composes these into its prompt.
+- **`CodexReviewer.reviewPlan` / `reReviewPlan`** take `round?: RoundBudget` + `context?: { hasPriorContext?: boolean }`. Cycle-1 plan prompts omit the coordinator MCP paragraph (nothing to query); cycle-2+ (replan) plan prompts include the trimmed paragraph; code prompts always include the full paragraph. Gate on `isReplan` at orchestrator call sites, NOT `planVersion > 1`.
+- **`CodexReviewer.reviewCode` / `reReviewCode`** take `round?: RoundBudget`.
+- **`parseStructuredResponse` consistency guards** (v0.7.7): (a) on malformed `severity`, fall back to `inferSeverityFromCategory(description)` before "unknown"; (b) `verdict:"APPROVE"` + `hasBlockingIssues(issues)` → downgrade verdict to `NEEDS_DISCUSSION` (trust the issues, not the author's verdict); (c) non-APPROVE + `issues.length === 0` → return `{valid:false}` so `withRetryOnInvalidResponse` retries (nothing actionable to respond to).
+- **Orchestrator gating** uses the shared predicates consistently: while-loop continuation checks `hasBlockingIssues`; escalation counting filters by `hasBlockingIssues` and keys by `normalizeIssueKey` so severity / category prefix drift across rounds can't evade recurrence tracking; `lastPlanApproved` and code-review `approved` include `hasOnlyMinorIssues` so minor-only outcomes propagate as approval (no cycle-burn at `orchestrator.ts:587`).
+- **softCap math**: `softCap = MAX_*_ROUNDS + 1` to include the initial review alongside up to 5 re-review rounds. `RoundBudget.current` threads the **discussion-round number**, not the literal invocation count — `withRetryOnInvalidResponse` can silently double invocations but Codex doesn't need to see retries.
+- **Convergence rule surfaced to Codex in every prompt**: "If every finding is `minor`, verdict MUST be `APPROVE`." The orchestrator short-circuits anyway if Codex non-complies.
 
 ### Run archival (v0.7.6)
 

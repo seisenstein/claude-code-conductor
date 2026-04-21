@@ -16,6 +16,21 @@ import {
 import type { Logger } from "../utils/logger.js";
 import { mkdirSecure, writeJsonAtomic } from "../utils/secure-fs.js";
 import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
+import {
+  hasBlockingIssues,
+  inferSeverityFromCategory,
+} from "./codex-review-gating.js";
+import {
+  buildAdversarialStance,
+  buildFeedbackFraming,
+  buildRoundBudget,
+  buildSeverityTaxonomy,
+  buildCoordinatorMcpParagraph,
+  buildCoordinatorMcpParagraphReplan,
+  type RoundBudget,
+} from "./codex-review-prompts.js";
+
+export type { RoundBudget };
 
 /** Timeout for each codex review invocation: 5 minutes. */
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
@@ -392,16 +407,24 @@ export class CodexReviewer {
 
   /**
    * Review a plan file. Returns a verdict and the raw Codex output.
+   *
+   * `round` threads the current discussion-round number so Codex sees a
+   * "round X of Y" budget block and stops drip-feeding findings across
+   * rounds. `context.hasPriorContext` is true for replan (cycle 2+)
+   * plan reviews, where coordinator contracts/decisions from earlier
+   * cycles are relevant to mention.
    */
-  async reviewPlan(planPath: string): Promise<CodexReviewResult> {
+  async reviewPlan(
+    planPath: string,
+    round?: RoundBudget,
+    context?: { hasPriorContext?: boolean },
+  ): Promise<CodexReviewResult> {
     return this.withRetryOnInvalidResponse(async () => {
-      const prompt =
-        "Review this implementation plan for completeness, correctness, and potential issues. " +
-        "For each issue, provide a clear description. " +
-        "You have access to the `coordinator` MCP server with tools: get_tasks, get_contracts, get_decisions, read_updates. " +
-        "Use these to understand the full context of the project's coordination state." +
-        JSON_FORMAT_INSTRUCTIONS;
-
+      const prompt = this.buildPlanReviewPrompt({
+        isInitial: true,
+        round,
+        hasPriorContext: context?.hasPriorContext === true,
+      });
       const output = await this.runCodex(prompt, [planPath]);
       const result = this.buildResult(output, planPath);
       await this.saveReview(result, "plan-review");
@@ -415,16 +438,15 @@ export class CodexReviewer {
   async reReviewPlan(
     planPath: string,
     discussionPath: string,
+    round?: RoundBudget,
+    context?: { hasPriorContext?: boolean },
   ): Promise<CodexReviewResult> {
     return this.withRetryOnInvalidResponse(async () => {
-      const prompt =
-        "You previously reviewed this plan and raised concerns. " +
-        "The planner has responded to your concerns. Review the updated plan and the response. " +
-        "For each remaining issue, provide a clear description. " +
-        "You have access to the `coordinator` MCP server with tools: get_tasks, get_contracts, get_decisions, read_updates. " +
-        "Use these to understand the full context." +
-        JSON_FORMAT_INSTRUCTIONS;
-
+      const prompt = this.buildPlanReviewPrompt({
+        isInitial: false,
+        round,
+        hasPriorContext: context?.hasPriorContext === true,
+      });
       const output = await this.runCodex(prompt, [planPath, discussionPath]);
       const result = this.buildResult(output, planPath);
       await this.saveReview(result, "plan-re-review");
@@ -440,18 +462,15 @@ export class CodexReviewer {
     planPath: string,
     changedFilesPath: string,
     diffPath: string,
+    round?: RoundBudget,
   ): Promise<CodexReviewResult> {
     return this.withRetryOnInvalidResponse(async () => {
       const sanitizedDescription = sanitizePromptContent(taskDescription);
-      const prompt =
-        `Review the code changes for the following task:\n\n${sanitizedDescription}\n\n` +
-        "Compare the implementation against the plan and the diff. " +
-        "Check for correctness, completeness, style, and potential bugs. " +
-        "For each issue, provide a clear description. " +
-        "You have access to the `coordinator` MCP server with tools: get_tasks, get_contracts, get_decisions, read_updates. " +
-        "Use these to see task statuses, contracts between workers, and architectural decisions." +
-        JSON_FORMAT_INSTRUCTIONS;
-
+      const prompt = this.buildCodeReviewPrompt({
+        isInitial: true,
+        round,
+        taskDescription: sanitizedDescription,
+      });
       const output = await this.runCodex(prompt, [planPath, changedFilesPath, diffPath]);
       const result = this.buildResult(output, diffPath);
       await this.saveReview(result, "code-review");
@@ -465,21 +484,84 @@ export class CodexReviewer {
   async reReviewCode(
     reviewResponsePath: string,
     changedFilesPath: string,
+    round?: RoundBudget,
   ): Promise<CodexReviewResult> {
     return this.withRetryOnInvalidResponse(async () => {
-      const prompt =
-        "You previously reviewed code and requested fixes. " +
-        "The developer has responded and made changes. Review the updated files and their response. " +
-        "For each remaining issue, provide a clear description. " +
-        "You have access to the `coordinator` MCP server with tools: get_tasks, get_contracts, get_decisions, read_updates. " +
-        "Use these to verify the full context." +
-        JSON_FORMAT_INSTRUCTIONS;
-
+      const prompt = this.buildCodeReviewPrompt({
+        isInitial: false,
+        round,
+      });
       const output = await this.runCodex(prompt, [reviewResponsePath, changedFilesPath]);
       const result = this.buildResult(output, changedFilesPath);
       await this.saveReview(result, "code-re-review");
       return result;
     }, "code-re-review");
+  }
+
+  // ----------------------------------------------------------------
+  // Private: prompt composition (v0.7.7)
+  // ----------------------------------------------------------------
+
+  private buildPlanReviewPrompt(args: {
+    isInitial: boolean;
+    round?: RoundBudget;
+    hasPriorContext: boolean;
+  }): string {
+    const { isInitial, round, hasPriorContext } = args;
+    const role = isInitial
+      ? "You are reviewing an implementation plan before any code is written."
+      : "You previously reviewed this plan and raised concerns. The planner has responded. Review the updated plan alongside the response.";
+    const task = isInitial
+      ? [
+          "## Your Task",
+          "",
+          "Examine the attached plan for feasibility, completeness, correctness, risk, alternatives, and ordering. Verify every claim against the actual codebase using your file-reading tools — do not take the plan's description of the current state at face value.",
+        ].join("\n")
+      : [
+          "## Your Task",
+          "",
+          "Address the planner's response. For each outstanding finding, say whether you accept the response, still disagree (with evidence), or have a new concern raised by the change. Skip items that were resolved.",
+        ].join("\n");
+
+    const parts: string[] = [role, "", buildAdversarialStance("plan"), "", buildFeedbackFraming()];
+    if (round) {
+      parts.push("", buildRoundBudget(round));
+    }
+    parts.push("", buildSeverityTaxonomy("plan"), "", task);
+    if (hasPriorContext) {
+      parts.push("", buildCoordinatorMcpParagraphReplan());
+    }
+    parts.push("", JSON_FORMAT_INSTRUCTIONS);
+    return parts.join("\n");
+  }
+
+  private buildCodeReviewPrompt(args: {
+    isInitial: boolean;
+    round?: RoundBudget;
+    taskDescription?: string;
+  }): string {
+    const { isInitial, round, taskDescription } = args;
+    const role = isInitial
+      ? `You are reviewing code changes for the following task:\n\n${taskDescription ?? "(no task description provided)"}\n\nCompare the implementation against the plan and the diff.`
+      : "You previously reviewed this code and requested fixes. The developer has responded. Review the updated files alongside the response.";
+    const task = isInitial
+      ? [
+          "## Your Task",
+          "",
+          "For each changed file, examine the FULL file (not just the diff) to understand context. Check correctness, completeness, edge cases, error handling, and consistency with the plan. Be specific: cite file paths and line numbers.",
+        ].join("\n")
+      : [
+          "## Your Task",
+          "",
+          "Verify the developer's fixes by reading the current file state. Accept or push back on disagreements with specific code evidence. If all significant issues are resolved, approve.",
+        ].join("\n");
+
+    const parts: string[] = [role, "", buildAdversarialStance("code"), "", buildFeedbackFraming()];
+    if (round) {
+      parts.push("", buildRoundBudget(round));
+    }
+    parts.push("", buildSeverityTaxonomy("code"), "", task, "", buildCoordinatorMcpParagraph(), "", JSON_FORMAT_INSTRUCTIONS);
+    return parts.join("\n");
   }
 
   /**
@@ -872,23 +954,54 @@ export class CodexReviewer {
         return { valid: false };
       }
 
-      // Map structured issues to string[] (extract description only)
+      // Map structured issues to string[] (extract description only).
+      // v0.7.7: if `severity` is malformed, infer from a leading
+      // `[CATEGORY]` tag in the description before falling back to
+      // "unknown". Keeps the escalation filter in sync with Codex's
+      // own sense of severity even when the JSON field is wrong.
       const validSeverities = new Set(["minor", "major", "critical"]);
       const issues: string[] = [];
       for (const issue of parsed.issues as Record<string, unknown>[]) {
         if (typeof issue === "object" && issue !== null && typeof issue.description === "string") {
-          const severity = typeof issue.severity === "string" && validSeverities.has(issue.severity)
-            ? issue.severity
-            : "unknown";
+          let severity: string;
+          if (typeof issue.severity === "string" && validSeverities.has(issue.severity)) {
+            severity = issue.severity;
+          } else {
+            const inferred = inferSeverityFromCategory(issue.description);
+            severity = inferred ?? "unknown";
+          }
           issues.push(`[${severity}] ${issue.description}`);
         }
       }
 
       const summary = typeof parsed.summary === "string" ? parsed.summary : "";
+      let verdict = parsed.verdict as CodexVerdict;
+
+      // v0.7.7 consistency guard #1: Codex contradicts itself by
+      // emitting verdict:"APPROVE" alongside blocking issues. Trust the
+      // issues (they're concrete), downgrade the verdict. Keeps
+      // downstream approval gating honest.
+      if (verdict === "APPROVE" && hasBlockingIssues(issues)) {
+        this.logger.warn(
+          `Codex returned APPROVE with ${issues.length} blocking issue(s); downgrading verdict to NEEDS_DISCUSSION.`,
+        );
+        verdict = "NEEDS_DISCUSSION" as CodexVerdict;
+      }
+
+      // v0.7.7 consistency guard #2: non-APPROVE verdict with no parsed
+      // issues is degenerate — nothing for the investigator to respond
+      // to. Flag as invalid so withRetryOnInvalidResponse takes a
+      // second pass.
+      if (verdict !== "APPROVE" && issues.length === 0) {
+        this.logger.debug(
+          `Non-APPROVE verdict (${verdict}) with empty issues array; treating as invalid for retry.`,
+        );
+        return { valid: false };
+      }
 
       return {
         valid: true,
-        verdict: parsed.verdict as CodexVerdict,
+        verdict,
         issues,
         summary,
       };

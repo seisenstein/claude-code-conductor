@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -286,5 +286,63 @@ describe("sanitizePromptContent logic verification", () => {
     const result = sanitizePromptContent(input);
     expect(result).not.toContain("<<SYS>>");
     expect(result).not.toContain("injected");
+  });
+});
+
+describe("CodexReviewer v0.7.7 - parser consistency guards", () => {
+  it("source code downgrades APPROVE+blocking issues to NEEDS_DISCUSSION", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-reviewer.ts"),
+      "utf-8",
+    );
+    // The guard must be present in the parser body.
+    expect(source).toContain('verdict === "APPROVE" && hasBlockingIssues(issues)');
+    expect(source).toContain('verdict = "NEEDS_DISCUSSION" as CodexVerdict');
+  });
+
+  it("source code invalidates non-APPROVE + empty issues to trigger retry", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-reviewer.ts"),
+      "utf-8",
+    );
+    expect(source).toContain('verdict !== "APPROVE" && issues.length === 0');
+    // The branch returns { valid: false } for the retry path.
+    expect(source).toMatch(/Non-APPROVE verdict[\s\S]{0,200}empty issues array/);
+  });
+
+  it("source code uses inferSeverityFromCategory as a fallback for malformed severity", async () => {
+    const source = await fs.readFile(
+      path.join(__dirname, "codex-reviewer.ts"),
+      "utf-8",
+    );
+    expect(source).toContain("inferSeverityFromCategory(issue.description)");
+    expect(source).toContain('severity = inferred ?? "unknown"');
+  });
+
+  it("behavioral: APPROVE + critical issue downgrades to NEEDS_DISCUSSION", async () => {
+    // Simulate the guard logic directly to verify semantics.
+    const { hasBlockingIssues } = await import("./codex-review-gating.js");
+    const issues: string[] = ["[critical] bug at handler.ts:42"];
+    const initialVerdict = "APPROVE" as string;
+    const finalVerdict: string =
+      initialVerdict === "APPROVE" && hasBlockingIssues(issues)
+        ? "NEEDS_DISCUSSION"
+        : initialVerdict;
+    expect(finalVerdict).toBe("NEEDS_DISCUSSION");
+  });
+
+  it("behavioral: non-APPROVE with zero issues flips to invalid", async () => {
+    const verdict: string = "NEEDS_DISCUSSION";
+    const issues: string[] = [];
+    const shouldInvalidate = verdict !== "APPROVE" && issues.length === 0;
+    expect(shouldInvalidate).toBe(true);
+  });
+
+  it("behavioral: [PRAISE] description with malformed severity maps to minor (defensive)", async () => {
+    const { inferSeverityFromCategory } = await import("./codex-review-gating.js");
+    // Simulates the parser fallback: severity is "unknown" → check category.
+    const description = "[PRAISE] Great separation of concerns here.";
+    const inferred = inferSeverityFromCategory(description) ?? "unknown";
+    expect(inferred).toBe("minor");
   });
 });

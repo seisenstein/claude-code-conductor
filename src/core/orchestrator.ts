@@ -72,6 +72,11 @@ import { WorkerManager } from "./worker-manager.js";
 import { CodexWorkerManager } from "./codex-worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
 import { archiveCurrentRun } from "./archiver.js";
+import {
+  hasBlockingIssues,
+  hasOnlyMinorIssues,
+  normalizeIssueKey,
+} from "./codex-review-gating.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadDesignSpec } from "../utils/design-spec-analyzer.js";
 import { updateDesignSpec } from "../utils/design-spec-updater.js";
@@ -1217,8 +1222,15 @@ export class Orchestrator {
           return planVersion;
         }
         const planPath = getPlanPath(this.options.project, planVersion);
+        // v0.7.7: softCap = MAX_PLAN_DISCUSSION_ROUNDS + 1 (initial + re-reviews).
+        // hasPriorContext gates the replan-specific MCP paragraph.
+        const planSoftCap = MAX_PLAN_DISCUSSION_ROUNDS + 1;
         let reviewResult = await this.retryCodexWithBackoff(
-          () => this.codex.reviewPlan(planPath),
+          () => this.codex.reviewPlan(
+            planPath,
+            { current: 1, softCap: planSoftCap, hardCap: planSoftCap },
+            { hasPriorContext: isReplan },
+          ),
           "plan review",
         );
 
@@ -1229,6 +1241,7 @@ export class Orchestrator {
           reviewResult.verdict !== "APPROVE" &&
           reviewResult.verdict !== "ERROR" &&
           reviewResult.verdict !== "RATE_LIMITED" &&
+          hasBlockingIssues(reviewResult.issues) &&
           discussionRound < MAX_PLAN_DISCUSSION_ROUNDS
         ) {
           discussionRound++;
@@ -1239,9 +1252,14 @@ export class Orchestrator {
             `${reviewResult.issues.length} issue(s)`,
           );
 
-          // Track recurring issues
+          // v0.7.7: track recurring issues using normalized keys so
+          // severity/category prefix drift across rounds can't evade
+          // recurrence counting. Only blocking issues count toward
+          // MAX_DISAGREEMENT_ROUNDS — persistent [NIT]/[SUGGESTION]
+          // shouldn't trigger escalation.
           for (const issue of reviewResult.issues) {
-            const issueKey = issue.substring(0, 80);
+            if (!hasBlockingIssues([issue])) continue;
+            const issueKey = normalizeIssueKey(issue);
             const count = (issueCounts.get(issueKey) ?? 0) + 1;
             issueCounts.set(issueKey, count);
 
@@ -1334,7 +1352,12 @@ export class Orchestrator {
             return planVersion;
           }
           reviewResult = await this.retryCodexWithBackoff(
-            () => this.codex.reReviewPlan(planPath, responsePath),
+            () => this.codex.reReviewPlan(
+              planPath,
+              responsePath,
+              { current: discussionRound + 1, softCap: planSoftCap, hardCap: planSoftCap },
+              { hasPriorContext: isReplan },
+            ),
             `plan re-review round ${discussionRound}`,
           );
         }
@@ -1342,12 +1365,24 @@ export class Orchestrator {
         // Persist metrics after plan review
         await this.state.updateCodexMetrics(this.codex.getMetrics());
 
-        // Track for cycle record
+        // v0.7.7: track for cycle record. Minor-only outcomes count as
+        // approved-with-minors so the loop can exit early without
+        // forcing another cycle just because Codex didn't flip its
+        // verdict to APPROVE.
         this.lastPlanDiscussionRounds = discussionRound;
-        this.lastPlanApproved = reviewResult.verdict === "APPROVE";
+        const planMinorOnly =
+          reviewResult.verdict !== "APPROVE" &&
+          reviewResult.verdict !== "ERROR" &&
+          reviewResult.verdict !== "RATE_LIMITED" &&
+          hasOnlyMinorIssues(reviewResult.issues);
+        this.lastPlanApproved = reviewResult.verdict === "APPROVE" || planMinorOnly;
 
         if (reviewResult.verdict === "APPROVE") {
           this.logger.info("Codex APPROVED the plan.");
+        } else if (planMinorOnly) {
+          this.logger.info(
+            `Plan review had only minor findings (${reviewResult.issues.length} minor); treating as approved-with-minors.`,
+          );
         } else if (reviewResult.verdict === "ERROR") {
           this.logger.error(
             "Codex plan review errored out. Plan was NOT reviewed by Codex.",
@@ -1867,8 +1902,16 @@ export class Orchestrator {
       this.lastCodeReviewRounds = 0;
       return false;
     }
+    // v0.7.7: softCap = MAX_CODE_REVIEW_ROUNDS + 1 (initial + re-reviews).
+    const codeSoftCap = MAX_CODE_REVIEW_ROUNDS + 1;
     let reviewResult = await this.retryCodexWithBackoff(
-      () => this.codex.reviewCode(state.feature, planPath, changedFilesPath, diffPath),
+      () => this.codex.reviewCode(
+        state.feature,
+        planPath,
+        changedFilesPath,
+        diffPath,
+        { current: 1, softCap: codeSoftCap, hardCap: codeSoftCap },
+      ),
       "code review",
     );
 
@@ -1888,6 +1931,7 @@ export class Orchestrator {
       reviewResult.verdict !== "APPROVE" &&
       reviewResult.verdict !== "ERROR" &&
       reviewResult.verdict !== "RATE_LIMITED" &&
+      hasBlockingIssues(reviewResult.issues) &&
       reviewRound < MAX_CODE_REVIEW_ROUNDS
     ) {
       reviewRound++;
@@ -1898,9 +1942,12 @@ export class Orchestrator {
         `${reviewResult.issues.length} issue(s)`,
       );
 
-      // Track recurring issues
+      // v0.7.7: only blocking issues count toward recurrence, and keys
+      // are normalized so severity/category drift across rounds can't
+      // evade tracking.
       for (const issue of reviewResult.issues) {
-        const issueKey = issue.substring(0, 80);
+        if (!hasBlockingIssues([issue])) continue;
+        const issueKey = normalizeIssueKey(issue);
         const count = (issueCounts.get(issueKey) ?? 0) + 1;
         issueCounts.set(issueKey, count);
 
@@ -1991,7 +2038,11 @@ export class Orchestrator {
         return false;
       }
       reviewResult = await this.retryCodexWithBackoff(
-        () => this.codex.reReviewCode(responsePath, changedFilesPath),
+        () => this.codex.reReviewCode(
+          responsePath,
+          changedFilesPath,
+          { current: reviewRound + 1, softCap: codeSoftCap, hardCap: codeSoftCap },
+        ),
         `code re-review round ${reviewRound}`,
       );
     }
@@ -2008,11 +2059,22 @@ export class Orchestrator {
     // even when no code issues exist. Instead, treat them as "review
     // unavailable" — return true so the checkpoint doesn't penalize the code
     // for a tooling failure.
+    //
+    // v0.7.7: minor-only outcomes also count as approved — Codex may not
+    // flip to APPROVE even when every remaining finding is a nit.
     const isToolFailure =
       reviewResult.verdict === "ERROR" || reviewResult.verdict === "RATE_LIMITED";
-    const approved = reviewResult.verdict === "APPROVE" || isToolFailure;
+    const codeMinorOnly =
+      !isToolFailure &&
+      reviewResult.verdict !== "APPROVE" &&
+      hasOnlyMinorIssues(reviewResult.issues);
+    const approved = reviewResult.verdict === "APPROVE" || isToolFailure || codeMinorOnly;
     if (reviewResult.verdict === "APPROVE") {
       this.logger.info("Codex APPROVED the code changes.");
+    } else if (codeMinorOnly) {
+      this.logger.info(
+        `Code review had only minor findings (${reviewResult.issues.length} minor); treating as approved-with-minors.`,
+      );
     } else if (reviewResult.verdict === "ERROR") {
       this.logger.error(
         "Codex code review errored out. Code was NOT reviewed by Codex. " +
